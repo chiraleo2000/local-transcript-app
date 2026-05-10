@@ -72,28 +72,83 @@ Until the installer build is finalized, use the developer setup flow below.
 ## Developer Setup On Windows
 
 ```bat
-cd C:\Users\chira\Documents\visualstudiocode\Work\local-transcript-app
+cd C:\path\to\local-transcript-app
 setup.bat
+```
+
+## Starting The App
+
+### Windows
+
+**First time only** — install dependencies and download models:
+
+```bat
+setup.bat
+copy .env.example .env
+REM Edit .env and set HF_TOKEN=hf_your_token_here
 venv\Scripts\activate
 python scripts\bootstrap_models.py
+```
+
+**Every subsequent run:**
+
+```bat
+venv\Scripts\activate
+python app.py
+```
+
+Or use the one-shot launcher:
+
+```bat
 run.bat
+```
+
+Then open your browser at:
+
+```
+http://localhost:7896
+```
+
+---
+
+### Linux / macOS
+
+**First time only:**
+
+```bash
+./setup.sh
+cp .env.example .env
+# Edit .env and set HF_TOKEN=hf_your_token_here
+source venv/bin/activate
+python scripts/bootstrap_models.py
+```
+
+**Every subsequent run:**
+
+```bash
+source venv/bin/activate
+python app.py
+# or: ./run.sh
 ```
 
 Then open:
 
-```text
+```
 http://localhost:7896
 ```
 
-## Linux/macOS Setup
+---
 
-```bash
-cd /path/to/local-transcript-app
-./setup.sh
-source venv/bin/activate
-python scripts/bootstrap_models.py
-./run.sh
-```
+### What to expect on first start
+
+1. Hardware is detected — NVIDIA CUDA (≥6 GB VRAM) is preferred; falls back to OpenVINO CPU or CPU.
+2. Models load from `models/hf_cache/` (fast after bootstrap).
+3. Gradio UI starts; the terminal shows `Running on local URL: http://0.0.0.0:7896`.
+4. Upload an audio or video file, choose engine and language, click **Transcribe**.
+
+### Stopping the app
+
+Press `Ctrl+C` in the terminal window where `app.py` is running.
 
 ## Runtime Storage
 
