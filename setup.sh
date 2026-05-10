@@ -42,6 +42,10 @@ open(os.path.join(d,'INSTALLER'),'w').write('pip')
 print('torchcodec stub created.')
 "
 
+# Install pywebview so the launcher opens a native desktop window.
+echo "[7/7] Installing pywebview (native desktop window)..."
+pip install pywebview
+
 echo
 echo "============================================"
 echo " Setup complete!"

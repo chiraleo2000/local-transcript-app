@@ -4,7 +4,7 @@
 ; for release packaging.
 
 #define MyAppName "Local Transcript App"
-#define MyAppVersion "0.1.0"
+#define MyAppVersion "1.1.0"
 #define MyAppPublisher "Local Transcript App"
 #define MyAppExeName "run.bat"
 
@@ -37,5 +37,6 @@ Filename: "{cmd}"; Parameters: "/c venv\Scripts\python.exe -m pip install --upgr
 Filename: "{cmd}"; Parameters: "/c venv\Scripts\pip.exe install openvino==2026.1.0"; WorkingDir: "{app}"; StatusMsg: "Installing OpenVINO..."; Flags: waituntilterminated
 Filename: "{cmd}"; Parameters: "/c venv\Scripts\pip.exe install -r requirements.txt"; WorkingDir: "{app}"; StatusMsg: "Installing app dependencies..."; Flags: waituntilterminated
 Filename: "{cmd}"; Parameters: "/c venv\Scripts\pip.exe uninstall torchcodec -y"; WorkingDir: "{app}"; StatusMsg: "Finalizing dependencies..."; Flags: runhidden waituntilterminated
+Filename: "{cmd}"; Parameters: "/c venv\Scripts\pip.exe install pywebview"; WorkingDir: "{app}"; StatusMsg: "Installing desktop window support..."; Flags: runhidden waituntilterminated
 Filename: "{cmd}"; Parameters: "/c venv\Scripts\python.exe scripts\bootstrap_models.py"; WorkingDir: "{app}"; StatusMsg: "Checking hardware and downloading local models..."; Flags: waituntilterminated; Tasks: downloadmodels
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: postinstall skipifsilent nowait

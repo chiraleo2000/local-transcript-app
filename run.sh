@@ -24,13 +24,13 @@ if [ "${1}" = "docker" ]; then
     COMPOSE_FILES="-f docker-compose.yml"
     if docker run --rm --gpus all nvidia/cuda:13.0.0-runtime-ubuntu24.04 nvidia-smi &>/dev/null; then
         echo "      GPU available in Docker — using CUDA mode."
-        COMPOSE_FILES="-f docker-compose.yml -f docker-compose.gpu.yml"
+        COMPOSE_FILES="-f docker-compose.gpu.yml"
     else
         echo "      GPU not available in Docker — using CPU/OpenVINO mode."
         echo "      To enable GPU: install nvidia-container-toolkit and restart Docker."
     fi
 
-    echo "[3/3] Starting Docker container on http://localhost:7890 ..."
+    echo "[3/3] Starting Docker container on http://localhost:7896 ..."
     echo
     docker compose $COMPOSE_FILES up --build -d
     docker logs -f transcription-service

@@ -62,10 +62,10 @@ if errorlevel 1 (
     echo       To enable GPU: Docker Desktop ^> Settings ^> Resources ^> GPU ^> Enable
 ) else (
     echo       GPU available in Docker — using CUDA mode.
-    set COMPOSE_FILES=-f docker-compose.yml -f docker-compose.gpu.yml
+    set COMPOSE_FILES=-f docker-compose.gpu.yml
 )
 
-echo [3/3] Starting Docker container on http://localhost:7890 ...
+echo [3/3] Starting Docker container on http://localhost:7896 ...
 echo.
 docker compose %COMPOSE_FILES% up --build -d
 docker logs -f transcription-service
