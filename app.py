@@ -19,11 +19,16 @@ def _install_torchcodec_stub() -> None:
         return
     torchcodec = types.ModuleType("torchcodec")
     torchcodec.__spec__ = importlib.machinery.ModuleSpec("torchcodec", None)
+    torchcodec.AudioDecoder = type("AudioDecoder", (), {})
+    torchcodec.AudioSamples = type("AudioSamples", (), {})
+    torchcodec.AudioStreamMetadata = type("AudioStreamMetadata", (), {})
     for name in ["decoders", "encoders", "samplers", "transforms"]:
         module = types.ModuleType(f"torchcodec.{name}")
         module.__spec__ = importlib.machinery.ModuleSpec(f"torchcodec.{name}", None)
         if name == "decoders":
             setattr(module, "AudioDecoder", type("AudioDecoder", (), {}))
+            setattr(module, "AudioSamples", type("AudioSamples", (), {}))
+            setattr(module, "AudioStreamMetadata", type("AudioStreamMetadata", (), {}))
         setattr(torchcodec, name, module)
         sys.modules[f"torchcodec.{name}"] = module
     sys.modules["torchcodec"] = torchcodec
@@ -135,7 +140,6 @@ def transcribe(
     selected_engines,
     language,
     diarization,
-    min_speakers,
     max_speakers,
     enhance,
     local_correction,
@@ -151,7 +155,7 @@ def transcribe(
             selected_engines=selected_engines or list(ALL_ENGINES),
             language=language,
             diarization=diarization,
-            min_speakers=int(min_speakers),
+            min_speakers=1,
             max_speakers=int(max_speakers),
             enhance=enhance,
             local_correction=local_correction,
@@ -197,7 +201,6 @@ def build_ui() -> gr.Blocks:
                     value=False,
                 )
                 with gr.Row(visible=False) as speakers_row:
-                    min_speakers = gr.Slider(1, 10, step=1, value=2, label="Min Speakers")
                     max_speakers = gr.Slider(1, 10, step=1, value=3, label="Max Speakers")
                 transcribe_btn = gr.Button("Transcribe", variant="primary", interactive=False)
 
@@ -293,7 +296,6 @@ def build_ui() -> gr.Blocks:
                 engine_selector,
                 language,
                 diarization,
-                min_speakers,
                 max_speakers,
                 enhance,
                 local_correction,

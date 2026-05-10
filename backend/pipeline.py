@@ -34,8 +34,10 @@ def run_transcription_job(
     if not selected:
         selected = list(ALL_ENGINES)
 
-    n_min = int(min_speakers) if diarization else 0
+    n_min = max(1, int(min_speakers)) if diarization else 0
     n_max = int(max_speakers) if diarization else 0
+    if diarization and n_max < n_min:
+        n_max = n_min
     diar_segments = None
     if diarization:
         try:

@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import warnings
 
 # Suppress torchcodec DLL probe warnings emitted when torch imports its video
@@ -12,6 +13,11 @@ import warnings
 warnings.filterwarnings(
     "ignore",
     message=r".*torchcodec.*|.*libtorchcodec.*|.*FFmpeg.*version.*",
+    category=UserWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r"[\s\S]*torchcodec[\s\S]*",
     category=UserWarning,
 )
 warnings.filterwarnings(
@@ -69,40 +75,57 @@ def _get_diarization_pipeline():
     return _pipeline_cache[0]
 
 
-def _prepare_audio_for_pyannote(audio_path: str) -> str:
-    """Ensure audio is a 16 kHz mono WAV file suitable for pyannote.
+def _prepare_audio_for_pyannote(audio_path: str) -> dict:
+    """Load audio as an in-memory 16 kHz mono waveform for pyannote.
 
-    Returns the path to use (original if already valid WAV, or a temp file).
-    Pyannote is most reliable when given a file path rather than a waveform
-    tensor, so we always return a path.
+    Docker uses a minimal torchcodec stub because transformers probes the
+    package at import time. Passing file paths to pyannote would make pyannote
+    call torchcodec's AudioDecoder for metadata, which fails with that stub.
+    The supported pyannote workaround is to pass a preloaded audio dictionary.
     """
-    import subprocess
+    import librosa
+    import torch
 
     ffmpeg = shutil.which("ffmpeg")
-    if ffmpeg is None:
-        # Can't convert; return original and hope for the best
-        logger.warning("ffmpeg not found — passing audio as-is to pyannote.")
-        return audio_path
-
-    # Write to a named temp WAV in the same directory
     base = os.path.splitext(audio_path)[0]
     out_path = base + "_diarize_tmp.wav"
 
-    cmd = [
-        ffmpeg, "-y", "-i", audio_path,
-        "-ar", "16000",      # 16 kHz
-        "-ac", "1",          # mono
-        "-sample_fmt", "s16",# 16-bit PCM
-        "-vn",               # drop video
-        out_path,
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300, check=False)
-    if result.returncode != 0:
-        logger.warning(
-            "ffmpeg audio conversion failed (%s); using original file.", result.stderr[-300:]
-        )
-        return audio_path
-    return out_path
+    source_path = audio_path
+    tmp_created = False
+    if ffmpeg is not None:
+        cmd = [
+            ffmpeg, "-y", "-i", audio_path,
+            "-ar", "16000",
+            "-ac", "1",
+            "-sample_fmt", "s16",
+            "-vn",
+            out_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300, check=False)
+        if result.returncode == 0:
+            source_path = out_path
+            tmp_created = True
+        else:
+            logger.warning(
+                "ffmpeg audio conversion failed (%s); loading original with librosa.",
+                result.stderr[-300:],
+            )
+    else:
+        logger.warning("ffmpeg not found — loading original audio with librosa.")
+
+    try:
+        waveform, sample_rate = librosa.load(source_path, sr=16000, mono=True)
+    finally:
+        if tmp_created and os.path.isfile(source_path):
+            try:
+                os.remove(source_path)
+            except OSError:
+                pass
+
+    tensor = torch.from_numpy(waveform).float().unsqueeze(0)
+    duration = tensor.shape[-1] / 16000 if tensor.shape[-1] else 0.0
+    logger.info("Prepared diarization audio: %.1fs at %d Hz", duration, sample_rate)
+    return {"waveform": tensor, "sample_rate": 16000}
 
 
 def _build_diarize_kwargs(num_speakers: int, min_speakers: int, max_speakers: int) -> dict:
@@ -120,14 +143,14 @@ def _build_diarize_kwargs(num_speakers: int, min_speakers: int, max_speakers: in
     return kwargs
 
 
-def _run_pyannote(pipe, wav_path: str, kwargs: dict):
+def _run_pyannote(pipe, audio_input: dict, kwargs: dict):
     """Call pyannote pipeline; use ProgressHook when available."""
     try:
         from pyannote.audio.pipelines.utils.hook import ProgressHook
         with ProgressHook() as hook:
-            return pipe(wav_path, hook=hook, **kwargs)
+            return pipe(audio_input, hook=hook, **kwargs)
     except (ImportError, TypeError):
-        return pipe(wav_path, **kwargs)
+        return pipe(audio_input, **kwargs)
 
 
 def _remap_speakers(segments: list[dict]) -> dict:
@@ -150,19 +173,10 @@ def diarize(
     """
     pipe = _get_diarization_pipeline()
     kwargs = _build_diarize_kwargs(num_speakers, min_speakers, max_speakers)
-    wav_path = _prepare_audio_for_pyannote(audio_path)
-    tmp_created = wav_path != audio_path
+    audio_input = _prepare_audio_for_pyannote(audio_path)
 
-    logger.info("Running diarization on %s  kwargs=%s ...", wav_path, kwargs or "(auto)")
-
-    try:
-        diarization = _run_pyannote(pipe, wav_path, kwargs)
-    finally:
-        if tmp_created and os.path.isfile(wav_path):
-            try:
-                os.remove(wav_path)
-            except OSError:
-                pass
+    logger.info("Running diarization on preloaded waveform  kwargs=%s ...", kwargs or "(auto)")
+    diarization = _run_pyannote(pipe, audio_input, kwargs)
 
     # pyannote 3.x returns Annotation directly; some community wrappers wrap it.
     annotation = getattr(diarization, "speaker_diarization", diarization)
@@ -306,6 +320,54 @@ def _format_plain(chunks: list[dict]) -> str:
     return "\n".join(lines) if lines else _NO_SPEECH
 
 
+def _overlapping_speaker_turns(
+    start: float | None, end: float | None, segments: list[dict],
+) -> list[dict]:
+    """Return diarization turns overlapping one ASR chunk, clipped to chunk bounds."""
+    if start is None or end is None or end <= start:
+        return []
+    turns = []
+    for seg in segments:
+        overlap_start = max(start, seg["start"])
+        overlap_end = min(end, seg["end"])
+        if overlap_end - overlap_start > 0.05:
+            turns.append({
+                "start": overlap_start,
+                "end": overlap_end,
+                "speaker": seg["speaker"],
+            })
+    return turns
+
+
+def _split_text_across_turns(text: str, turns: list[dict]) -> list[tuple[float, float, str, str]]:
+    """Split a long chunk's words proportionally across overlapping speakers."""
+    words = text.split()
+    if len(turns) <= 1 or len(words) < len(turns):
+        return []
+
+    start = turns[0]["start"]
+    end = turns[-1]["end"]
+    duration = max(0.001, end - start)
+    pieces = []
+    cursor = 0
+
+    for idx, turn in enumerate(turns):
+        if idx == len(turns) - 1:
+            next_cursor = len(words)
+        else:
+            fraction = (turn["end"] - start) / duration
+            next_cursor = round(fraction * len(words))
+            next_cursor = min(len(words), max(cursor + 1, next_cursor))
+        piece = " ".join(words[cursor:next_cursor]).strip()
+        if piece:
+            pieces.append((turn["start"], turn["end"], piece, turn["speaker"]))
+        cursor = next_cursor
+        if cursor >= len(words):
+            break
+
+    return pieces
+
+
 def _iter_chunks(
     chunks: list[dict],
     diarization_segments: list[dict],
@@ -330,6 +392,13 @@ def _iter_chunks(
         # mapped to the correct time-window and therefore the correct speaker.
         if (all_ts_none or c_start is None) and total_dur > 0 and total_chunks > 0:
             c_start, c_end = _estimate_chunk_ts(chunk_idx, total_chunks, total_dur)
+
+        turns = _overlapping_speaker_turns(c_start, c_end, diarization_segments)
+        split_pieces = _split_text_across_turns(text, turns)
+        if split_pieces:
+            chunk_idx += 1
+            yield from split_pieces
+            continue
 
         speaker = _find_speaker(c_start, c_end, diarization_segments)
         chunk_idx += 1

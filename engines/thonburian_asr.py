@@ -187,10 +187,11 @@ def transcribe_thonburian(
     """
     pipe = _get_pipeline()
     audio_input = _load_audio(audio_path)
+    timestamp_mode = "word" if diarization_segments else True
     result = pipe(
         audio_input,
         generate_kwargs={"language": language, "task": "transcribe"},
-        return_timestamps=True,
+        return_timestamps=timestamp_mode,
     )
     logger.debug(
         "Thonburian result: text_len=%d chunks=%d first_ts=%s",
