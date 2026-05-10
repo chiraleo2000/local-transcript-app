@@ -1,0 +1,24 @@
+services:
+  transcription:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: transcription-service
+    restart: unless-stopped
+    ports:
+      - "7896:7896"
+    env_file:
+      - .env
+    environment:
+      - GRADIO_SERVER_NAME=0.0.0.0
+    volumes:
+      # Bind-mount to project folder → copy folder to another PC, no re-download
+      - ./hf_cache:/root/.cache/huggingface
+      - ./ov_cache:/app/ov_cache
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+        "import urllib.request; urllib.request.urlopen('http://localhost:7896/gradio_api/startup-events')"]
+      interval: 30s
+      timeout: 10s
+      start_period: 120s
+      retries: 3

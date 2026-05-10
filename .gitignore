@@ -1,0 +1,39 @@
+# Python virtual environment
+venv/
+.venv/
+env/
+
+# Model weights & HF/OV caches (large binary files — run scripts/bootstrap_models.py to download)
+models/
+ov_cache/
+
+# App runtime storage
+storage/
+config/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
+
+# Env / secrets
+.env
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# VS Code
+.vscode/

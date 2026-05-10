@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+.env
+ov_cache/
+hf_cache/
+*.egg-info/
+dist/
+build/
+.git/
+.gitignore
+*.md
+setup.bat
+setup.sh

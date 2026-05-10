@@ -1,0 +1,18 @@
+# GPU override — requires Docker Desktop GPU enabled OR Linux with nvidia-container-toolkit
+# Usage: docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+#
+# To enable on Windows Docker Desktop:
+#   Settings → Resources → GPU → Enable GPU → Apply & Restart
+services:
+  transcription:
+    environment:
+      - GRADIO_SERVER_NAME=0.0.0.0
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
