@@ -1,14 +1,33 @@
-# GPU override — requires Docker Desktop GPU enabled OR Linux with nvidia-container-toolkit
-# Usage: docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+# GPU compose — standalone file, no overlay needed
+# Requires Docker Desktop (Windows) with GPU enabled, or Linux with nvidia-container-toolkit
 #
-# To enable on Windows Docker Desktop:
-#   Settings → Resources → GPU → Enable GPU → Apply & Restart
+# First-time setup:
+#   Windows: Docker Desktop → Settings → Resources → GPU → Enable GPU → Apply & Restart
+#   Linux:   sudo apt install nvidia-container-toolkit && sudo systemctl restart docker
+#
+# Usage:
+#   docker compose -f docker-compose.gpu.yml up -d --build   (first run, builds image)
+#   docker compose -f docker-compose.gpu.yml up -d           (subsequent runs)
+#   docker compose -f docker-compose.gpu.yml down            (stop)
 services:
   transcription:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: transcription-service
+    restart: unless-stopped
+    ports:
+      - "7896:7896"
+    env_file:
+      - .env
     environment:
       - GRADIO_SERVER_NAME=0.0.0.0
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    volumes:
+      # Persist models and transcripts — bind-mount project-local dirs
+      - ./models:/app/models
+      - ./storage:/app/storage
     deploy:
       resources:
         reservations:
@@ -16,3 +35,10 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+        "import urllib.request; urllib.request.urlopen('http://localhost:7896/gradio_api/startup-events')"]
+      interval: 30s
+      timeout: 10s
+      start_period: 120s
+      retries: 3

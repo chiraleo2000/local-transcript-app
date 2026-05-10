@@ -12,9 +12,9 @@ services:
     environment:
       - GRADIO_SERVER_NAME=0.0.0.0
     volumes:
-      # Bind-mount to project folder → copy folder to another PC, no re-download
-      - ./hf_cache:/root/.cache/huggingface
-      - ./ov_cache:/app/ov_cache
+      # Bind-mount so models and transcripts persist and don't re-download
+      - ./models:/app/models
+      - ./storage:/app/storage
     healthcheck:
       test: ["CMD", "python3", "-c",
         "import urllib.request; urllib.request.urlopen('http://localhost:7896/gradio_api/startup-events')"]

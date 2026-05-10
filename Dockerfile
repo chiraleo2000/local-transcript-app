@@ -3,7 +3,8 @@ FROM nvidia/cuda:13.0.0-runtime-ubuntu24.04 AS base
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    HF_HUB_DISABLE_SYMLINKS_WARNING=1
 
 # System dependencies (ffmpeg needed for audio preprocessing)
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -12,10 +13,26 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
+# Pre-create persistent-mount directories so volumes work without root
+RUN mkdir -p models/hf_cache models/ov_cache storage/input storage/audio \
+             storage/transcripts storage/jobs storage/logs config
+
 # Install Python deps first (layer cache)
 COPY requirements.txt .
 RUN python3 -m pip install --no-cache-dir --break-system-packages -r requirements.txt \
-    && python3 -m pip uninstall -y torchcodec || true
+    && python3 -m pip uninstall -y torchcodec || true \
+    && python3 -c "
+import site, os
+for p in site.getsitepackages():
+    stub = os.path.join(p, 'torchcodec-0.0.1.dist-info')
+    if os.path.isdir(os.path.dirname(stub)):
+        os.makedirs(stub, exist_ok=True)
+        open(os.path.join(stub,'METADATA'),'w').write('Metadata-Version: 2.1\nName: torchcodec\nVersion: 0.0.1\n')
+        open(os.path.join(stub,'RECORD'),'w').write('')
+        open(os.path.join(stub,'INSTALLER'),'w').write('pip')
+        print('torchcodec stub created at', stub)
+        break
+"
 
 # Copy application code
 COPY engines/ engines/

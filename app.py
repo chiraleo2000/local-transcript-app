@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.machinery
 import logging
+import os
 import sys
 import threading
 import types
@@ -208,16 +209,36 @@ def build_ui() -> gr.Blocks:
 
         with gr.Row():
             with gr.Column():
-                gr.Markdown("#### Original Media")
-                original_media = gr.File(label="Original", interactive=False)
+                gr.Markdown("#### Original Media Preview")
+                original_video = gr.Video(
+                    label="Video",
+                    interactive=False,
+                    visible=False,
+                )
+                original_audio_preview = gr.Audio(
+                    label="Audio",
+                    interactive=False,
+                    visible=False,
+                    type="filepath",
+                )
             with gr.Column():
                 gr.Markdown("#### Enhanced Audio Preview")
                 enhanced_audio = gr.Audio(label="Enhanced", interactive=False, type="filepath")
 
+        _VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv", ".wmv", ".m4v", ".ts"}
+
+        def _route_media_preview(path):
+            if not path:
+                return gr.update(value=None, visible=False), gr.update(value=None, visible=False)
+            ext = os.path.splitext(path)[1].lower()
+            if ext in _VIDEO_EXTS:
+                return gr.update(value=path, visible=True), gr.update(value=None, visible=False)
+            return gr.update(value=None, visible=False), gr.update(value=path, visible=True)
+
         media_input.change(  # pylint: disable=no-member
-            fn=lambda path: path,
+            fn=_route_media_preview,
             inputs=[media_input],
-            outputs=[original_media],
+            outputs=[original_video, original_audio_preview],
         )
 
         def _run_enhance(media_path, do_enhance):
