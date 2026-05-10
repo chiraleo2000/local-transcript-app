@@ -34,6 +34,11 @@ REM Transformers 4.57+ tries to import it for ASR pipelines; remove it so
 REM transformers falls back to soundfile/librosa (which works correctly).
 pip uninstall torchcodec -y 2>nul
 
+REM Create a minimal torchcodec stub so transformers 4.57 metadata check
+REM does not crash with PackageNotFoundError after the real package is removed.
+echo [6/6] Creating torchcodec compatibility stub...
+python -c "import os,sys; d=os.path.join(sys.prefix,'Lib','site-packages','torchcodec-0.0.1.dist-info'); os.makedirs(d,exist_ok=True); open(os.path.join(d,'METADATA'),'w').write('Metadata-Version: 2.1\nName: torchcodec\nVersion: 0.0.1\n'); open(os.path.join(d,'RECORD'),'w').write(''); open(os.path.join(d,'INSTALLER'),'w').write('pip'); print('torchcodec stub created.')"
+
 echo.
 echo ============================================
 echo  Setup complete!
