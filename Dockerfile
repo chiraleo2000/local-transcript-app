@@ -21,18 +21,14 @@ RUN mkdir -p models/hf_cache models/ov_cache storage/input storage/audio \
 COPY requirements.txt .
 RUN python3 -m pip install --no-cache-dir --break-system-packages -r requirements.txt \
     && python3 -m pip uninstall -y torchcodec || true \
-    && python3 -c "
-import site, os
-for p in site.getsitepackages():
-    stub = os.path.join(p, 'torchcodec-0.0.1.dist-info')
-    if os.path.isdir(os.path.dirname(stub)):
-        os.makedirs(stub, exist_ok=True)
-        open(os.path.join(stub,'METADATA'),'w').write('Metadata-Version: 2.1\nName: torchcodec\nVersion: 0.0.1\n')
-        open(os.path.join(stub,'RECORD'),'w').write('')
-        open(os.path.join(stub,'INSTALLER'),'w').write('pip')
-        print('torchcodec stub created at', stub)
-        break
-"
+    && python3 -c "import site,os; \
+stub=[os.path.join(p,'torchcodec-0.0.1.dist-info') for p in site.getsitepackages() if os.path.isdir(p)]; \
+d=stub[0] if stub else '/usr/lib/python3/dist-packages/torchcodec-0.0.1.dist-info'; \
+os.makedirs(d,exist_ok=True); \
+open(os.path.join(d,'METADATA'),'w').write('Metadata-Version: 2.1\nName: torchcodec\nVersion: 0.0.1\n'); \
+open(os.path.join(d,'RECORD'),'w').write(''); \
+open(os.path.join(d,'INSTALLER'),'w').write('pip'); \
+print('torchcodec stub created at',d)"
 
 # Copy application code
 COPY engines/ engines/
