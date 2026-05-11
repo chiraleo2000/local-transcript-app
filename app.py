@@ -264,20 +264,32 @@ def transcribe(
     diar_clust_threshold,
     diar_clust_min_size,
 ):
-    """Gradio callback: run local backend pipeline."""
+    """Gradio callback: run local backend pipeline (generator for live SSE push)."""
     _cancel_event.clear()
     if not media_path:
-        return _empty_outputs("(no media provided)")
+        yield _empty_outputs("(no media provided)")
+        return
     if not _models_ready.is_set():
-        return _empty_outputs("Models are still loading, please wait...")
+        yield _empty_outputs("Models are still loading, please wait...")
+        return
+
+    # Push an immediate in-progress state so the browser shows activity right away.
+    no_dl = gr.update(value=None, interactive=False)
+    no_btn = gr.update(interactive=False)
+    yield (
+        "⏳ Transcribing...", "", no_dl, no_btn,
+        "⏳ Transcribing...", "", no_dl, no_btn,
+        "Processing — please wait...",
+    )
+
     try:
         diarize_kwargs: dict | None = None
         if diarization:
             diarize_kwargs = {
-                "seg_threshold":       float(diar_seg_threshold),
+                "seg_threshold":        float(diar_seg_threshold),
                 "seg_min_duration_off": float(diar_min_off),
-                "clust_threshold":     float(diar_clust_threshold),
-                "clust_min_size":      int(diar_clust_min_size),
+                "clust_threshold":      float(diar_clust_threshold),
+                "clust_min_size":       int(diar_clust_min_size),
             }
         result = run_transcription_job(
             media_path=media_path,
@@ -292,16 +304,18 @@ def transcribe(
             cancel_event=_cancel_event,
         )
         if _cancel_event.is_set():
-            return _empty_outputs("(cancelled)")
-        return _build_outputs(result, selected_engines or default_asr_engines())
+            yield _empty_outputs("(cancelled)")
+            return
+        yield _build_outputs(result, selected_engines or default_asr_engines())
     except RuntimeError as exc:
         if "cancelled" in str(exc).lower():
-            return _empty_outputs("(cancelled)")
+            yield _empty_outputs("(cancelled)")
+            return
         logger.error("Transcription job failed: %s", exc, exc_info=True)
-        return _empty_outputs(f"ERROR: {exc}")
+        yield _empty_outputs(f"ERROR: {exc}")
     except Exception as exc:  # pylint: disable=broad-exception-caught
         logger.error("Transcription job failed: %s", exc, exc_info=True)
-        return _empty_outputs(f"ERROR: {exc}")
+        yield _empty_outputs(f"ERROR: {exc}")
 
 
 def _job_id_from_info(job_info: str) -> str | None:
@@ -586,7 +600,7 @@ def build_ui() -> gr.Blocks:
             fn=check_ready,
             outputs=[load_status, media_input, transcribe_btn],
         )
-        demo.queue()
+        demo.queue(default_concurrency_limit=4)
 
     return demo
 
@@ -603,4 +617,5 @@ if __name__ == "__main__":
         max_threads=40,
         theme=_SoftTheme(),
         css=APP_CSS,
+        show_api=False,
     )
