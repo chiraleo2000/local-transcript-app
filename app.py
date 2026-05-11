@@ -617,5 +617,4 @@ if __name__ == "__main__":
         max_threads=40,
         theme=_SoftTheme(),
         css=APP_CSS,
-        show_api=False,
     )
