@@ -233,7 +233,7 @@ AUDIO_ENHANCE_NOISE_REDUCTION=0.65    # Spectral gating strength (0–1)
 
 ```dotenv
 DIARIZATION_MODEL_ID=pyannote/speaker-diarization-3.1
-DIARIZATION_DEVICE=cpu                # cpu = reserve GPU for ASR
+DIARIZATION_DEVICE=cuda                # cuda = fast GPU embeddings (recommended)
 DIARIZATION_PREPROCESS_SR=44100       # Intermediate rate before 16 kHz downsample
 DIARIZATION_NOISE_REDUCTION=0.60      # NR strength for diarization audio
 
@@ -508,7 +508,7 @@ AUDIO_ENHANCE_MAX_GAIN_DB=10.0            # cap boost so noise does not explode
 AUDIO_ENHANCE_NOISE_REDUCTION=0.65        # less destructive than heavy gating
 
 DIARIZATION_MODEL_ID=pyannote/speaker-diarization-3.1
-DIARIZATION_DEVICE=cpu                    # reserve GPU VRAM for ASR
+DIARIZATION_DEVICE=cuda                    # cuda = GPU diarization (much faster embeddings)
 DIARIZATION_CUDA_MIN_VRAM_MB=12288
 ```
 
