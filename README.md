@@ -43,7 +43,7 @@ run.bat gui
 ./run.sh gui
 ```
 
-Or open manually: **http://localhost:7896**
+Or open manually: **<http://localhost:7896>**
 
 ---
 
@@ -123,7 +123,7 @@ Supported: `.mp3`, `.wav`, `.m4a`, `.flac`, `.ogg`, `.mp4`, `.mov`, `.mkv`, `.av
 ### 2. Configure options
 
 | Setting | Default | Notes |
-|---|---|---|
+| --- | --- | --- |
 | **Language** | Thai | Dropdown — choose the spoken language |
 | **Local ASR Engines** | Typhoon Whisper | Tick one or both; dual-engine runs sequentially on 8 GB GPUs |
 | **Audio Enhancement** | Off | Noise gate → spectral NR → compressor → limiter chain |
@@ -136,7 +136,7 @@ Supported: `.mp3`, `.wav`, `.m4a`, `.flac`, `.ogg`, `.mp4`, `.mov`, `.mkv`, `.av
 Visible only when **Speaker Diarization** is checked.
 
 | Slider | What it does | Tune when… |
-|---|---|---|
+| --- | --- | --- |
 | **Segmentation Threshold** (0.42) | Activity threshold; lower = catches quieter / shorter turns | Speakers are missed or turns are cut short |
 | **Min Silence Gap** (0.10 s) | Minimum gap before splitting a turn | Too many spurious splits — raise it |
 | **Clustering Threshold** (0.60) | Speaker embedding distance; lower = more speakers separated | Different speakers are merged into one — lower it |
@@ -150,6 +150,7 @@ Results appear in the **Typhoon Whisper** and **Thonburian Whisper** tabs.
 ### 5. Results
 
 Each engine tab shows:
+
 - **Transcript** — full text with speaker labels and timestamps when diarization is on
 - **Elapsed Time** — wall time for that engine
 - **Download .txt** — save the transcript
@@ -258,7 +259,7 @@ LOCAL_LLM_MAX_TOKENS=4096
 ## Hardware Support
 
 | Hardware | Mode |
-|---|---|
+| --- | --- |
 | NVIDIA GPU ≥ 8 GB VRAM | CUDA (PyTorch) |
 | NVIDIA GPU < 8 GB VRAM | OpenVINO / CPU fallback |
 | Intel GPU / NPU | OpenVINO GPU or NPU |
@@ -309,7 +310,7 @@ storage/logs/                 — optional log files
 ## Troubleshooting
 
 | Symptom | Fix |
-|---|---|
+| --- | --- |
 | GPU not used | Requires NVIDIA GPU ≥ 8 GB VRAM and CUDA drivers |
 | Models download on every start | Set `HF_HUB_OFFLINE=1` in `.env` after bootstrap |
 | Video upload fails | Install FFmpeg and add it to PATH |
@@ -324,8 +325,7 @@ storage/logs/                 — optional log files
 
 All processing is local. No audio, video, or transcript data is sent to any cloud service. Internet access is used only during model download (bootstrap).
 
-
-## Features
+## Full Feature List
 
 - Audio file transcription.
 - Video file transcription by extracting audio locally with FFmpeg.
@@ -337,7 +337,7 @@ All processing is local. No audio, video, or transcript data is sent to any clou
 - Folder-based storage inside the app path.
 - Hardware-aware backend selection for NVIDIA GPU, Intel OpenVINO GPU/NPU, AMD GPU fallback, and CPU-only systems.
 
-## Project Structure
+## Detailed Project Structure
 
 ```text
 local-transcript-app/
@@ -403,7 +403,7 @@ setup.bat
 
 ## Starting The App
 
-### Windows
+### Windows (Starting The App)
 
 **First time only** — install dependencies and download models:
 
@@ -518,9 +518,7 @@ Each job manifest records `audio_duration_s`, `total_elapsed_s`, `target_elapsed
 
 Press `Ctrl+C` in the terminal window where `app.py` is running.
 
-## Runtime Storage
-
-The app creates these folders automatically:
+## Runtime Storage Layout
 
 ```text
 config/app_config.json
@@ -535,9 +533,7 @@ storage/logs/
 
 Transcripts are written to `storage/transcripts/`. Job metadata is written to `storage/jobs/` as JSON.
 
-## Model Bootstrap
-
-Run this after dependency install:
+## Model Bootstrap Script
 
 ```bash
 python scripts/bootstrap_models.py
@@ -601,11 +597,11 @@ LOCAL_LLM_MODEL=llama3.1:8b
 
 If the local LLM server or model is unavailable, the app keeps the original transcript and reports that correction was skipped.
 
-## Privacy
+## Privacy Statement
 
 Audio/video processing, transcription, diarization, transcript storage, and optional correction are local. The app does not send files to Azure, OpenAI, or any cloud transcription service. Internet access is used only when the user installs/downloads models.
 
-## Troubleshooting
+## Troubleshooting Reference
 
 ### NVIDIA GPU Found But Not Used
 

@@ -87,7 +87,9 @@ def default_asr_engines() -> list[str]:
         selected = [engine for engine in names if engine in ALL_ENGINES]
         if selected:
             return selected
-        logger.warning("ASR_DEFAULT_ENGINES=%r has no known engines; using policy default.", configured)
+        logger.warning(
+            "ASR_DEFAULT_ENGINES=%r has no known engines; using policy default.", configured
+        )
     if strict_memory_mode_active():
         return FAST_8GB_ENGINES.copy()
     return ALL_ENGINES.copy()

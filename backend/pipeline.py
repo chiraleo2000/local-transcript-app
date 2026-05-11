@@ -92,7 +92,7 @@ def _error_result(engine: str, exc: Exception) -> dict:
 
 def _is_cuda_oom(exc: Exception) -> bool:
     try:
-        import torch
+        import torch  # pylint: disable=import-outside-toplevel
 
         if isinstance(exc, torch.cuda.OutOfMemoryError):
             return True
@@ -197,7 +197,9 @@ def _run_asr_engines(
     workers = asr_worker_count(len(selected))
     logger.info("Running %d ASR engine(s) with %d worker(s).", len(selected), workers)
     if workers == 1:
-        results = _run_asr_sequential(job_id, selected, process_path, language, diar_segments, cancel_event)
+        results = _run_asr_sequential(
+            job_id, selected, process_path, language, diar_segments, cancel_event
+        )
         return results, workers
 
     results = _run_asr_parallel(job_id, selected, process_path, language, diar_segments, workers)
@@ -247,9 +249,13 @@ def run_transcription_job(
 
     selected = _selected_engines(selected_engines)
     n_min, n_max = _speaker_bounds(diarization, min_speakers, max_speakers)
-    diar_segments = _run_diarization(process_path, diarization, n_min, n_max, diarize_kwargs=diarize_kwargs)
+    diar_segments = _run_diarization(
+        process_path, diarization, n_min, n_max, diarize_kwargs=diarize_kwargs
+    )
     _check_cancel(cancel_event)
-    results, workers = _run_asr_engines(job_id, selected, process_path, language, diar_segments, cancel_event)
+    results, workers = _run_asr_engines(
+        job_id, selected, process_path, language, diar_segments, cancel_event
+    )
     _clear_asr_models(selected)
 
     total_elapsed_s = time.perf_counter() - job_started

@@ -84,7 +84,6 @@ from backend.services.asr_local import (
     LANGUAGES,
     default_asr_engines,
     load_model,
-    strict_memory_mode_active,
 )
 from backend.services.correction_local import correct_with_local_llm
 from backend.services.hardware_policy import detect_hardware, hardware_summary
@@ -94,6 +93,7 @@ from backend.storage import ensure_app_dirs, save_transcript
 
 LABEL_ELAPSED = "Elapsed Time"
 LABEL_DOWNLOAD = "Download .txt"
+_CANCELLED = "(cancelled)"
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv", ".wmv", ".m4v", ".ts"}
 
 APP_CSS = """
@@ -157,7 +157,6 @@ def _preload_models() -> None:
         _models_ready.set()
         logger.info("Model preload finished.")
 
-    import threading
     threading.Thread(target=_worker, daemon=True).start()
 
 
@@ -246,8 +245,8 @@ def _reset_ui_outputs() -> tuple:
     no_dl = gr.update(value=None, interactive=False)
     no_btn = gr.update(interactive=False)
     return (
-        "(cancelled)", "", no_dl, no_btn,
-        "(cancelled)", "", no_dl, no_btn,
+        _CANCELLED, "", no_dl, no_btn,
+        _CANCELLED, "", no_dl, no_btn,
         "Cancelled by user.",
     )
 
@@ -263,7 +262,7 @@ def transcribe(
     diar_min_off,
     diar_clust_threshold,
     diar_clust_min_size,
-    progress=gr.Progress(track_tqdm=True),
+    _progress=gr.Progress(track_tqdm=True),
 ):
     """Gradio callback — generator so the UI clears immediately, then blocks.
 
@@ -317,13 +316,13 @@ def transcribe(
             cancel_event=_cancel_event,
         )
         if _cancel_event.is_set():
-            yield _empty_outputs("(cancelled)")
+            yield _empty_outputs(_CANCELLED)
             return
         # Yield 2 — push the completed result to the browser.
         yield _build_outputs(result, selected_engines or default_asr_engines())
     except RuntimeError as exc:
         if "cancelled" in str(exc).lower():
-            yield _empty_outputs("(cancelled)")
+            yield _empty_outputs(_CANCELLED)
             return
         logger.error("Transcription job failed: %s", exc, exc_info=True)
         yield _empty_outputs(f"ERROR: {exc}")

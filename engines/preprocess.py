@@ -36,7 +36,7 @@ _FFMPEG_EXE_NAME = "ffmpeg.exe"
 
 def _locate_ffmpeg_in_registry() -> str | None:
     """Search Windows registry PATH for ffmpeg."""
-    import winreg
+    import winreg  # pylint: disable=import-outside-toplevel
 
     paths = []
     for hive, subkey in [
@@ -174,9 +174,9 @@ def _ffmpeg_stage(audio_path: str, out_path: str) -> bool:
 def _noisereduce_stage(wav_path: str, out_path: str) -> bool:
     """Apply non-stationary spectral gating noise reduction. Returns True on success."""
     try:
-        import librosa
-        import soundfile as sf
-        import noisereduce as nr
+        import librosa  # pylint: disable=import-outside-toplevel
+        import soundfile as sf  # pylint: disable=import-outside-toplevel
+        import noisereduce as nr  # pylint: disable=import-outside-toplevel
 
         y, sr = librosa.load(wav_path, sr=16000, mono=True)
         reduced = nr.reduce_noise(
@@ -202,8 +202,8 @@ def _noisereduce_stage(wav_path: str, out_path: str) -> bool:
 def _pedalboard_stage(wav_path: str, out_path: str) -> bool:
     """Apply NoiseGate → Compressor → Limiter, then controlled peak gain."""
     try:
-        from pedalboard import Pedalboard, NoiseGate, Compressor, Limiter
-        from pedalboard.io import AudioFile
+        from pedalboard import Pedalboard, NoiseGate, Compressor, Limiter  # pylint: disable=import-outside-toplevel
+        from pedalboard.io import AudioFile  # pylint: disable=import-outside-toplevel
 
         board = Pedalboard([
             # Very soft gate — only kills true silence below -50dB.

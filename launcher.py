@@ -18,6 +18,7 @@ import importlib
 import os
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 import webbrowser
@@ -74,7 +75,7 @@ def _docker_available() -> bool:
             ["docker", "info"], capture_output=True, timeout=8, check=False
         )
         return r.returncode == 0
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+    except (subprocess.TimeoutExpired, OSError):
         return False
 
 
@@ -86,7 +87,7 @@ def _gpu_in_docker() -> bool:
             capture_output=True, timeout=30, check=False,
         )
         return r.returncode == 0
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+    except (subprocess.TimeoutExpired, OSError):
         return False
 
 
@@ -126,7 +127,6 @@ def _open_native_window() -> None:
                 print(f"[launcher] Server did not respond in 180 s — loading {APP_URL} anyway.")
             window.load_url(APP_URL)
 
-        import threading
         threading.Thread(target=_navigate, daemon=True).start()
         webview.start(debug=False)
 
@@ -154,7 +154,7 @@ def _start_docker() -> subprocess.Popen | None:
         )
         proc.wait()
         return None  # Docker manages the server process; nothing to terminate
-    except (FileNotFoundError, OSError) as exc:
+    except OSError as exc:
         print(f"[launcher] docker compose failed: {exc}")
         return None
 
@@ -179,6 +179,7 @@ def _start_direct() -> subprocess.Popen:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    """Parse CLI flags and start the chosen backend, then open the desktop window."""
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--docker", action="store_true")
     parser.add_argument("--direct", action="store_true")

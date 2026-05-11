@@ -334,7 +334,9 @@ def _load_audio(audio_path: str):
     return {"raw": y, "sampling_rate": sr}
 
 
-def _run_pipe(pipe, audio_input, language: str, timestamp_mode, batch_size: int, chunk_length_s=None):
+def _run_pipe(
+    pipe, audio_input, language: str, timestamp_mode, batch_size: int, chunk_length_s=None
+):
     kwargs = {
         "batch_size": batch_size,
         "generate_kwargs": {"language": language, "task": "transcribe", "num_beams": 1},

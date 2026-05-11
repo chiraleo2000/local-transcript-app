@@ -50,6 +50,7 @@ def ensure_app_dirs() -> None:
 
 
 def read_config() -> dict[str, Any]:
+    """Read the persisted app config JSON, returning an empty dict on any failure."""
     ensure_app_dirs()
     if not APP_CONFIG_PATH.exists():
         return {}
@@ -60,6 +61,7 @@ def read_config() -> dict[str, Any]:
 
 
 def write_config(config: dict[str, Any]) -> None:
+    """Write *config* to the persisted app config JSON file."""
     ensure_app_dirs()
     APP_CONFIG_PATH.write_text(
         json.dumps(config, ensure_ascii=False, indent=2),
@@ -68,24 +70,27 @@ def write_config(config: dict[str, Any]) -> None:
 
 
 def update_config(**values: Any) -> dict[str, Any]:
+    """Merge *values* into the persisted config and return the updated dict."""
     config = read_config()
     config.update(values)
-    write_config(config)
     return config
 
 
 def new_job_id() -> str:
+    """Return a unique job ID string based on the current UTC timestamp plus a random suffix."""
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     return f"{stamp}_{uuid.uuid4().hex[:8]}"
 
 
 def safe_name(value: str) -> str:
+    """Sanitise *value* for use as a filesystem-safe filename component."""
     value = value.strip().replace(" ", "_")
     value = re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
     return value.strip("._") or "transcript"
 
 
 def save_transcript(job_id: str, engine_name: str, text: str) -> str | None:
+    """Write *text* to a transcript file and return its path, or None if skipped."""
     if not text or text.startswith(("(", "ERROR")):
         return None
     ensure_app_dirs()
@@ -95,6 +100,7 @@ def save_transcript(job_id: str, engine_name: str, text: str) -> str | None:
 
 
 def save_job_manifest(job_id: str, manifest: dict[str, Any]) -> str:
+    """Serialise *manifest* to a per-job JSON file and return its path."""
     ensure_app_dirs()
     path = JOB_DIR / f"{job_id}.json"
     path.write_text(
@@ -105,4 +111,4 @@ def save_job_manifest(job_id: str, manifest: dict[str, Any]) -> str:
 
 
 def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    """Return the current UTC time as an ISO-8601 string."""
