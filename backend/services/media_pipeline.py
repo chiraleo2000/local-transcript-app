@@ -24,6 +24,7 @@ def normalize_media(media_path: str, job_id: str) -> str:
     ensure_app_dirs()
     source = Path(media_path)
     if source.suffix.lower() not in VIDEO_EXTENSIONS:
+        logger.info("Media normalization: using source audio directly: %s", media_path)
         return media_path
 
     ffmpeg = shutil.which("ffmpeg")
@@ -48,6 +49,7 @@ def normalize_media(media_path: str, job_id: str) -> str:
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=600, check=False)
     if result.returncode != 0:
         raise RuntimeError(f"Video audio extraction failed: {result.stderr[-800:]}")
+    logger.info("Media normalization: extracted video audio to %s", output)
     return str(output)
 
 
@@ -74,6 +76,7 @@ def enhance_audio(audio_path: str) -> str:
     enhanced_path = preprocess_audio(audio_path)
     if enhanced_path != audio_path and os.path.isfile(enhanced_path):
         _enhance_cache[key] = enhanced_path
+        logger.info("Audio enhancement complete: %s", enhanced_path)
     return enhanced_path
 
 

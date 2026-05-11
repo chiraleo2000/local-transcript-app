@@ -130,7 +130,7 @@ def _retry_chunk_length_s() -> int:
 
 def _timestamp_mode(diarization_segments: list | None):
     if diarization_segments and _env_bool("ASR_WORD_TIMESTAMPS_WITH_DIARIZATION", True):
-        if _strict_8gb_mode() and not _env_bool("TYPHOON_WORD_TIMESTAMPS_ON_8GB", False):
+        if _strict_8gb_mode() and not _env_bool("TYPHOON_WORD_TIMESTAMPS_ON_8GB", True):
             logger.info("Typhoon strict 8 GB mode uses chunk timestamps to avoid CUDA OOM.")
             return True
         return "word"
@@ -363,7 +363,20 @@ def transcribe_typhoon(
     """
     pipe = _get_pipeline()
     audio_input = _load_audio(audio_path)
+    from engines.timestamps import audio_duration_from_input, repair_asr_result
+
+    audio_duration_s = audio_duration_from_input(audio_input)
     timestamp_mode = _timestamp_mode(diarization_segments)
+    logger.info(
+        "Typhoon transcription started: audio=%.1fs language=%s diarization=%s "
+        "timestamp_mode=%s batch=%d chunk=%ds",
+        audio_duration_s,
+        language,
+        bool(diarization_segments),
+        timestamp_mode,
+        _asr_batch_size(),
+        _chunk_length_s(),
+    )
     try:
         result = _run_pipe(pipe, audio_input, language, timestamp_mode, _asr_batch_size())
     except Exception as exc:  # pylint: disable=broad-exception-caught
@@ -377,12 +390,7 @@ def transcribe_typhoon(
         )
         _clear_cuda_cache()
         result = _run_pipe(pipe, audio_input, language, True, 1, retry_chunk_s)
-    logger.debug(
-        "Typhoon result: text_len=%d chunks=%d first_ts=%s",
-        len(result.get("text", "")),
-        len(result.get("chunks", [])),
-        result.get("chunks", [{}])[0].get("timestamp") if result.get("chunks") else "N/A",
-    )
+    result = repair_asr_result(result, audio_duration_s, "Typhoon", logger)
 
     if diarization_segments:
         from engines.diarization import assign_speakers

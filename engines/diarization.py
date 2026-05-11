@@ -217,89 +217,148 @@ def _prepare_audio_for_pyannote(audio_path: str) -> dict:
     call torchcodec's AudioDecoder for metadata, which fails with that stub.
     The supported pyannote workaround is to pass a preloaded audio dictionary.
     """
-    import librosa
     import torch
 
-    ffmpeg = shutil.which("ffmpeg")
-    base = os.path.splitext(audio_path)[0]
-
-    # Intermediate rate — higher quality for noise reduction before 16kHz downsample.
     preprocess_sr = _env_int("DIARIZATION_PREPROCESS_SR", 44100)
     noise_reduction = _env_float("DIARIZATION_NOISE_REDUCTION", 0.60)
-
-    inter_path = base + "_diarize_inter.wav"
-    source_path = audio_path
-    tmp_files: list[str] = []
-
-    already_ready = _is_16k_mono_wav(audio_path) and preprocess_sr == 16000 and noise_reduction <= 0.0
-
-    if ffmpeg is not None and not already_ready:
-        # Speech-optimised bandpass: strip rumble (<80 Hz) and high-freq hiss
-        # (>8 kHz is above Nyquist of 16kHz anyway); loudnorm evens out level
-        # differences so quieter speakers are not lost during NR.
-        bandpass = "highpass=f=80,lowpass=f=8000"
-        loudnorm = "loudnorm=I=-16:TP=-1.5:LRA=11"
-        diarize_filters = f"{bandpass},{loudnorm}"
-        cmd = [
-            ffmpeg, "-y", "-i", audio_path,
-            "-af", diarize_filters,
-            "-ar", str(preprocess_sr),
-            "-ac", "1",
-            "-sample_fmt", "s16",
-            "-vn",
-            inter_path,
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300, check=False)
-        if result.returncode == 0:
-            source_path = inter_path
-            tmp_files.append(inter_path)
-        else:
-            logger.warning(
-                "ffmpeg diarization prep failed (%s); loading original with librosa.",
-                result.stderr[-300:],
-            )
-    elif ffmpeg is None and not already_ready:
-        logger.warning("ffmpeg not found — loading original audio with librosa.")
-
-    # Optional noise reduction at the intermediate sample rate.
-    if noise_reduction > 0.0 and source_path != audio_path:
-        try:
-            import noisereduce as nr
-            import soundfile as sf
-
-            y_inter, sr_inter = librosa.load(source_path, sr=preprocess_sr, mono=True)
-            y_reduced = nr.reduce_noise(
-                y=y_inter,
-                sr=sr_inter,
-                stationary=False,
-                prop_decrease=noise_reduction,
-                n_fft=2048,
-                freq_mask_smooth_hz=500,
-                time_mask_smooth_ms=50,
-            )
-            nr_path = base + "_diarize_nr.wav"
-            sf.write(nr_path, y_reduced, sr_inter, subtype="PCM_16")
-            source_path = nr_path
-            tmp_files.append(nr_path)
-            logger.info("Diarization noise reduction applied (prop=%.2f) at %d Hz.", noise_reduction, sr_inter)
-        except (ImportError, OSError, ValueError, RuntimeError) as exc:
-            logger.warning("Diarization noise reduction skipped: %s", exc)
+    source_path, tmp_files = _build_diarization_source(
+        audio_path, preprocess_sr, noise_reduction
+    )
 
     try:
-        # Final downsample to 16 kHz for pyannote.
-        waveform, sample_rate = librosa.load(source_path, sr=16000, mono=True)
+        waveform, sample_rate = _load_diarization_waveform(source_path)
     finally:
-        for tmp in tmp_files:
-            if os.path.isfile(tmp):
-                try:
-                    os.remove(tmp)
-                except OSError:
-                    pass
+        _cleanup_tmp_files(tmp_files)
 
     tensor = torch.from_numpy(waveform).float().unsqueeze(0)
     duration = tensor.shape[-1] / 16000 if tensor.shape[-1] else 0.0
-    logger.info("Prepared diarization audio: %.1fs at %d Hz (intermediate: %d Hz)", duration, sample_rate, preprocess_sr)
+    logger.info(
+        "Prepared diarization audio: %.1fs at %d Hz (intermediate=%d Hz, nr=%.2f)",
+        duration,
+        sample_rate,
+        preprocess_sr,
+        noise_reduction,
+    )
     return {"waveform": tensor, "sample_rate": 16000}
+
+
+def _build_diarization_source(
+    audio_path: str,
+    preprocess_sr: int,
+    noise_reduction: float,
+) -> tuple[str, list[str]]:
+    """Return a pyannote-ready source path plus temporary files to remove."""
+    ffmpeg = shutil.which("ffmpeg")
+    source_path = audio_path
+    tmp_files: list[str] = []
+    already_ready = (
+        _is_16k_mono_wav(audio_path)
+        and preprocess_sr == 16000
+        and noise_reduction <= 0.0
+    )
+
+    if ffmpeg and not already_ready:
+        source_path = _run_ffmpeg_diarization_prep(ffmpeg, audio_path, preprocess_sr)
+        if source_path != audio_path:
+            tmp_files.append(source_path)
+    elif not ffmpeg and not already_ready:
+        logger.warning("ffmpeg not found - loading original audio with librosa.")
+
+    if noise_reduction > 0.0 and source_path != audio_path:
+        source_path = _apply_diarization_noise_reduction(
+            source_path,
+            os.path.splitext(audio_path)[0],
+            preprocess_sr,
+            noise_reduction,
+            tmp_files,
+        )
+    return source_path, tmp_files
+
+
+def _run_ffmpeg_diarization_prep(
+    ffmpeg: str,
+    audio_path: str,
+    preprocess_sr: int,
+) -> str:
+    """Run FFmpeg bandpass/loudness normalization for diarization."""
+    inter_path = os.path.splitext(audio_path)[0] + "_diarize_inter.wav"
+    diarize_filters = "highpass=f=80,lowpass=f=8000,loudnorm=I=-16:TP=-1.5:LRA=11"
+    cmd = [
+        ffmpeg, "-y", "-i", audio_path,
+        "-af", diarize_filters,
+        "-ar", str(preprocess_sr),
+        "-ac", "1",
+        "-sample_fmt", "s16",
+        "-vn",
+        inter_path,
+    ]
+    logger.info(
+        "Preparing diarization audio with ffmpeg: sr=%d filters=%s",
+        preprocess_sr,
+        diarize_filters,
+    )
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300, check=False)
+    if result.returncode == 0:
+        return inter_path
+    logger.warning(
+        "ffmpeg diarization prep failed (%s); loading original with librosa.",
+        result.stderr[-300:],
+    )
+    return audio_path
+
+
+def _apply_diarization_noise_reduction(
+    source_path: str,
+    base_path: str,
+    preprocess_sr: int,
+    noise_reduction: float,
+    tmp_files: list[str],
+) -> str:
+    """Apply optional noisereduce pass to the diarization source file."""
+    try:
+        import librosa
+        import noisereduce as nr
+        import soundfile as sf
+
+        y_inter, sr_inter = librosa.load(source_path, sr=preprocess_sr, mono=True)
+        y_reduced = nr.reduce_noise(
+            y=y_inter,
+            sr=sr_inter,
+            stationary=False,
+            prop_decrease=noise_reduction,
+            n_fft=2048,
+            freq_mask_smooth_hz=500,
+            time_mask_smooth_ms=50,
+        )
+        nr_path = base_path + "_diarize_nr.wav"
+        sf.write(nr_path, y_reduced, sr_inter, subtype="PCM_16")
+        tmp_files.append(nr_path)
+        logger.info(
+            "Diarization noise reduction applied (prop=%.2f) at %d Hz.",
+            noise_reduction,
+            sr_inter,
+        )
+        return nr_path
+    except (ImportError, OSError, ValueError, RuntimeError) as exc:
+        logger.warning("Diarization noise reduction skipped: %s", exc)
+        return source_path
+
+
+def _load_diarization_waveform(source_path: str):
+    """Load the final diarization waveform as 16 kHz mono."""
+    import librosa
+
+    return librosa.load(source_path, sr=16000, mono=True)
+
+
+def _cleanup_tmp_files(tmp_files: list[str]) -> None:
+    """Remove temporary diarization audio files."""
+    for tmp in tmp_files:
+        if os.path.isfile(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
 
 def _is_16k_mono_wav(audio_path: str) -> bool:
@@ -387,7 +446,12 @@ def diarize(
     pipe = _get_diarization_pipeline()
 
     # Apply per-call UI overrides (re-instantiate pipeline params for this run).
-    override = _override_params(seg_threshold, seg_min_duration_off, clust_threshold, clust_min_size)
+    override = _override_params(
+        seg_threshold,
+        seg_min_duration_off,
+        clust_threshold,
+        clust_min_size,
+    )
     if override:
         try:
             pipe.instantiate(override)
@@ -398,7 +462,7 @@ def diarize(
     kwargs = _build_diarize_kwargs(num_speakers, min_speakers, max_speakers)
     audio_input = _prepare_audio_for_pyannote(audio_path)
 
-    logger.info("Running diarization on preloaded waveform  kwargs=%s ...", kwargs or "(auto)")
+    logger.info("Running diarization on preloaded waveform kwargs=%s ...", kwargs or "(auto)")
     diarization = _run_pyannote(pipe, audio_input, kwargs)
 
     # pyannote 3.x returns Annotation directly; some community wrappers wrap it.
@@ -420,7 +484,7 @@ def diarize(
     )
 
     if not segments:
-        logger.warning("Diarization produced no segments — transcript will have no speaker labels.")
+        logger.warning("Diarization produced no segments; transcript will have no speaker labels.")
         return segments
 
     if len(unique_raw) == 1 and (min_speakers > 1 or num_speakers > 1):
@@ -660,7 +724,7 @@ def assign_speakers(result: dict, diarization_segments: list[dict]) -> str:
             chunk_ts_end = max(chunk_ts_end, ts[1])
     total_dur = max(diar_end, chunk_ts_end)
 
-    logger.debug(
+    logger.info(
         "assign_speakers: total_chunks=%d  all_ts_none=%s  total_dur=%.1fs  "
         "diar_segments=%d  speakers=%s",
         total_chunks, all_ts_none, total_dur,
@@ -690,5 +754,6 @@ def assign_speakers(result: dict, diarization_segments: list[dict]) -> str:
         group_end = c_end
 
     _flush_speaker_group(lines, current_speaker, current_words, group_start, group_end)
+    logger.info("assign_speakers complete: output_lines=%d", len(lines))
     return "\n".join(lines) if lines else _NO_SPEECH
 

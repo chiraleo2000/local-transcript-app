@@ -189,6 +189,12 @@ def transcribe_engine(
     """Run one ASR engine and return transcript text plus elapsed seconds."""
     whisper_language = LANGUAGES.get(language, LANGUAGES["Thai"])
     started = time.perf_counter()
+    logger.info(
+        "ASR engine starting: engine=%s language=%s diarization_segments=%d",
+        engine_name,
+        whisper_language,
+        len(diarization_segments or []),
+    )
     if engine_name == ENGINE_TYPHOON:
         from engines.typhoon_asr import transcribe_typhoon
 
@@ -199,4 +205,11 @@ def transcribe_engine(
         text = transcribe_thonburian(audio_path, whisper_language, diarization_segments)
     else:
         raise ValueError(f"Unknown ASR engine: {engine_name}")
-    return text, time.perf_counter() - started
+    elapsed = time.perf_counter() - started
+    logger.info(
+        "ASR engine finished: engine=%s elapsed=%.2fs transcript_chars=%d",
+        engine_name,
+        elapsed,
+        len(text),
+    )
+    return text, elapsed

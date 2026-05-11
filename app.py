@@ -359,6 +359,7 @@ def correct_transcript(engine_name: str, text: str, elapsed: str, job_info: str)
 
 
 def build_ui() -> gr.Blocks:
+    """Build and wire the Gradio application UI."""
     hw_md = hardware_summary()
 
     with gr.Blocks(title="Local Transcript App") as demo:

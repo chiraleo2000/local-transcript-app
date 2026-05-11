@@ -56,9 +56,18 @@ def _run_diarization(
     diarize_kwargs: dict | None = None,
 ) -> list[dict] | None:
     if not enabled:
+        logger.info("Diarization disabled for this job.")
         return None
     try:
-        return diarize_audio(process_path, n_min, n_max, diarize_kwargs=diarize_kwargs)
+        logger.info(
+            "Diarization starting: min_speakers=%d max_speakers=%d overrides=%s",
+            n_min,
+            n_max,
+            diarize_kwargs or {},
+        )
+        segments = diarize_audio(process_path, n_min, n_max, diarize_kwargs=diarize_kwargs)
+        logger.info("Diarization finished: segments=%d", len(segments))
+        return segments
     except Exception as exc:  # pylint: disable=broad-exception-caught
         logger.error("Diarization failed: %s", exc, exc_info=True)
         return None
@@ -69,6 +78,14 @@ def _run_diarization(
 
 def _success_result(job_id: str, engine: str, text: str, elapsed: float) -> dict:
     transcript_path = save_transcript(job_id, engine, text)
+    logger.info(
+        "Job %s ASR success: engine=%s elapsed=%.2fs chars=%d transcript=%s",
+        job_id,
+        engine,
+        elapsed,
+        len(text),
+        transcript_path,
+    )
     return {
         "text": text,
         "elapsed": elapsed,
@@ -240,15 +257,28 @@ def run_transcription_job(
     """Run the full local transcript pipeline and persist outputs."""
     job_started = time.perf_counter()
     job_id = new_job_id()
+    logger.info(
+        "Job %s started: source=%s engines=%s language=%s diarization=%s enhance=%s",
+        job_id,
+        media_path,
+        selected_engines,
+        language,
+        diarization,
+        enhance,
+    )
     process_path = normalize_media(media_path, job_id)
+    logger.info("Job %s normalized media path: %s", job_id, process_path)
     _check_cancel(cancel_event)
     if enhance:
         process_path = enhance_audio(process_path)
+        logger.info("Job %s enhanced audio path: %s", job_id, process_path)
     _check_cancel(cancel_event)
     audio_duration_s = audio_duration_seconds(process_path)
+    logger.info("Job %s audio duration: %.2fs", job_id, audio_duration_s)
 
     selected = _selected_engines(selected_engines)
     n_min, n_max = _speaker_bounds(diarization, min_speakers, max_speakers)
+    logger.info("Job %s selected engines after policy: %s", job_id, selected)
     diar_segments = _run_diarization(
         process_path, diarization, n_min, n_max, diarize_kwargs=diarize_kwargs
     )
