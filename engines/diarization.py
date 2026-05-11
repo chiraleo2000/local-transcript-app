@@ -756,4 +756,3 @@ def assign_speakers(result: dict, diarization_segments: list[dict]) -> str:
     _flush_speaker_group(lines, current_speaker, current_words, group_start, group_end)
     logger.info("assign_speakers complete: output_lines=%d", len(lines))
     return "\n".join(lines) if lines else _NO_SPEECH
-
