@@ -1,5 +1,7 @@
 """Hardware detection and backend selection policy for local inference."""
 
+# pylint: disable=import-outside-toplevel
+
 from __future__ import annotations
 
 import logging
@@ -12,7 +14,7 @@ from backend.storage import update_config
 
 logger = logging.getLogger(__name__)
 
-MIN_NVIDIA_VRAM_MB = 6 * 1024
+MIN_NVIDIA_VRAM_MB = 8000
 _hw_cache: list[dict] = []
 
 
@@ -85,7 +87,11 @@ def _detect_amd_gpu() -> bool:
         return False
 
 
-def _select_openvino_device(torch_info: dict, ov_info: dict, has_amd_gpu: bool) -> tuple[str, str]:
+def _select_openvino_device(
+    torch_info: dict,
+    ov_info: dict,
+    has_amd_gpu: bool,
+) -> tuple[str, str]:
     devices = ov_info["available_devices"]
     env_device = os.getenv("OV_DEVICE", "").upper()
     if env_device == "AUTO":
@@ -95,25 +101,44 @@ def _select_openvino_device(torch_info: dict, ov_info: dict, has_amd_gpu: bool) 
     if ov_info["npu"]:
         return "NPU", "OpenVINO NPU detected and selected."
     if ov_info["gpu"]:
-        return next(device for device in devices if device.startswith("GPU")), "OpenVINO GPU detected and selected."
+        return (
+            next(device for device in devices if device.startswith("GPU")),
+            "OpenVINO GPU detected and selected.",
+        )
     if torch_info["cuda"]:
-        return "CPU", "NVIDIA GPU has less than 6 GB VRAM; using OpenVINO CPU fallback."
+        return "CPU", "NVIDIA GPU has less than 8 GB VRAM; using OpenVINO CPU fallback."
     if has_amd_gpu:
         return "CPU", "AMD GPU detected; using OpenVINO CPU fallback in v1."
     return "CPU", "OpenVINO CPU selected."
 
 
-def _select_backend(torch_info: dict, ov_info: dict, has_amd_gpu: bool) -> tuple[str, str, str, bool]:
-    nvidia_vram_ok = bool(torch_info["cuda"] and torch_info["cuda_vram_mb"] >= MIN_NVIDIA_VRAM_MB)
+def _select_backend(
+    torch_info: dict,
+    ov_info: dict,
+    has_amd_gpu: bool,
+) -> tuple[str, str, str, bool]:
+    nvidia_vram_ok = bool(
+        torch_info["cuda"] and torch_info["cuda_vram_mb"] >= MIN_NVIDIA_VRAM_MB
+    )
     if torch_info["cuda"] and nvidia_vram_ok:
-        return "cuda", "cuda", "NVIDIA CUDA selected; VRAM meets the 6 GB minimum.", nvidia_vram_ok
+        return "cuda", "cuda", "NVIDIA CUDA selected; VRAM meets the 8 GB minimum.", nvidia_vram_ok
     if ov_info["openvino_version"]:
         device, reason = _select_openvino_device(torch_info, ov_info, has_amd_gpu)
         return "openvino", device, reason, nvidia_vram_ok
     if torch_info["cuda"]:
-        return "cpu", "cpu", "NVIDIA GPU has less than 6 GB VRAM and OpenVINO is unavailable; using CPU.", nvidia_vram_ok
+        return (
+            "cpu",
+            "cpu",
+            "NVIDIA GPU has less than 8 GB VRAM and OpenVINO is unavailable; using CPU.",
+            nvidia_vram_ok,
+        )
     if has_amd_gpu:
-        return "cpu", "cpu", "AMD GPU detected; no AMD acceleration path enabled in v1, using CPU.", nvidia_vram_ok
+        return (
+            "cpu",
+            "cpu",
+            "AMD GPU detected; no AMD acceleration path enabled in v1, using CPU.",
+            nvidia_vram_ok,
+        )
     return "cpu", "cpu", "No CUDA/OpenVINO acceleration detected; using CPU.", nvidia_vram_ok
 
 
@@ -153,6 +178,7 @@ def detect_hardware(refresh: bool = False) -> dict:
 
 
 def hardware_summary() -> str:
+    """Return a Markdown summary of the selected hardware backend."""
     hw = detect_hardware()
     lines = [
         "### Hardware Status",
@@ -165,6 +191,16 @@ def hardware_summary() -> str:
             f"- **NVIDIA GPU:** {hw['cuda_device_name']} "
             f"({hw['cuda_vram_mb']} MB VRAM; minimum {hw['min_nvidia_vram_mb']} MB)"
         )
+        try:
+            class_limit = int(os.getenv("ASR_8GB_CLASS_MAX_MB", "9000"))
+        except ValueError:
+            class_limit = 9000
+        if os.getenv("ASR_HARD_MEMORY_SAFE", "true").strip().lower() in {"1", "true", "yes", "on"}:
+            if hw["cuda_vram_mb"] <= class_limit:
+                lines.append(
+                    "- **VRAM policy:** strict 8 GB mode; one GPU ASR model at a time, "
+                    "CPU diarization by default"
+                )
     if hw["amd_gpu"]:
         lines.append("- **AMD GPU:** detected; CPU/OpenVINO fallback used in v1")
     lines.extend([

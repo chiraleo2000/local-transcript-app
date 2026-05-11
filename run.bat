@@ -2,10 +2,12 @@
 echo ============================================================
 echo  Transcription Service - Run (Windows)
 echo  Usage:  run.bat          ^<-- run app directly (default)
-echo          run.bat docker   ^<-- run via Docker on port 7890
+echo          run.bat gui      ^<-- native desktop window (pywebview)
+echo          run.bat docker   ^<-- run via Docker on port 7896
 echo ============================================================
 echo.
 
+if /i "%1"=="gui"    goto GUI
 if /i "%1"=="docker" goto DOCKER
 
 REM ============================================================
@@ -40,8 +42,25 @@ if errorlevel 1 (
 
 echo [4/4] Starting local transcript app on http://localhost:7896 ...
 echo.
+set "PYTHONPATH=%CD%;%PYTHONPATH%"
 call venv\Scripts\activate
 python app.py
+goto END
+
+REM ============================================================
+REM  GUI / DESKTOP WINDOW MODE
+REM ============================================================
+:GUI
+if not exist "venv\Scripts\activate.bat" (
+    echo [ERROR] Virtual environment not found. Run setup.bat first.
+    pause
+    exit /b 1
+)
+echo Starting Local Transcript App in native desktop window...
+echo.
+set "PYTHONPATH=%CD%;%PYTHONPATH%"
+call venv\Scripts\activate
+python launcher.py
 goto END
 
 REM ============================================================

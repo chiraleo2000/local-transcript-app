@@ -5,6 +5,8 @@ the app-local storage/model folders, records hardware policy, and pre-downloads
 or exports the ASR models for the selected backend.
 """
 
+# pylint: disable=wrong-import-position
+
 from __future__ import annotations
 
 import logging
@@ -17,7 +19,12 @@ sys.path.insert(0, PROJECT_ROOT)
 
 from dotenv import load_dotenv
 
-from backend.services.asr_local import ALL_ENGINES, load_model
+from backend.services.asr_local import (
+    ALL_ENGINES,
+    clear_accelerator_cache,
+    load_model,
+    unload_model,
+)
 from backend.services.hardware_policy import detect_hardware
 from backend.storage import ensure_app_dirs, update_config
 
@@ -32,6 +39,7 @@ logger = logging.getLogger(__name__)
 
 
 def main() -> int:
+    """Prepare local folders and bootstrap all ASR engines."""
     ensure_app_dirs()
     hardware = detect_hardware(refresh=True)
     logger.info("Backend policy: %s / %s", hardware["backend"], hardware["selected_device"])
@@ -46,6 +54,12 @@ def main() -> int:
         except Exception as exc:  # pylint: disable=broad-exception-caught
             failures[engine] = str(exc)
             logger.error("%s bootstrap failed: %s", engine, exc, exc_info=True)
+        finally:
+            try:
+                unload_model(engine)
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                logger.debug("%s unload skipped during bootstrap: %s", engine, exc)
+            clear_accelerator_cache()
 
     update_config(model_bootstrap={"ready": not failures, "failures": failures})
     if failures:

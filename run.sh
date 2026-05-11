@@ -4,7 +4,8 @@ set -e
 echo "============================================================"
 echo " Transcription Service - Run (Linux / Mac)"
 echo " Usage:  ./run.sh          <-- run app directly (default)"
-echo "         ./run.sh docker   <-- run via Docker on port 7890"
+echo "         ./run.sh gui      <-- native desktop window (pywebview)"
+echo "         ./run.sh docker   <-- run via Docker on port 7896"
 echo "============================================================"
 echo
 
@@ -13,9 +14,25 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 # ============================================================
+#  GUI / DESKTOP WINDOW MODE
+# ============================================================
+if [ "${1:-}" = "gui" ]; then
+    if [ ! -f "venv/bin/activate" ]; then
+        echo "[ERROR] Virtual environment not found. Run ./setup.sh first."
+        exit 1
+    fi
+    echo "Starting Local Transcript App in native desktop window..."
+    echo
+    export PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}"
+    source venv/bin/activate
+    python launcher.py
+    exit 0
+fi
+
+# ============================================================
 #  DOCKER MODE
 # ============================================================
-if [ "${1}" = "docker" ]; then
+if [ "${1:-}" = "docker" ]; then
     echo "[1/3] Checking Docker..."
     command -v docker &>/dev/null || { echo "[ERROR] Docker not installed."; exit 1; }
     docker info &>/dev/null     || { echo "[ERROR] Docker daemon not running."; exit 1; }
@@ -64,5 +81,6 @@ fi
 
 echo "[4/4] Starting local transcript app on http://localhost:7896 ..."
 echo
+export PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}"
 source venv/bin/activate
 python app.py

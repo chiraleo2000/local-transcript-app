@@ -9,7 +9,7 @@ Stage 2 — noisereduce (spectral gating):
 
 Stage 3 — pedalboard (Spotify):
   NoiseGate (silence background) → Compressor (gentle) → Limiter →
-  peak-normalise only if very quiet
+    controlled peak gain for clearer, louder speech
 """
 
 import glob
@@ -109,6 +109,21 @@ def _locate_ffmpeg() -> str | None:
 _FFMPEG_EXE: str | None = _locate_ffmpeg()
 
 
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return float(value.strip())
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %.2f.", name, value, default)
+        return default
+
+
+def _db_to_amp(db_value: float) -> float:
+    return float(10 ** (db_value / 20.0))
+
+
 # ---------------------------------------------------------------------------
 # Stage 1: FFmpeg — format conversion + bandpass only
 # ---------------------------------------------------------------------------
@@ -168,7 +183,7 @@ def _noisereduce_stage(wav_path: str, out_path: str) -> bool:
             y=y,
             sr=sr,
             stationary=False,   # adaptive — tracks changing noise
-            prop_decrease=0.75, # 75% noise reduction strength
+            prop_decrease=_env_float("AUDIO_ENHANCE_NOISE_REDUCTION", 0.65),
             n_fft=2048,
             freq_mask_smooth_hz=500,
             time_mask_smooth_ms=50,
@@ -185,7 +200,7 @@ def _noisereduce_stage(wav_path: str, out_path: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def _pedalboard_stage(wav_path: str, out_path: str) -> bool:
-    """Apply NoiseGate → Compressor → Limiter, then peak-normalise. Returns True on success."""
+    """Apply NoiseGate → Compressor → Limiter, then controlled peak gain."""
     try:
         from pedalboard import Pedalboard, NoiseGate, Compressor, Limiter
         from pedalboard.io import AudioFile
@@ -206,11 +221,18 @@ def _pedalboard_stage(wav_path: str, out_path: str) -> bool:
 
         processed = board(audio, sr)
 
-        # Only normalise if the signal is very quiet (under -20dBFS peak).
-        # Do NOT normalise loud audio — that would boost any residual noise.
+        # Lift quiet speech to a clearer level, but cap gain so background noise
+        # does not explode on very noisy or almost-silent recordings.
         peak = np.max(np.abs(processed))
-        if 0.001 < peak < 0.1:  # only boost genuinely quiet recordings
-            processed = processed * (0.1 / peak)
+        target_peak = _db_to_amp(_env_float("AUDIO_ENHANCE_TARGET_PEAK_DB", -3.0))
+        max_gain = _db_to_amp(_env_float("AUDIO_ENHANCE_MAX_GAIN_DB", 10.0))
+        if peak > 0.001:
+            gain = min(max_gain, target_peak / peak)
+            if gain > 1.0:
+                processed = processed * gain
+                logger.info("Audio enhancement gain applied: %.2fx", gain)
+
+        processed = np.clip(processed, -0.98, 0.98)
 
         with AudioFile(out_path, "w", samplerate=sr, num_channels=processed.shape[0]) as f:  # pylint: disable=not-context-manager
             f.write(processed)
@@ -226,7 +248,7 @@ def preprocess_audio(audio_path: str) -> str:
 
     Stage 1 (FFmpeg): bandpass → 16 kHz mono WAV.
     Stage 2 (noisereduce): non-stationary spectral gating.
-    Stage 3 (pedalboard): noise gate → compressor → limiter → peak normalise.
+    Stage 3 (pedalboard): noise gate → compressor → limiter → capped speech gain.
 
     Returns path to enhanced WAV, or original path on failure.
     """

@@ -1,13 +1,164 @@
 """Typhoon Whisper Large v3 — Thai ASR via OpenVINO."""
 
+# pylint: disable=import-outside-toplevel
+
 import logging
 import os
 
 logger = logging.getLogger(__name__)
 
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 MODEL_ID = "typhoon-ai/typhoon-whisper-large-v3"
 
 _pipeline_cache: list = []
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(value.strip())
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %d.", name, value, default)
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return float(value.strip())
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %.2f.", name, value, default)
+        return default
+
+
+def _cuda_vram_mb() -> int:
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return int(torch.cuda.get_device_properties(0).total_memory // (1024 * 1024))
+    except (ImportError, RuntimeError, OSError, AttributeError):
+        return 0
+    return 0
+
+
+def _strict_8gb_mode() -> bool:
+    vram_mb = _cuda_vram_mb()
+    if not vram_mb:
+        return False
+    return _env_bool("ASR_HARD_MEMORY_SAFE", True) and vram_mb <= _env_int(
+        "ASR_8GB_CLASS_MAX_MB", 9000,
+    )
+
+
+def _configure_torch_runtime() -> None:
+    try:
+        import torch
+
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision("high")
+        if torch.cuda.is_available() and _strict_8gb_mode():
+            fraction = min(1.0, max(0.5, _env_float("ASR_CUDA_MEMORY_FRACTION", 0.90)))
+            torch.cuda.set_per_process_memory_fraction(fraction, 0)
+            logger.info("Typhoon CUDA memory fraction capped at %.2f.", fraction)
+    except (ImportError, RuntimeError, OSError, AttributeError):
+        pass
+
+
+def _clear_cuda_cache() -> None:
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            try:
+                torch.cuda.ipc_collect()
+            except (RuntimeError, AttributeError):
+                pass
+    except (ImportError, RuntimeError, OSError, AttributeError):
+        pass
+
+
+def _asr_batch_size() -> int:
+    default = _env_int("ASR_8GB_BATCH_SIZE", 1) if _strict_8gb_mode() else 4
+    batch_size = max(1, _env_int("ASR_CUDA_BATCH_SIZE", default))
+    if _strict_8gb_mode():
+        max_batch_size = max(1, _env_int("ASR_8GB_MAX_BATCH_SIZE", 1))
+        if batch_size > max_batch_size:
+            logger.warning(
+                "ASR_CUDA_BATCH_SIZE=%d capped to %d by strict 8 GB mode.",
+                batch_size,
+                max_batch_size,
+            )
+            return max_batch_size
+    return batch_size
+
+
+def _chunk_length_s() -> int:
+    default = _env_int("ASR_8GB_CHUNK_LENGTH_S", 20) if _strict_8gb_mode() else 30
+    chunk_length_s = max(10, _env_int("ASR_CHUNK_LENGTH_S", default))
+    if _strict_8gb_mode():
+        max_chunk_s = max(10, _env_int("ASR_8GB_MAX_CHUNK_LENGTH_S", 20))
+        if chunk_length_s > max_chunk_s:
+            logger.info(
+                "ASR_CHUNK_LENGTH_S=%d capped to %d by strict 8 GB mode.",
+                chunk_length_s,
+                max_chunk_s,
+            )
+            return max_chunk_s
+    return chunk_length_s
+
+
+def _retry_chunk_length_s() -> int:
+    return max(10, _env_int("ASR_8GB_RETRY_CHUNK_LENGTH_S", 10))
+
+
+def _timestamp_mode(diarization_segments: list | None):
+    if diarization_segments and _env_bool("ASR_WORD_TIMESTAMPS_WITH_DIARIZATION", True):
+        if _strict_8gb_mode() and not _env_bool("TYPHOON_WORD_TIMESTAMPS_ON_8GB", False):
+            logger.info("Typhoon strict 8 GB mode uses chunk timestamps to avoid CUDA OOM.")
+            return True
+        return "word"
+    return True
+
+
+def _model_load_kwargs(hf_token: str | None, dtype) -> dict:
+    kwargs = {
+        "dtype": dtype,
+        "use_safetensors": True,
+        "low_cpu_mem_usage": True,
+        "token": hf_token,
+    }
+    attention = os.getenv("ASR_ATTENTION_IMPLEMENTATION", "sdpa").strip()
+    if attention:
+        kwargs["attn_implementation"] = attention
+    return kwargs
+
+
+def _is_cuda_oom(exc: Exception) -> bool:
+    try:
+        import torch
+
+        if isinstance(exc, torch.cuda.OutOfMemoryError):
+            return True
+    except (ImportError, OSError, AttributeError):
+        pass
+    return "CUDA out of memory" in str(exc)
 
 
 def _fmt_ts(seconds: float) -> str:
@@ -27,12 +178,11 @@ def _load_cuda_pipeline(hf_token: str | None):
     from transformers import pipeline as hf_pipeline
     from transformers.models.whisper.processing_whisper import WhisperProcessor
 
+    _configure_torch_runtime()
     logger.info("Using CUDA (float16) backend for Typhoon Whisper.")
     model = AutoModelForSpeechSeq2Seq.from_pretrained(
         MODEL_ID,
-        dtype=torch.float16,
-        use_safetensors=True,
-        token=hf_token,
+        **_model_load_kwargs(hf_token, torch.float16),
     )
     # Fix meta tensors left over from sharded checkpoint loading
     meta_params = [
@@ -55,7 +205,7 @@ def _load_cuda_pipeline(hf_token: str | None):
         model=model,
         tokenizer=processor.tokenizer,  # pylint: disable=no-member
         feature_extractor=processor.feature_extractor,  # pylint: disable=no-member
-        chunk_length_s=30,
+        chunk_length_s=_chunk_length_s(),
         return_timestamps=True,
         max_new_tokens=445,
     )
@@ -70,7 +220,8 @@ def _load_cpu_pipeline(hf_token: str | None):
 
     logger.info("Using CPU (float32) fallback pipeline for Typhoon Whisper.")
     model = AutoModelForSpeechSeq2Seq.from_pretrained(
-        MODEL_ID, dtype=torch.float32, use_safetensors=True, token=hf_token,
+        MODEL_ID,
+        **_model_load_kwargs(hf_token, torch.float32),
     )
     processor = WhisperProcessor.from_pretrained(MODEL_ID, token=hf_token)
     return hf_pipeline(
@@ -78,7 +229,7 @@ def _load_cpu_pipeline(hf_token: str | None):
         model=model,
         tokenizer=processor.tokenizer,  # pylint: disable=no-member
         feature_extractor=processor.feature_extractor,  # pylint: disable=no-member
-        chunk_length_s=30,
+        chunk_length_s=_chunk_length_s(),
         return_timestamps=True,
         max_new_tokens=445,
     )
@@ -113,7 +264,7 @@ def _load_ov_pipeline(device: str, hf_token: str | None):
             model=model,
             tokenizer=processor.tokenizer,  # pylint: disable=no-member
             feature_extractor=processor.feature_extractor,  # pylint: disable=no-member
-            chunk_length_s=30,
+            chunk_length_s=_chunk_length_s(),
             return_timestamps=True,
             max_new_tokens=445,
         )
@@ -165,6 +316,13 @@ def load_model():
     logger.info("Typhoon Whisper model pre-loaded.")
 
 
+def unload_model():
+    """Unload Typhoon Whisper from process memory and clear CUDA cache."""
+    _pipeline_cache.clear()
+    _clear_cuda_cache()
+    logger.info("Typhoon Whisper model cache cleared.")
+
+
 def _load_audio(audio_path: str):
     """Load audio as numpy array at 16 kHz mono.
 
@@ -174,6 +332,22 @@ def _load_audio(audio_path: str):
     import librosa
     y, sr = librosa.load(audio_path, sr=16000, mono=True)
     return {"raw": y, "sampling_rate": sr}
+
+
+def _run_pipe(pipe, audio_input, language: str, timestamp_mode, batch_size: int, chunk_length_s=None):
+    kwargs = {
+        "batch_size": batch_size,
+        "generate_kwargs": {"language": language, "task": "transcribe", "num_beams": 1},
+        "return_timestamps": timestamp_mode,
+    }
+    if chunk_length_s is not None:
+        kwargs["chunk_length_s"] = chunk_length_s
+    try:
+        import torch
+    except (ImportError, OSError):
+        return pipe(audio_input, **kwargs)
+    with torch.inference_mode():
+        return pipe(audio_input, **kwargs)
 
 
 def transcribe_typhoon(
@@ -187,12 +361,20 @@ def transcribe_typhoon(
     """
     pipe = _get_pipeline()
     audio_input = _load_audio(audio_path)
-    timestamp_mode = "word" if diarization_segments else True
-    result = pipe(
-        audio_input,
-        generate_kwargs={"language": language, "task": "transcribe"},
-        return_timestamps=timestamp_mode,
-    )
+    timestamp_mode = _timestamp_mode(diarization_segments)
+    try:
+        result = _run_pipe(pipe, audio_input, language, timestamp_mode, _asr_batch_size())
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        if not (_strict_8gb_mode() and _is_cuda_oom(exc)):
+            raise
+        retry_chunk_s = _retry_chunk_length_s()
+        logger.warning(
+            "Typhoon CUDA OOM in strict 8 GB mode; retrying with batch=1, "
+            "chunk=%ds and chunk timestamps.",
+            retry_chunk_s,
+        )
+        _clear_cuda_cache()
+        result = _run_pipe(pipe, audio_input, language, True, 1, retry_chunk_s)
     logger.debug(
         "Typhoon result: text_len=%d chunks=%d first_ts=%s",
         len(result.get("text", "")),

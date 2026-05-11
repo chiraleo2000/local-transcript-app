@@ -1,10 +1,13 @@
-"""Shared speaker diarization using pyannote/speaker-diarization-community-1."""
+"""Shared speaker diarization using pyannote/speaker-diarization-3.1."""
+
+# pylint: disable=import-outside-toplevel
 
 import logging
 import os
 import re
 import shutil
 import subprocess
+import wave
 import warnings
 
 # Suppress torchcodec DLL probe warnings emitted when torch imports its video
@@ -27,7 +30,7 @@ warnings.filterwarnings(
 
 logger = logging.getLogger(__name__)
 
-MODEL_ID = "pyannote/speaker-diarization-community-1"
+MODEL_ID = os.getenv("DIARIZATION_MODEL_ID", "pyannote/speaker-diarization-3.1")
 
 _pipeline_cache: list = []
 
@@ -52,8 +55,102 @@ def _check_ffmpeg():
         )
 
 
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(value.strip())
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %d.", name, value, default)
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return float(value.strip())
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %.4f.", name, value, default)
+        return default
+
+
+def _build_pipeline_params() -> dict | None:
+    """Build pyannote pipeline instantiate() params from environment variables.
+
+    Tuning guide:
+      DIARIZATION_SEGMENTATION_THRESHOLD  — activity threshold; lower = catches
+          quieter / shorter speaker turns (pyannote default ~0.5).
+      DIARIZATION_MIN_DURATION_OFF        — minimum silence gap (s) to split
+          a speaker turn; smaller = more splits (pyannote default 0.0).
+      DIARIZATION_CLUSTERING_THRESHOLD    — speaker embedding distance; lower =
+          more distinct speakers separated (pyannote default ~0.70).
+      DIARIZATION_MIN_CLUSTER_SIZE        — minimum segments to form a cluster;
+          lower = rare/short speakers still detected (pyannote default 12).
+    """
+    seg_threshold   = _env_float("DIARIZATION_SEGMENTATION_THRESHOLD", -1.0)
+    seg_min_dur_off = _env_float("DIARIZATION_MIN_DURATION_OFF",        -1.0)
+    clust_threshold = _env_float("DIARIZATION_CLUSTERING_THRESHOLD",    -1.0)
+    clust_min_size  = _env_int(  "DIARIZATION_MIN_CLUSTER_SIZE",        -1)
+
+    params: dict = {}
+
+    seg_params: dict = {}
+    if seg_threshold >= 0:
+        seg_params["threshold"] = seg_threshold
+    if seg_min_dur_off >= 0:
+        seg_params["min_duration_off"] = seg_min_dur_off
+    if seg_params:
+        params["segmentation"] = seg_params
+
+    clust_params: dict = {}
+    if clust_threshold >= 0:
+        clust_params["threshold"] = clust_threshold
+    if clust_min_size >= 0:
+        clust_params["min_cluster_size"] = clust_min_size
+    if clust_params:
+        params["clustering"] = clust_params
+
+    return params if params else None
+
+
+def _cuda_vram_mb(torch_module) -> int:
+    if not torch_module.cuda.is_available():
+        return 0
+    try:
+        total = torch_module.cuda.get_device_properties(0).total_memory
+        return int(total // (1024 * 1024))
+    except (RuntimeError, OSError, AttributeError):
+        return 0
+
+
+def _select_diarization_device(torch_module):
+    """Keep diarization off 8 GB GPUs unless a larger GPU is available."""
+    requested = os.getenv("DIARIZATION_DEVICE", "cpu").strip().lower()
+    min_cuda_vram_mb = _env_int("DIARIZATION_CUDA_MIN_VRAM_MB", 12288)
+    vram_mb = _cuda_vram_mb(torch_module)
+
+    if requested in {"cuda", "gpu"}:
+        if vram_mb >= min_cuda_vram_mb:
+            return torch_module.device("cuda")
+        logger.warning(
+            "DIARIZATION_DEVICE=%s ignored: %d MB VRAM is below %d MB. Using CPU.",
+            requested,
+            vram_mb,
+            min_cuda_vram_mb,
+        )
+        return torch_module.device("cpu")
+
+    if requested == "auto" and vram_mb >= min_cuda_vram_mb:
+        return torch_module.device("cuda")
+
+    return torch_module.device("cpu")
+
+
 def _get_diarization_pipeline():
-    """Lazy-load the pyannote community diarization pipeline."""
+    """Lazy-load the configured pyannote diarization pipeline."""
     if _pipeline_cache:
         return _pipeline_cache[0]
 
@@ -68,15 +165,52 @@ def _get_diarization_pipeline():
     pipeline = Pipeline.from_pretrained(MODEL_ID, token=hf_token)
     if pipeline is None:
         raise RuntimeError(f"Failed to load pyannote pipeline '{MODEL_ID}'")
-    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    device = _select_diarization_device(torch)
     pipeline = pipeline.to(device)
+
+    # Apply tunable segmentation / clustering hyperparameters.
+    custom_params = _build_pipeline_params()
+    if custom_params:
+        try:
+            pipeline.instantiate(custom_params)
+            logger.info("Diarization hyperparameters applied: %s", custom_params)
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning("Could not apply custom diarization params: %s", exc)
+
     _pipeline_cache.append(pipeline)
     logger.info("Pyannote diarization pipeline ready on %s.", device)
     return _pipeline_cache[0]
 
 
+def unload_model() -> None:
+    """Unload the cached pyannote pipeline and release CUDA cache."""
+    _pipeline_cache.clear()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            try:
+                torch.cuda.ipc_collect()
+            except (RuntimeError, AttributeError):
+                pass
+    except (ImportError, RuntimeError, OSError, AttributeError):
+        pass
+    logger.info("Pyannote diarization model cache cleared.")
+
+
 def _prepare_audio_for_pyannote(audio_path: str) -> dict:
     """Load audio as an in-memory 16 kHz mono waveform for pyannote.
+
+    Pipeline:
+      1. FFmpeg — convert to mono WAV at DIARIZATION_PREPROCESS_SR (default
+         44 100 Hz) with a speech-optimised bandpass filter.  Using a higher
+         intermediate rate preserves more spectral detail for the noise-
+         reduction stage before the final 16 kHz downsample.
+      2. Optional noisereduce — non-stationary spectral gating at the
+         intermediate rate (DIARIZATION_NOISE_REDUCTION; 0.0 = skip).
+      3. librosa — resample + load as 16 kHz mono tensor for pyannote.
 
     Docker uses a minimal torchcodec stub because transformers probes the
     package at import time. Passing file paths to pyannote would make pyannote
@@ -88,44 +222,119 @@ def _prepare_audio_for_pyannote(audio_path: str) -> dict:
 
     ffmpeg = shutil.which("ffmpeg")
     base = os.path.splitext(audio_path)[0]
-    out_path = base + "_diarize_tmp.wav"
 
+    # Intermediate rate — higher quality for noise reduction before 16kHz downsample.
+    preprocess_sr = _env_int("DIARIZATION_PREPROCESS_SR", 44100)
+    noise_reduction = _env_float("DIARIZATION_NOISE_REDUCTION", 0.60)
+
+    inter_path = base + "_diarize_inter.wav"
     source_path = audio_path
-    tmp_created = False
-    if ffmpeg is not None:
+    tmp_files: list[str] = []
+
+    already_ready = _is_16k_mono_wav(audio_path) and preprocess_sr == 16000 and noise_reduction <= 0.0
+
+    if ffmpeg is not None and not already_ready:
+        # Speech-optimised bandpass: strip rumble (<80 Hz) and high-freq hiss
+        # (>8 kHz is above Nyquist of 16kHz anyway); loudnorm evens out level
+        # differences so quieter speakers are not lost during NR.
+        bandpass = "highpass=f=80,lowpass=f=8000"
+        loudnorm = "loudnorm=I=-16:TP=-1.5:LRA=11"
+        diarize_filters = f"{bandpass},{loudnorm}"
         cmd = [
             ffmpeg, "-y", "-i", audio_path,
-            "-ar", "16000",
+            "-af", diarize_filters,
+            "-ar", str(preprocess_sr),
             "-ac", "1",
             "-sample_fmt", "s16",
             "-vn",
-            out_path,
+            inter_path,
         ]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300, check=False)
         if result.returncode == 0:
-            source_path = out_path
-            tmp_created = True
+            source_path = inter_path
+            tmp_files.append(inter_path)
         else:
             logger.warning(
-                "ffmpeg audio conversion failed (%s); loading original with librosa.",
+                "ffmpeg diarization prep failed (%s); loading original with librosa.",
                 result.stderr[-300:],
             )
-    else:
+    elif ffmpeg is None and not already_ready:
         logger.warning("ffmpeg not found — loading original audio with librosa.")
 
+    # Optional noise reduction at the intermediate sample rate.
+    if noise_reduction > 0.0 and source_path != audio_path:
+        try:
+            import noisereduce as nr
+            import soundfile as sf
+
+            y_inter, sr_inter = librosa.load(source_path, sr=preprocess_sr, mono=True)
+            y_reduced = nr.reduce_noise(
+                y=y_inter,
+                sr=sr_inter,
+                stationary=False,
+                prop_decrease=noise_reduction,
+                n_fft=2048,
+                freq_mask_smooth_hz=500,
+                time_mask_smooth_ms=50,
+            )
+            nr_path = base + "_diarize_nr.wav"
+            sf.write(nr_path, y_reduced, sr_inter, subtype="PCM_16")
+            source_path = nr_path
+            tmp_files.append(nr_path)
+            logger.info("Diarization noise reduction applied (prop=%.2f) at %d Hz.", noise_reduction, sr_inter)
+        except (ImportError, OSError, ValueError, RuntimeError) as exc:
+            logger.warning("Diarization noise reduction skipped: %s", exc)
+
     try:
+        # Final downsample to 16 kHz for pyannote.
         waveform, sample_rate = librosa.load(source_path, sr=16000, mono=True)
     finally:
-        if tmp_created and os.path.isfile(source_path):
-            try:
-                os.remove(source_path)
-            except OSError:
-                pass
+        for tmp in tmp_files:
+            if os.path.isfile(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
 
     tensor = torch.from_numpy(waveform).float().unsqueeze(0)
     duration = tensor.shape[-1] / 16000 if tensor.shape[-1] else 0.0
-    logger.info("Prepared diarization audio: %.1fs at %d Hz", duration, sample_rate)
+    logger.info("Prepared diarization audio: %.1fs at %d Hz (intermediate: %d Hz)", duration, sample_rate, preprocess_sr)
     return {"waveform": tensor, "sample_rate": 16000}
+
+
+def _is_16k_mono_wav(audio_path: str) -> bool:
+    if os.path.splitext(audio_path)[1].lower() != ".wav":
+        return False
+    try:
+        with wave.open(audio_path, "rb") as wav_file:
+            return wav_file.getframerate() == 16000 and wav_file.getnchannels() == 1
+    except (wave.Error, OSError, EOFError):
+        return False
+
+
+def _override_params(
+    seg_threshold: float | None,
+    seg_min_duration_off: float | None,
+    clust_threshold: float | None,
+    clust_min_size: int | None,
+) -> dict | None:
+    """Build pyannote instantiate() params from explicit per-call overrides."""
+    params: dict = {}
+    seg: dict = {}
+    if seg_threshold is not None:
+        seg["threshold"] = float(seg_threshold)
+    if seg_min_duration_off is not None:
+        seg["min_duration_off"] = float(seg_min_duration_off)
+    if seg:
+        params["segmentation"] = seg
+    clust: dict = {}
+    if clust_threshold is not None:
+        clust["threshold"] = float(clust_threshold)
+    if clust_min_size is not None:
+        clust["min_cluster_size"] = int(clust_min_size)
+    if clust:
+        params["clustering"] = clust
+    return params if params else None
 
 
 def _build_diarize_kwargs(num_speakers: int, min_speakers: int, max_speakers: int) -> dict:
@@ -165,6 +374,10 @@ def _remap_speakers(segments: list[dict]) -> dict:
 def diarize(
     audio_path: str, num_speakers: int = 0,
     min_speakers: int = 0, max_speakers: int = 0,
+    seg_threshold: float | None = None,
+    seg_min_duration_off: float | None = None,
+    clust_threshold: float | None = None,
+    clust_min_size: int | None = None,
 ) -> list[dict]:
     """Run speaker diarization on audio file.
 
@@ -172,6 +385,16 @@ def diarize(
     sorted by start time.
     """
     pipe = _get_diarization_pipeline()
+
+    # Apply per-call UI overrides (re-instantiate pipeline params for this run).
+    override = _override_params(seg_threshold, seg_min_duration_off, clust_threshold, clust_min_size)
+    if override:
+        try:
+            pipe.instantiate(override)
+            logger.info("Diarization params overridden for this run: %s", override)
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning("Could not apply diarization param overrides: %s", exc)
+
     kwargs = _build_diarize_kwargs(num_speakers, min_speakers, max_speakers)
     audio_input = _prepare_audio_for_pyannote(audio_path)
 
@@ -210,8 +433,6 @@ def diarize(
     speaker_map = _remap_speakers(segments)
     logger.info("Diarization complete: %d segments, speaker map: %s", len(segments), speaker_map)
     return segments
-
-
 
 
 def _find_speaker(start: float | None, end: float | None, segments: list[dict]) -> str:
@@ -403,7 +624,6 @@ def _iter_chunks(
         speaker = _find_speaker(c_start, c_end, diarization_segments)
         chunk_idx += 1
         yield c_start, c_end, text, speaker
-
 
 
 def assign_speakers(result: dict, diarization_segments: list[dict]) -> str:
