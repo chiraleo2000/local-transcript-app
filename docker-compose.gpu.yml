@@ -35,7 +35,7 @@ services:
       - APP_SUPPRESS_WARNING_LOGS=true
       - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
       - ASR_PARALLEL_MODE=auto
-      - ASR_PARALLEL_MIN_VRAM_MB=12288
+      - ASR_PARALLEL_MIN_VRAM_MB=7500
       - ASR_HARD_MEMORY_SAFE=true
       - ASR_8GB_CLASS_MAX_MB=9000
       - ASR_CLEAR_VRAM_AFTER_JOB=true

@@ -130,15 +130,7 @@ def _preload_models() -> None:
         logger.info("ASR preload skipped; models are available on demand.")
         return
 
-    preload_engines = default_asr_engines() if strict_memory_mode_active() else ALL_ENGINES
-    if strict_memory_mode_active():
-        skipped = [engine for engine in ALL_ENGINES if engine not in preload_engines]
-        for engine in skipped:
-            _load_status[engine] = "available (not preloaded in strict 8 GB mode)"
-        logger.info(
-            "ASR eager preload limited to %s by strict 8 GB memory mode.",
-            ", ".join(preload_engines),
-        )
+    preload_engines = ALL_ENGINES
 
     def _load(engine: str) -> None:
         try:

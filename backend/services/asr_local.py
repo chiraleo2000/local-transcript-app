@@ -71,8 +71,12 @@ def strict_memory_mode_active() -> bool:
 
 
 def should_clear_model_between_engines() -> bool:
-    """Return whether a model should be unloaded immediately after each engine."""
-    return strict_memory_mode_active() or _env_bool("ASR_CLEAR_VRAM_BETWEEN_ENGINES", True)
+    """Return whether a model should be unloaded immediately after each engine.
+
+    Only applies in sequential mode. Parallel mode keeps both models in VRAM
+    for the duration of both transcriptions.
+    """
+    return _env_bool("ASR_CLEAR_VRAM_BETWEEN_ENGINES", False)
 
 
 def default_asr_engines() -> list[str]:
@@ -118,16 +122,6 @@ def asr_worker_count(selected_count: int) -> int:
         return 1
 
     mode = os.getenv("ASR_PARALLEL_MODE", "auto").strip().lower()
-    if strict_memory_mode_active():
-        if mode in {"parallel", "force", "true", "1"}:
-            logger.warning(
-                "ASR_PARALLEL_MODE=%s ignored on 8 GB-class CUDA GPU; "
-                "strict mode keeps one ASR model in VRAM at a time.",
-                mode,
-            )
-        else:
-            logger.info("ASR strict 8 GB mode active; using one ASR worker.")
-        return 1
 
     if mode in {"parallel", "force", "true", "1"}:
         return selected_count
