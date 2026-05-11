@@ -337,6 +337,7 @@ def _load_audio(audio_path: str):
 def _run_pipe(
     pipe, audio_input, language: str, timestamp_mode, batch_size: int, chunk_length_s=None
 ):
+    pipeline_input = dict(audio_input) if isinstance(audio_input, dict) else audio_input
     kwargs = {
         "batch_size": batch_size,
         "generate_kwargs": {"language": language, "task": "transcribe", "num_beams": 1},
@@ -347,9 +348,9 @@ def _run_pipe(
     try:
         import torch
     except (ImportError, OSError):
-        return pipe(audio_input, **kwargs)
+        return pipe(pipeline_input, **kwargs)
     with torch.inference_mode():
-        return pipe(audio_input, **kwargs)
+        return pipe(pipeline_input, **kwargs)
 
 
 def transcribe_typhoon(
