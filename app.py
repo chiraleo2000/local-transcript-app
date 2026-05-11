@@ -112,6 +112,7 @@ APP_CSS = """
 """
 
 _models_ready = threading.Event()
+_cancel_event = threading.Event()
 _load_status = dict.fromkeys(ALL_ENGINES, "pending")
 
 
@@ -231,6 +232,18 @@ def _build_outputs(job_result: dict, selected_engines: list[str]) -> tuple:
     return tuple(outputs)
 
 
+def _reset_ui_outputs() -> tuple:
+    """Signal cancellation and return a blank UI state for all transcript outputs."""
+    _cancel_event.set()
+    no_dl = gr.update(value=None, interactive=False)
+    no_btn = gr.update(interactive=False)
+    return (
+        "(cancelled)", "", no_dl, no_btn,
+        "(cancelled)", "", no_dl, no_btn,
+        "Cancelled by user.",
+    )
+
+
 def transcribe(
     media_path,
     selected_engines,
@@ -244,6 +257,7 @@ def transcribe(
     diar_clust_min_size,
 ):
     """Gradio callback: run local backend pipeline."""
+    _cancel_event.clear()
     if not media_path:
         return _empty_outputs("(no media provided)")
     if not _models_ready.is_set():
@@ -267,8 +281,16 @@ def transcribe(
             enhance=enhance,
             local_correction=False,
             diarize_kwargs=diarize_kwargs,
+            cancel_event=_cancel_event,
         )
+        if _cancel_event.is_set():
+            return _empty_outputs("(cancelled)")
         return _build_outputs(result, selected_engines or default_asr_engines())
+    except RuntimeError as exc:
+        if "cancelled" in str(exc).lower():
+            return _empty_outputs("(cancelled)")
+        logger.error("Transcription job failed: %s", exc, exc_info=True)
+        return _empty_outputs(f"ERROR: {exc}")
     except Exception as exc:  # pylint: disable=broad-exception-caught
         logger.error("Transcription job failed: %s", exc, exc_info=True)
         return _empty_outputs(f"ERROR: {exc}")
@@ -340,6 +362,7 @@ def build_ui() -> gr.Blocks:
                 max_speakers = gr.Slider(1, 10, step=1, value=3, label="Max Speakers")
             with gr.Column(scale=1, min_width=180):
                 transcribe_btn = gr.Button("Transcribe", variant="primary", interactive=False)
+                cancel_btn = gr.Button("Cancel & Reset", variant="stop", interactive=True)
 
         # Diarization advanced config — shown when Speaker Diarization is enabled.
         with gr.Group(visible=False) as diarize_config_group:
@@ -497,7 +520,7 @@ def build_ui() -> gr.Blocks:
 
         gr.Markdown(hw_md)
 
-        transcribe_btn.click(  # pylint: disable=no-member
+        transcribe_event = transcribe_btn.click(  # pylint: disable=no-member
             fn=transcribe,
             inputs=[
                 media_input,
@@ -516,6 +539,16 @@ def build_ui() -> gr.Blocks:
                 thonburian_text, thonburian_time, thonburian_dl, thonburian_correct,
                 job_info,
             ],
+        )
+
+        cancel_btn.click(  # pylint: disable=no-member
+            fn=_reset_ui_outputs,
+            outputs=[
+                typhoon_text, typhoon_time, typhoon_dl, typhoon_correct,
+                thonburian_text, thonburian_time, thonburian_dl, thonburian_correct,
+                job_info,
+            ],
+            cancels=[transcribe_event],
         )
 
         typhoon_correct.click(  # pylint: disable=no-member

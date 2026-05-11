@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -29,6 +30,12 @@ from backend.storage import new_job_id, now_iso, save_job_manifest, save_transcr
 
 
 logger = logging.getLogger(__name__)
+
+
+def _check_cancel(cancel_event: threading.Event | None) -> None:
+    """Raise RuntimeError if a cancellation has been requested."""
+    if cancel_event and cancel_event.is_set():
+        raise RuntimeError("Job cancelled by user.")
 
 
 def _selected_engines(selected_engines: list[str]) -> list[str]:
@@ -143,10 +150,12 @@ def _run_asr_sequential(
     process_path: str,
     language: str,
     diar_segments: list[dict] | None,
+    cancel_event: threading.Event | None = None,
 ) -> dict[str, dict]:
     results: dict[str, dict] = {}
     clear_between = should_clear_model_between_engines()
     for engine in selected:
+        _check_cancel(cancel_event)
         results[engine] = _run_one_asr_engine(job_id, engine, process_path, language, diar_segments)
         if clear_between:
             _unload_asr_engine(engine)
@@ -183,11 +192,12 @@ def _run_asr_engines(
     process_path: str,
     language: str,
     diar_segments: list[dict] | None,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[dict[str, dict], int]:
     workers = asr_worker_count(len(selected))
     logger.info("Running %d ASR engine(s) with %d worker(s).", len(selected), workers)
     if workers == 1:
-        results = _run_asr_sequential(job_id, selected, process_path, language, diar_segments)
+        results = _run_asr_sequential(job_id, selected, process_path, language, diar_segments, cancel_event)
         return results, workers
 
     results = _run_asr_parallel(job_id, selected, process_path, language, diar_segments, workers)
@@ -223,19 +233,23 @@ def run_transcription_job(
     enhance: bool,
     local_correction: bool = False,
     diarize_kwargs: dict | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> dict:
     """Run the full local transcript pipeline and persist outputs."""
     job_started = time.perf_counter()
     job_id = new_job_id()
     process_path = normalize_media(media_path, job_id)
+    _check_cancel(cancel_event)
     if enhance:
         process_path = enhance_audio(process_path)
+    _check_cancel(cancel_event)
     audio_duration_s = audio_duration_seconds(process_path)
 
     selected = _selected_engines(selected_engines)
     n_min, n_max = _speaker_bounds(diarization, min_speakers, max_speakers)
     diar_segments = _run_diarization(process_path, diarization, n_min, n_max, diarize_kwargs=diarize_kwargs)
-    results, workers = _run_asr_engines(job_id, selected, process_path, language, diar_segments)
+    _check_cancel(cancel_event)
+    results, workers = _run_asr_engines(job_id, selected, process_path, language, diar_segments, cancel_event)
     _clear_asr_models(selected)
 
     total_elapsed_s = time.perf_counter() - job_started
