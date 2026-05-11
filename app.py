@@ -7,11 +7,9 @@ from __future__ import annotations
 import importlib.machinery
 import logging
 import os
-import concurrent.futures
 import re
 import sys
 import threading
-import time
 import types
 import warnings
 
@@ -265,8 +263,19 @@ def transcribe(
     diar_min_off,
     diar_clust_threshold,
     diar_clust_min_size,
+    progress=gr.Progress(track_tqdm=True),
 ):
-    """Gradio callback: run local backend pipeline (generator for live SSE push)."""
+    """Gradio callback — generator so the UI clears immediately, then blocks.
+
+    Gradio 6.x uses WebSockets with a server-side heartbeat that keeps the
+    connection alive regardless of how long the function blocks between yields.
+    We do NOT need manual keepalive yields; two yields are sufficient:
+      1. Clear the outputs and show a loading state immediately.
+      2. Yield the real result when the pipeline finishes.
+    gr.Progress(track_tqdm=True) surfaces pyannote diarization stage progress
+    (segmentation / embeddings / discrete_diarization) in the Gradio progress
+    bar natively, without touching the output components.
+    """
     _cancel_event.clear()
     if not media_path:
         yield _empty_outputs("(no media provided)")
@@ -275,7 +284,7 @@ def transcribe(
         yield _empty_outputs("Models are still loading, please wait...")
         return
 
-    # Push an immediate in-progress state so the browser shows activity right away.
+    # Yield 1 — clear previous outputs immediately so the user knows a new job started.
     no_dl = gr.update(value=None, interactive=False)
     no_btn = gr.update(interactive=False)
     yield (
@@ -284,8 +293,6 @@ def transcribe(
         "Processing — please wait...",
     )
 
-    # Run the pipeline in a background thread and yield keepalives every 2 s so
-    # the SSE connection never goes idle (diarization embeddings can take 3+ min).
     diarize_kwargs: dict | None = None
     if diarization:
         diarize_kwargs = {
@@ -295,40 +302,24 @@ def transcribe(
             "clust_min_size":       int(diar_clust_min_size),
         }
 
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    future = pool.submit(
-        run_transcription_job,
-        media_path=media_path,
-        selected_engines=selected_engines or default_asr_engines(),
-        language=language,
-        diarization=diarization,
-        min_speakers=1,
-        max_speakers=int(max_speakers),
-        enhance=enhance,
-        local_correction=False,
-        diarize_kwargs=diarize_kwargs,
-        cancel_event=_cancel_event,
-    )
-    pool.shutdown(wait=False)  # let the thread run; we poll via future.done()
-
-    elapsed = 0
     try:
-        while not future.done():
-            time.sleep(2)
-            elapsed += 2
-            if _cancel_event.is_set():
-                yield _empty_outputs("(cancelled)")
-                return
-            yield (
-                f"⏳ Transcribing... ({elapsed}s)", "", no_dl, no_btn,
-                f"⏳ Transcribing... ({elapsed}s)", "", no_dl, no_btn,
-                f"Processing — please wait... ({elapsed}s elapsed)",
-            )
-
-        result = future.result()  # raises if the job threw an exception
+        # Blocking call — Gradio 6.x WS heartbeat keeps the browser connection alive.
+        result = run_transcription_job(
+            media_path=media_path,
+            selected_engines=selected_engines or default_asr_engines(),
+            language=language,
+            diarization=diarization,
+            min_speakers=1,
+            max_speakers=int(max_speakers),
+            enhance=enhance,
+            local_correction=False,
+            diarize_kwargs=diarize_kwargs,
+            cancel_event=_cancel_event,
+        )
         if _cancel_event.is_set():
             yield _empty_outputs("(cancelled)")
             return
+        # Yield 2 — push the completed result to the browser.
         yield _build_outputs(result, selected_engines or default_asr_engines())
     except RuntimeError as exc:
         if "cancelled" in str(exc).lower():
