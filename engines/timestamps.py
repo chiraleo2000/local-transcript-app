@@ -30,6 +30,61 @@ def audio_duration_from_input(audio_input: dict[str, Any]) -> float:
         return 0.0
 
 
+def audio_windows(
+    audio_input: dict[str, Any],
+    window_s: int,
+) -> list[tuple[float, dict[str, Any]]]:
+    """Split a HuggingFace ASR audio input dict into fixed-size windows."""
+    raw = audio_input.get("raw")
+    sample_rate = int(audio_input.get("sampling_rate") or 16000)
+    if raw is None or window_s <= 0:
+        return [(0.0, dict(audio_input))]
+
+    window_samples = max(sample_rate, int(window_s * sample_rate))
+    total_samples = len(raw)
+    windows: list[tuple[float, dict[str, Any]]] = []
+    for start_sample in range(0, total_samples, window_samples):
+        end_sample = min(total_samples, start_sample + window_samples)
+        if end_sample <= start_sample:
+            continue
+        offset_s = start_sample / sample_rate
+        windows.append((
+            offset_s,
+            {"raw": raw[start_sample:end_sample], "sampling_rate": sample_rate},
+        ))
+    return windows or [(0.0, dict(audio_input))]
+
+
+def offset_result_timestamps(result: dict, offset_s: float) -> dict:
+    """Return an ASR result with chunk timestamps shifted by an audio-window offset."""
+    if not offset_s:
+        return result
+    shifted = dict(result)
+    chunks = deepcopy(result.get("chunks") or [])
+    for chunk in chunks:
+        start, end = _timestamp_pair(chunk)
+        if start is None:
+            continue
+        new_start = float(start) + offset_s
+        new_end = float(end) + offset_s if end is not None else None
+        timestamp_type = type(chunk.get("timestamp"))
+        chunk["timestamp"] = timestamp_type((new_start, new_end))
+    shifted["chunks"] = chunks
+    return shifted
+
+
+def merge_window_results(results: list[dict]) -> dict:
+    """Merge ordered window ASR results into one HuggingFace-style result dict."""
+    texts: list[str] = []
+    chunks: list[dict] = []
+    for result in results:
+        text = result.get("text", "").strip()
+        if text:
+            texts.append(text)
+        chunks.extend(result.get("chunks") or [])
+    return {"text": "\n".join(texts).strip(), "chunks": chunks}
+
+
 def _timestamp_pair(chunk: dict) -> tuple[float | None, float | None]:
     timestamp = chunk.get("timestamp")
     if not timestamp or len(timestamp) < 2:

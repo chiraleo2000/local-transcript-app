@@ -128,9 +128,18 @@ def _retry_chunk_length_s() -> int:
     return max(10, _env_int("ASR_8GB_RETRY_CHUNK_LENGTH_S", 10))
 
 
+def _long_form_min_duration_s() -> int:
+    return max(0, _env_int("ASR_LONG_FORM_MIN_DURATION_S", 300))
+
+
+def _long_form_window_s() -> int:
+    default = 180 if _strict_8gb_mode() else 600
+    return max(30, _env_int("ASR_LONG_FORM_WINDOW_S", default))
+
+
 def _timestamp_mode(diarization_segments: list | None):
     if diarization_segments and _env_bool("ASR_WORD_TIMESTAMPS_WITH_DIARIZATION", True):
-        if _strict_8gb_mode() and not _env_bool("TYPHOON_WORD_TIMESTAMPS_ON_8GB", True):
+        if _strict_8gb_mode() and not _env_bool("TYPHOON_WORD_TIMESTAMPS_ON_8GB", False):
             logger.info("Typhoon strict 8 GB mode uses chunk timestamps to avoid CUDA OOM.")
             return True
         return "word"
@@ -353,6 +362,68 @@ def _run_pipe(
         return pipe(pipeline_input, **kwargs)
 
 
+def _run_long_form_asr(
+    pipe,
+    audio_input: dict,
+    language: str,
+    timestamp_mode,
+    engine_name: str,
+) -> dict:
+    """Run ASR in bounded windows and assemble timestamps into the full timeline."""
+    from engines.timestamps import audio_windows, merge_window_results, offset_result_timestamps
+
+    window_s = _long_form_window_s()
+    windows = audio_windows(audio_input, window_s)
+    logger.info(
+        "%s long-form windowing: windows=%d window=%ds timestamp_mode=%s",
+        engine_name,
+        len(windows),
+        window_s,
+        timestamp_mode,
+    )
+    results: list[dict] = []
+    for index, (offset_s, window_input) in enumerate(windows, start=1):
+        logger.info(
+            "%s ASR window %d/%d started: offset=%.1fs duration=%.1fs",
+            engine_name,
+            index,
+            len(windows),
+            offset_s,
+            len(window_input["raw"]) / window_input["sampling_rate"],
+        )
+        try:
+            window_result = _run_pipe(
+                pipe, window_input, language, timestamp_mode, _asr_batch_size()
+            )
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            if not (_strict_8gb_mode() and _is_cuda_oom(exc)):
+                raise
+            retry_chunk_s = _retry_chunk_length_s()
+            logger.warning(
+                "%s CUDA OOM on window %d/%d; retrying batch=1 chunk=%ds "
+                "with chunk timestamps.",
+                engine_name,
+                index,
+                len(windows),
+                retry_chunk_s,
+            )
+            _clear_cuda_cache()
+            window_result = _run_pipe(pipe, window_input, language, True, 1, retry_chunk_s)
+
+        shifted = offset_result_timestamps(window_result, offset_s)
+        logger.info(
+            "%s ASR window %d/%d finished: chars=%d chunks=%d",
+            engine_name,
+            index,
+            len(windows),
+            len(shifted.get("text", "")),
+            len(shifted.get("chunks") or []),
+        )
+        results.append(shifted)
+        _clear_cuda_cache()
+    return merge_window_results(results)
+
+
 def transcribe_typhoon(
     audio_path: str, language: str = "thai",
     diarization_segments: list | None = None,
@@ -378,19 +449,22 @@ def transcribe_typhoon(
         _asr_batch_size(),
         _chunk_length_s(),
     )
-    try:
-        result = _run_pipe(pipe, audio_input, language, timestamp_mode, _asr_batch_size())
-    except Exception as exc:  # pylint: disable=broad-exception-caught
-        if not (_strict_8gb_mode() and _is_cuda_oom(exc)):
-            raise
-        retry_chunk_s = _retry_chunk_length_s()
-        logger.warning(
-            "Typhoon CUDA OOM in strict 8 GB mode; retrying with batch=1, "
-            "chunk=%ds and chunk timestamps.",
-            retry_chunk_s,
-        )
-        _clear_cuda_cache()
-        result = _run_pipe(pipe, audio_input, language, True, 1, retry_chunk_s)
+    if audio_duration_s >= _long_form_min_duration_s():
+        result = _run_long_form_asr(pipe, audio_input, language, timestamp_mode, "Typhoon")
+    else:
+        try:
+            result = _run_pipe(pipe, audio_input, language, timestamp_mode, _asr_batch_size())
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            if not (_strict_8gb_mode() and _is_cuda_oom(exc)):
+                raise
+            retry_chunk_s = _retry_chunk_length_s()
+            logger.warning(
+                "Typhoon CUDA OOM in strict 8 GB mode; retrying with batch=1, "
+                "chunk=%ds and chunk timestamps.",
+                retry_chunk_s,
+            )
+            _clear_cuda_cache()
+            result = _run_pipe(pipe, audio_input, language, True, 1, retry_chunk_s)
     result = repair_asr_result(result, audio_duration_s, "Typhoon", logger)
 
     if diarization_segments:
