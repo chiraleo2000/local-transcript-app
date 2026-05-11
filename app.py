@@ -7,9 +7,11 @@ from __future__ import annotations
 import importlib.machinery
 import logging
 import os
+import concurrent.futures
 import re
 import sys
 import threading
+import time
 import types
 import warnings
 
@@ -282,27 +284,48 @@ def transcribe(
         "Processing — please wait...",
     )
 
+    # Run the pipeline in a background thread and yield keepalives every 2 s so
+    # the SSE connection never goes idle (diarization embeddings can take 3+ min).
+    diarize_kwargs: dict | None = None
+    if diarization:
+        diarize_kwargs = {
+            "seg_threshold":        float(diar_seg_threshold),
+            "seg_min_duration_off": float(diar_min_off),
+            "clust_threshold":      float(diar_clust_threshold),
+            "clust_min_size":       int(diar_clust_min_size),
+        }
+
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = pool.submit(
+        run_transcription_job,
+        media_path=media_path,
+        selected_engines=selected_engines or default_asr_engines(),
+        language=language,
+        diarization=diarization,
+        min_speakers=1,
+        max_speakers=int(max_speakers),
+        enhance=enhance,
+        local_correction=False,
+        diarize_kwargs=diarize_kwargs,
+        cancel_event=_cancel_event,
+    )
+    pool.shutdown(wait=False)  # let the thread run; we poll via future.done()
+
+    elapsed = 0
     try:
-        diarize_kwargs: dict | None = None
-        if diarization:
-            diarize_kwargs = {
-                "seg_threshold":        float(diar_seg_threshold),
-                "seg_min_duration_off": float(diar_min_off),
-                "clust_threshold":      float(diar_clust_threshold),
-                "clust_min_size":       int(diar_clust_min_size),
-            }
-        result = run_transcription_job(
-            media_path=media_path,
-            selected_engines=selected_engines or default_asr_engines(),
-            language=language,
-            diarization=diarization,
-            min_speakers=1,
-            max_speakers=int(max_speakers),
-            enhance=enhance,
-            local_correction=False,
-            diarize_kwargs=diarize_kwargs,
-            cancel_event=_cancel_event,
-        )
+        while not future.done():
+            time.sleep(2)
+            elapsed += 2
+            if _cancel_event.is_set():
+                yield _empty_outputs("(cancelled)")
+                return
+            yield (
+                f"⏳ Transcribing... ({elapsed}s)", "", no_dl, no_btn,
+                f"⏳ Transcribing... ({elapsed}s)", "", no_dl, no_btn,
+                f"Processing — please wait... ({elapsed}s elapsed)",
+            )
+
+        result = future.result()  # raises if the job threw an exception
         if _cancel_event.is_set():
             yield _empty_outputs("(cancelled)")
             return
