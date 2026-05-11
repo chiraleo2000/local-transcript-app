@@ -33,25 +33,32 @@ def audio_duration_from_input(audio_input: dict[str, Any]) -> float:
 def audio_windows(
     audio_input: dict[str, Any],
     window_s: int,
+    overlap_s: int = 0,
 ) -> list[tuple[float, dict[str, Any]]]:
-    """Split a HuggingFace ASR audio input dict into fixed-size windows."""
+    """Split a HuggingFace ASR audio input dict into overlapped fixed-size windows."""
     raw = audio_input.get("raw")
     sample_rate = int(audio_input.get("sampling_rate") or 16000)
     if raw is None or window_s <= 0:
         return [(0.0, dict(audio_input))]
 
     window_samples = max(sample_rate, int(window_s * sample_rate))
+    overlap_samples = max(0, min(window_samples - sample_rate, int(overlap_s * sample_rate)))
+    step_samples = max(sample_rate, window_samples - overlap_samples)
     total_samples = len(raw)
     windows: list[tuple[float, dict[str, Any]]] = []
-    for start_sample in range(0, total_samples, window_samples):
+    start_sample = 0
+    while start_sample < total_samples:
         end_sample = min(total_samples, start_sample + window_samples)
         if end_sample <= start_sample:
-            continue
+            break
         offset_s = start_sample / sample_rate
         windows.append((
             offset_s,
             {"raw": raw[start_sample:end_sample], "sampling_rate": sample_rate},
         ))
+        if end_sample >= total_samples:
+            break
+        start_sample += step_samples
     return windows or [(0.0, dict(audio_input))]
 
 
@@ -73,16 +80,65 @@ def offset_result_timestamps(result: dict, offset_s: float) -> dict:
     return shifted
 
 
+def _chunk_sort_key(chunk: dict) -> tuple[float, float]:
+    start, end = _timestamp_pair(chunk)
+    return (
+        float("inf") if start is None else float(start),
+        float("inf") if end is None else float(end),
+    )
+
+
+def _dedupe_overlapped_chunks(chunks: list[dict]) -> list[dict]:
+    """Drop chunks fully covered by an earlier overlapped window."""
+    ordered = sorted(chunks, key=_chunk_sort_key)
+    kept: list[dict] = []
+    last_end = -1.0
+    for chunk in ordered:
+        start, end = _timestamp_pair(chunk)
+        text = chunk.get("text", "").strip()
+        if not text:
+            continue
+        if start is not None and end is not None:
+            if float(end) <= last_end + 0.25 and _is_recent_duplicate_text(text, kept):
+                continue
+            last_end = max(last_end, float(end))
+        kept.append(chunk)
+    return kept
+
+
+def _normalise_chunk_text(text: str) -> str:
+    return " ".join(text.casefold().split())
+
+
+def _is_recent_duplicate_text(text: str, kept: list[dict]) -> bool:
+    current = _normalise_chunk_text(text)
+    if not current:
+        return False
+    for previous in reversed(kept[-8:]):
+        previous_text = _normalise_chunk_text(previous.get("text", ""))
+        if not previous_text:
+            continue
+        if current == previous_text:
+            return True
+        if min(len(current), len(previous_text)) >= 12:
+            if current in previous_text or previous_text in current:
+                return True
+    return False
+
+
 def merge_window_results(results: list[dict]) -> dict:
     """Merge ordered window ASR results into one HuggingFace-style result dict."""
-    texts: list[str] = []
+    fallback_texts: list[str] = []
     chunks: list[dict] = []
     for result in results:
         text = result.get("text", "").strip()
         if text:
-            texts.append(text)
+            fallback_texts.append(text)
         chunks.extend(result.get("chunks") or [])
-    return {"text": "\n".join(texts).strip(), "chunks": chunks}
+    chunks = _dedupe_overlapped_chunks(chunks)
+    chunk_texts = [chunk.get("text", "").strip() for chunk in chunks]
+    chunk_text = "\n".join(text for text in chunk_texts if text).strip()
+    return {"text": chunk_text or "\n".join(fallback_texts).strip(), "chunks": chunks}
 
 
 def _timestamp_pair(chunk: dict) -> tuple[float | None, float | None]:

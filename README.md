@@ -213,10 +213,13 @@ HF_TOKEN=hf_your_token_here     # Required for gated models (Typhoon Whisper, py
 ```dotenv
 ASR_DEFAULT_ENGINES=Typhoon Whisper   # Default engine shown checked in UI
 ASR_PRELOAD_MODE=eager                # eager = load model at startup; lazy = on first use
-ASR_HARD_MEMORY_SAFE=true             # One model at a time on 8 GB GPUs
-ASR_8GB_CLASS_MAX_MB=9000             # GPUs up to this VRAM use strict 8 GB policy
+MIN_NVIDIA_VRAM_MB=6000               # Minimum NVIDIA VRAM for CUDA mode
+ASR_HARD_MEMORY_SAFE=true             # One model at a time on low-VRAM GPUs
+ASR_8GB_CLASS_MAX_MB=9000             # GPUs up to this VRAM use strict policy
 ASR_CHUNK_LENGTH_S=30                 # Audio chunk size (larger GPUs)
-ASR_8GB_CHUNK_LENGTH_S=20             # Chunk size for 8 GB GPUs
+ASR_8GB_CHUNK_LENGTH_S=40             # Chunk size for 6-8 GB GPUs
+ASR_LONG_FORM_WINDOW_S=360            # Long-file ASR window size
+ASR_LONG_FORM_OVERLAP_S=30            # Overlap to protect window boundaries
 ASR_CUDA_MEMORY_FRACTION=0.90         # Leave headroom for CUDA allocator
 TYPHOON_WORD_TIMESTAMPS_ON_8GB=false  # Disable word timestamps on 8 GB (saves VRAM)
 ```
@@ -260,13 +263,13 @@ LOCAL_LLM_MAX_TOKENS=4096
 
 | Hardware | Mode |
 | --- | --- |
-| NVIDIA GPU ≥ 8 GB VRAM | CUDA (PyTorch) |
-| NVIDIA GPU < 8 GB VRAM | OpenVINO / CPU fallback |
+| NVIDIA GPU ≥ 6 GB VRAM | CUDA (PyTorch, strict memory mode up to 9 GB) |
+| NVIDIA GPU < 6 GB VRAM | OpenVINO / CPU fallback |
 | Intel GPU / NPU | OpenVINO GPU or NPU |
 | AMD GPU | OpenVINO CPU fallback (v1) |
 | CPU only | OpenVINO CPU |
 
-The RTX 4060 Laptop (8 GB) is the reference hardware. Strict 8 GB mode keeps only one Whisper model in VRAM at a time, runs diarization on CPU, and uses sequential multi-engine mode.
+The RTX 4060 Laptop (8 GB) is the reference hardware. Strict low-VRAM mode keeps only one Whisper model in VRAM at a time, uses bounded long-form ASR windows, and uses sequential multi-engine mode.
 
 ---
 

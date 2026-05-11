@@ -137,6 +137,10 @@ def _long_form_window_s() -> int:
     return max(30, _env_int("ASR_LONG_FORM_WINDOW_S", default))
 
 
+def _long_form_overlap_s() -> int:
+    return max(0, _env_int("ASR_LONG_FORM_OVERLAP_S", 30))
+
+
 def _timestamp_mode(diarization_segments: list | None):
     if diarization_segments and _env_bool("ASR_WORD_TIMESTAMPS_WITH_DIARIZATION", True):
         if _strict_8gb_mode() and not _env_bool("TYPHOON_WORD_TIMESTAMPS_ON_8GB", False):
@@ -373,12 +377,14 @@ def _run_long_form_asr(
     from engines.timestamps import audio_windows, merge_window_results, offset_result_timestamps
 
     window_s = _long_form_window_s()
-    windows = audio_windows(audio_input, window_s)
+    overlap_s = min(_long_form_overlap_s(), max(0, window_s // 3))
+    windows = audio_windows(audio_input, window_s, overlap_s)
     logger.info(
-        "%s long-form windowing: windows=%d window=%ds timestamp_mode=%s",
+        "%s long-form windowing: windows=%d window=%ds overlap=%ds timestamp_mode=%s",
         engine_name,
         len(windows),
         window_s,
+        overlap_s,
         timestamp_mode,
     )
     results: list[dict] = []
