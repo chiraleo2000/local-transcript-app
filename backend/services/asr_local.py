@@ -145,7 +145,7 @@ def asr_worker_count(selected_count: int) -> int:
 
 def should_clear_models_after_job() -> bool:
     """Return whether ASR models should be unloaded after each job."""
-    return _env_bool("ASR_CLEAR_VRAM_AFTER_JOB", True)
+    return _env_bool("ASR_CLEAR_VRAM_AFTER_JOB", False)
 
 
 def load_model(engine_name: str) -> None:

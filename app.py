@@ -131,7 +131,15 @@ def _preload_models() -> None:
         logger.info("ASR preload skipped; models are available on demand.")
         return
 
-    preload_engines = ALL_ENGINES
+    preload_engines = default_asr_engines()
+    skipped = [e for e in ALL_ENGINES if e not in preload_engines]
+    for engine in skipped:
+        _load_status[engine] = "available"
+    if skipped:
+        logger.info(
+            "ASR eager preload limited to %s; others available on demand.",
+            ", ".join(preload_engines),
+        )
 
     def _load(engine: str) -> None:
         try:
