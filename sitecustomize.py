@@ -35,6 +35,12 @@ def _env_bool(name: str, default: bool) -> bool:
 
 if _env_bool("APP_SUPPRESS_WARNING_LOGS", True):
     logging.disable(logging.WARNING)
+    # Silence tracer warnings from torch.jit.trace during OpenVINO export
+    logging.getLogger("torch._dynamo").setLevel(logging.ERROR)
+    logging.getLogger("torch._inductor").setLevel(logging.ERROR)
+    logging.getLogger("torch").setLevel(logging.ERROR)
+    logging.getLogger("transformers").setLevel(logging.ERROR)
+    logging.getLogger("openvino").setLevel(logging.ERROR)
 
 warnings.filterwarnings(
     "ignore",
@@ -49,6 +55,21 @@ warnings.filterwarnings(
 warnings.filterwarnings(
     "ignore",
     message=r".*TensorFloat-32.*|.*TF32.*",
+)
+warnings.filterwarnings(
+    "ignore",
+    category=Warning,
+    message=r".*Converting a tensor.*",
+)
+warnings.filterwarnings(
+    "ignore",
+    category=Warning,
+    message=r".*trace.*incorrect.*",
+)
+warnings.filterwarnings(
+    "ignore",
+    module=r".*torch.*",
+    category=Warning,
 )
 
 for logger_name in [
