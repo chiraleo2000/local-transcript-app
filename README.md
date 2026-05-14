@@ -283,7 +283,7 @@ python scripts/bootstrap_models.py
 
 `pyannote/speaker-diarization-3.1` is a gated model — accept its terms on Hugging Face, then set `HF_TOKEN` in `.env`.
 
-After bootstrap, set `HF_HUB_OFFLINE=1` in `.env` to prevent any runtime downloads.
+Keep `HF_HUB_OFFLINE=0` during setup and model swaps so missing model files can be downloaded. After every selected model has been bootstrapped, you may set `HF_HUB_OFFLINE=1` for fully offline runs.
 
 ---
 
@@ -315,7 +315,7 @@ storage/logs/                 — optional log files
 | Symptom | Fix |
 | --- | --- |
 | GPU not used | Requires NVIDIA GPU ≥ 8 GB VRAM and CUDA drivers |
-| Models download on every start | Set `HF_HUB_OFFLINE=1` in `.env` after bootstrap |
+| Missing model fails in offline mode | Set `HF_HUB_OFFLINE=0`, run bootstrap or start the app once, then switch back to offline only after the model is cached |
 | Video upload fails | Install FFmpeg and add it to PATH |
 | Speaker diarization misses a speaker | Lower **Clustering Threshold** and **Min Cluster Size** in the UI |
 | Speakers merged into one | Lower **Clustering Threshold** (try 0.45–0.55) |
@@ -481,7 +481,7 @@ APP_SUPPRESS_WARNING_LOGS=true             # keep known dependency warning logs 
 APP_MODEL_ROOT=./models                   # Docker uses /app/models via bind mount
 HF_HOME=./models/hf_cache                 # reuse downloaded Hugging Face models
 HF_HUB_CACHE=./models/hf_cache/hub
-HF_HUB_OFFLINE=1                          # do not download models at runtime
+HF_HUB_OFFLINE=0                          # allow first-run downloads after model changes
 HUGGINGFACE_HUB_CACHE=./models/hf_cache/hub
 TORCH_HOME=./models/torch
 OV_CACHE_DIR=./models/ov_cache            # reuse OpenVINO exports

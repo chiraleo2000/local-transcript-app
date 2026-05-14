@@ -5,6 +5,8 @@
 import logging
 import os
 
+from engines.model_cache import allow_online_download_if_missing, pretrained_local_files_only
+
 logger = logging.getLogger(__name__)
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -164,6 +166,7 @@ def _model_load_kwargs(hf_token: str | None, dtype) -> dict:
         "use_safetensors": True,
         "low_cpu_mem_usage": True,
         "token": hf_token,
+        "local_files_only": pretrained_local_files_only(),
     }
     attention = os.getenv("ASR_ATTENTION_IMPLEMENTATION", "sdpa").strip()
     if attention:
@@ -220,7 +223,11 @@ def _load_cuda_pipeline(hf_token: str | None):
         ))
     model.tie_weights()
     model = model.to("cuda")
-    processor = WhisperProcessor.from_pretrained(MODEL_ID, token=hf_token)
+    processor = WhisperProcessor.from_pretrained(
+        MODEL_ID,
+        token=hf_token,
+        local_files_only=pretrained_local_files_only(),
+    )
     return hf_pipeline(
         "automatic-speech-recognition",
         model=model,
@@ -244,7 +251,11 @@ def _load_cpu_pipeline(hf_token: str | None):
         MODEL_ID,
         **_model_load_kwargs(hf_token, torch.float32),
     )
-    processor = WhisperProcessor.from_pretrained(MODEL_ID, token=hf_token)
+    processor = WhisperProcessor.from_pretrained(
+        MODEL_ID,
+        token=hf_token,
+        local_files_only=pretrained_local_files_only(),
+    )
     return hf_pipeline(
         "automatic-speech-recognition",
         model=model,
@@ -279,9 +290,18 @@ def _load_ov_pipeline(device: str, hf_token: str | None):
                 "Exporting Pathumma to OpenVINO IR (first run, may take several minutes)..."
             )
             model = OVModelForSpeechSeq2Seq.from_pretrained(
-                MODEL_ID, export=True, device=device, compile=True, token=hf_token,
+                MODEL_ID,
+                export=True,
+                device=device,
+                compile=True,
+                token=hf_token,
+                local_files_only=pretrained_local_files_only(),
             )
-            processor = WhisperProcessor.from_pretrained(MODEL_ID, token=hf_token)
+            processor = WhisperProcessor.from_pretrained(
+                MODEL_ID,
+                token=hf_token,
+                local_files_only=pretrained_local_files_only(),
+            )
             model.save_pretrained(export_dir)
             processor.save_pretrained(export_dir)
             logger.info("Pathumma OpenVINO IR saved to %s", export_dir)
@@ -326,6 +346,7 @@ def _get_pipeline():
     device = hw["selected_device"]
     hf_token = os.getenv("HF_TOKEN")
 
+    allow_online_download_if_missing(MODEL_ID, logger)
     logger.info("Loading Pathumma Whisper (%s) on device=%s ...", MODEL_ID, device)
     if hw["backend"] == "cuda":
         pipe = _load_cuda_pipeline(hf_token)

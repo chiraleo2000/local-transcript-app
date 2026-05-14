@@ -71,6 +71,11 @@ warnings.filterwarnings(
     module=r".*torch.*",
     category=Warning,
 )
+warnings.filterwarnings(
+    "ignore",
+    message=r".*std\(\): degrees of freedom is <= 0.*",
+    category=UserWarning,
+)
 
 for logger_name in [
     "torch.utils.flop_counter",
