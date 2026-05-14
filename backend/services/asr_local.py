@@ -14,9 +14,10 @@ logger = logging.getLogger(__name__)
 
 
 ENGINE_TYPHOON = "Typhoon Whisper"
-ENGINE_THONBURIAN = "Thonburian Whisper"
-ALL_ENGINES = [ENGINE_TYPHOON, ENGINE_THONBURIAN]
-FAST_8GB_ENGINES = [ENGINE_THONBURIAN]
+ENGINE_PATHUMMA = "Pathumma Whisper"
+_LEGACY_ENGINE_NAMES = {"Thonburian Whisper": ENGINE_PATHUMMA}
+ALL_ENGINES = [ENGINE_TYPHOON, ENGINE_PATHUMMA]
+FAST_8GB_ENGINES = [ENGINE_PATHUMMA]
 
 LANGUAGES = {
     "Thai": "thai",
@@ -84,7 +85,11 @@ def default_asr_engines() -> list[str]:
     configured = os.getenv("ASR_DEFAULT_ENGINES", "").strip()
     if configured:
         names = [part.strip() for part in configured.split(",") if part.strip()]
-        selected = [engine for engine in names if engine in ALL_ENGINES]
+        selected = [
+            _LEGACY_ENGINE_NAMES.get(engine, engine)
+            for engine in names
+            if _LEGACY_ENGINE_NAMES.get(engine, engine) in ALL_ENGINES
+        ]
         if selected:
             return selected
         logger.warning(
@@ -152,12 +157,13 @@ def should_clear_models_after_job() -> bool:
 
 def load_model(engine_name: str) -> None:
     """Load one ASR engine by display name."""
+    engine_name = _LEGACY_ENGINE_NAMES.get(engine_name, engine_name)
     if engine_name == ENGINE_TYPHOON:
         from engines.typhoon_asr import load_model as load_typhoon
 
         load_typhoon()
         return
-    if engine_name == ENGINE_THONBURIAN:
+    if engine_name == ENGINE_PATHUMMA:
         from engines.thonburian_asr import load_model as load_thonburian
 
         load_thonburian()
@@ -167,11 +173,12 @@ def load_model(engine_name: str) -> None:
 
 def unload_model(engine_name: str) -> None:
     """Unload one ASR engine by display name and clear accelerator cache."""
+    engine_name = _LEGACY_ENGINE_NAMES.get(engine_name, engine_name)
     if engine_name == ENGINE_TYPHOON:
         from engines.typhoon_asr import unload_model as unload_typhoon
 
         unload_typhoon()
-    elif engine_name == ENGINE_THONBURIAN:
+    elif engine_name == ENGINE_PATHUMMA:
         from engines.thonburian_asr import unload_model as unload_thonburian
 
         unload_thonburian()
@@ -187,6 +194,7 @@ def transcribe_engine(
     diarization_segments: list[dict] | None = None,
 ) -> tuple[str, float]:
     """Run one ASR engine and return transcript text plus elapsed seconds."""
+    engine_name = _LEGACY_ENGINE_NAMES.get(engine_name, engine_name)
     whisper_language = LANGUAGES.get(language, LANGUAGES["Thai"])
     started = time.perf_counter()
     logger.info(
@@ -199,7 +207,7 @@ def transcribe_engine(
         from engines.typhoon_asr import transcribe_typhoon
 
         text = transcribe_typhoon(audio_path, whisper_language, diarization_segments)
-    elif engine_name == ENGINE_THONBURIAN:
+    elif engine_name == ENGINE_PATHUMMA:
         from engines.thonburian_asr import transcribe_thonburian
 
         text = transcribe_thonburian(audio_path, whisper_language, diarization_segments)

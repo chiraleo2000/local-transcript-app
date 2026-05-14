@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from backend.services.asr_local import (
     ALL_ENGINES,
-    ENGINE_THONBURIAN,
+    ENGINE_PATHUMMA,
     ENGINE_TYPHOON,
     asr_worker_count,
     clear_accelerator_cache,
@@ -69,7 +69,7 @@ def _run_diarization(
         logger.info("Diarization finished: segments=%d", len(segments))
         return segments
     except Exception as exc:  # pylint: disable=broad-exception-caught
-        logger.error("Diarization failed: %s", exc, exc_info=True)
+        logger.exception("Diarization failed: %s", exc)
         return None
     finally:
         clear_diarization_model()
@@ -118,7 +118,7 @@ def _is_cuda_oom(exc: Exception) -> bool:
     return "CUDA out of memory" in str(exc)
 
 
-def _should_fallback_to_thonburian(engine: str, exc: Exception) -> bool:
+def _should_fallback_to_pathumma(engine: str, exc: Exception) -> bool:
     return engine == ENGINE_TYPHOON and strict_memory_mode_active() and _is_cuda_oom(exc)
 
 
@@ -133,23 +133,23 @@ def _run_one_asr_engine(
         text, elapsed = transcribe_engine(engine, process_path, language, diar_segments)
         return _success_result(job_id, engine, text, elapsed)
     except Exception as exc:  # pylint: disable=broad-exception-caught
-        if _should_fallback_to_thonburian(engine, exc):
+        if _should_fallback_to_pathumma(engine, exc):
             logger.warning(
-                "Typhoon hit CUDA OOM on an 8 GB-class GPU; falling back to Thonburian."
+                "Typhoon hit CUDA OOM on an 8 GB-class GPU; falling back to Pathumma."
             )
             _unload_asr_engine(engine)
             try:
                 text, elapsed = transcribe_engine(
-                    ENGINE_THONBURIAN,
+                    ENGINE_PATHUMMA,
                     process_path,
                     language,
                     diar_segments,
                 )
                 result = _success_result(job_id, engine, text, elapsed)
-                result["note"] = "Typhoon recovered by falling back to Thonburian."
+                result["note"] = "Typhoon recovered by falling back to Pathumma."
                 return result
             except Exception as fallback_exc:  # pylint: disable=broad-exception-caught
-                return _error_result(ENGINE_THONBURIAN, fallback_exc)
+                return _error_result(ENGINE_PATHUMMA, fallback_exc)
         return _error_result(engine, exc)
 
 

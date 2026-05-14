@@ -1,4 +1,4 @@
-"""Thonburian Whisper Large v3 — Thai ASR via OpenVINO."""
+"""Pathumma Whisper Large v3 Thai ASR via CUDA/OpenVINO."""
 
 # pylint: disable=import-outside-toplevel
 
@@ -9,7 +9,11 @@ logger = logging.getLogger(__name__)
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-MODEL_ID = "biodatlab/distill-whisper-th-large-v3"
+MODEL_ID = (
+    os.getenv("PATHUMMA_MODEL_ID")
+    or os.getenv("THONBURIAN_MODEL_ID")
+    or "nectec/Pathumma-whisper-th-large-v3"
+)
 
 _pipeline_cache: list = []
 
@@ -74,7 +78,7 @@ def _configure_torch_runtime() -> None:
         if torch.cuda.is_available() and _strict_8gb_mode():
             fraction = min(1.0, max(0.5, _env_float("ASR_CUDA_MEMORY_FRACTION", 0.90)))
             torch.cuda.set_per_process_memory_fraction(fraction, 0)
-            logger.info("Thonburian CUDA memory fraction capped at %.2f.", fraction)
+            logger.info("Pathumma CUDA memory fraction capped at %.2f.", fraction)
     except (ImportError, RuntimeError, OSError, AttributeError):
         pass
 
@@ -143,8 +147,12 @@ def _long_form_overlap_s() -> int:
 
 def _timestamp_mode(diarization_segments: list | None):
     if diarization_segments and _env_bool("ASR_WORD_TIMESTAMPS_WITH_DIARIZATION", True):
-        if _strict_8gb_mode() and not _env_bool("THONBURIAN_WORD_TIMESTAMPS_ON_8GB", False):
-            logger.info("Thonburian strict 8 GB mode uses chunk timestamps to avoid CUDA OOM.")
+        word_ts_on_8gb = _env_bool(
+            "PATHUMMA_WORD_TIMESTAMPS_ON_8GB",
+            _env_bool("THONBURIAN_WORD_TIMESTAMPS_ON_8GB", False),
+        )
+        if _strict_8gb_mode() and not word_ts_on_8gb:
+            logger.info("Pathumma strict 8 GB mode uses chunk timestamps to avoid CUDA OOM.")
             return True
         return "word"
     return True
@@ -185,14 +193,14 @@ def _fmt_ts(seconds: float) -> str:
 
 
 def _load_cuda_pipeline(hf_token: str | None):
-    """Build Thonburian pipeline on NVIDIA CUDA (float16)."""
+    """Build Pathumma pipeline on NVIDIA CUDA (float16)."""
     import torch
     from transformers.models.auto.modeling_auto import AutoModelForSpeechSeq2Seq
     from transformers import pipeline as hf_pipeline
     from transformers.models.whisper.processing_whisper import WhisperProcessor
 
     _configure_torch_runtime()
-    logger.info("Using CUDA (float16) backend for Thonburian Whisper.")
+    logger.info("Using CUDA (float16) backend for Pathumma Whisper.")
     model = AutoModelForSpeechSeq2Seq.from_pretrained(
         MODEL_ID,
         **_model_load_kwargs(hf_token, torch.float16),
@@ -231,7 +239,7 @@ def _load_cpu_pipeline(hf_token: str | None):
     from transformers import pipeline as hf_pipeline
     from transformers.models.whisper.processing_whisper import WhisperProcessor
 
-    logger.info("Using CPU (float32) fallback pipeline for Thonburian Whisper.")
+    logger.info("Using CPU (float32) fallback pipeline for Pathumma Whisper.")
     model = AutoModelForSpeechSeq2Seq.from_pretrained(
         MODEL_ID,
         **_model_load_kwargs(hf_token, torch.float32),
@@ -249,23 +257,26 @@ def _load_cpu_pipeline(hf_token: str | None):
 
 
 def _load_ov_pipeline(device: str, hf_token: str | None):
-    """Build Thonburian pipeline via OpenVINO IR; falls back to CPU on export failure."""
+    """Build Pathumma pipeline via OpenVINO IR; falls back to CPU on export failure."""
     from transformers.models.whisper.processing_whisper import WhisperProcessor
     from transformers import pipeline as hf_pipeline
 
     cache_dir = os.getenv("OV_CACHE_DIR", "./ov_cache")
-    export_dir = os.path.join(cache_dir, "thonburian")
+    # Namespace the OpenVINO export by the model id so swapping MODEL_ID does
+    # not silently reuse an older model's IR.
+    safe_model_slug = MODEL_ID.replace("/", "__")
+    export_dir = os.path.join(cache_dir, f"pathumma_{safe_model_slug}")
     ir_path = os.path.join(export_dir, "openvino_encoder_model.xml")
 
     try:
         from optimum.intel.openvino import OVModelForSpeechSeq2Seq
         if os.path.isdir(export_dir) and os.path.isfile(ir_path):
-            logger.info("Loading Thonburian from cached OpenVINO IR: %s", export_dir)
+            logger.info("Loading Pathumma from cached OpenVINO IR: %s", export_dir)
             model = OVModelForSpeechSeq2Seq.from_pretrained(export_dir, device=device, compile=True)
             processor = WhisperProcessor.from_pretrained(export_dir)
         else:
             logger.info(
-                "Exporting Thonburian to OpenVINO IR (first run, may take several minutes)..."
+                "Exporting Pathumma to OpenVINO IR (first run, may take several minutes)..."
             )
             model = OVModelForSpeechSeq2Seq.from_pretrained(
                 MODEL_ID, export=True, device=device, compile=True, token=hf_token,
@@ -273,7 +284,7 @@ def _load_ov_pipeline(device: str, hf_token: str | None):
             processor = WhisperProcessor.from_pretrained(MODEL_ID, token=hf_token)
             model.save_pretrained(export_dir)
             processor.save_pretrained(export_dir)
-            logger.info("Thonburian OpenVINO IR saved to %s", export_dir)
+            logger.info("Pathumma OpenVINO IR saved to %s", export_dir)
         return hf_pipeline(
             "automatic-speech-recognition",
             model=model,
@@ -305,7 +316,7 @@ def _format_chunks(chunks):
 
 
 def _get_pipeline():
-    """Lazy-load the Thonburian Whisper pipeline (CUDA or OpenVINO)."""
+    """Lazy-load the Pathumma Whisper pipeline (CUDA or OpenVINO)."""
     if _pipeline_cache:
         return _pipeline_cache[0]
 
@@ -315,27 +326,27 @@ def _get_pipeline():
     device = hw["selected_device"]
     hf_token = os.getenv("HF_TOKEN")
 
-    logger.info("Loading Thonburian Whisper (%s) on device=%s ...", MODEL_ID, device)
+    logger.info("Loading Pathumma Whisper (%s) on device=%s ...", MODEL_ID, device)
     if hw["backend"] == "cuda":
         pipe = _load_cuda_pipeline(hf_token)
     else:
         pipe = _load_ov_pipeline(device, hf_token)
     _pipeline_cache.append(pipe)
-    logger.info("Thonburian Whisper pipeline ready on %s.", device)
+    logger.info("Pathumma Whisper pipeline ready on %s.", device)
     return _pipeline_cache[0]
 
 
 def load_model():
-    """Pre-load the Thonburian Whisper model. Safe to call multiple times."""
+    """Pre-load the Pathumma Whisper model. Safe to call multiple times."""
     _get_pipeline()
-    logger.info("Thonburian Whisper model pre-loaded.")
+    logger.info("Pathumma Whisper model pre-loaded.")
 
 
 def unload_model():
-    """Unload Thonburian Whisper from process memory and clear CUDA cache."""
+    """Unload Pathumma Whisper from process memory and clear CUDA cache."""
     _pipeline_cache.clear()
     _clear_cuda_cache()
-    logger.info("Thonburian Whisper model cache cleared.")
+    logger.info("Pathumma Whisper model cache cleared.")
 
 
 def _load_audio(audio_path: str):
@@ -436,7 +447,7 @@ def transcribe_thonburian(
     audio_path: str, language: str = "thai",
     diarization_segments: list | None = None,
 ) -> str:
-    """Transcribe audio using Thonburian Whisper Large v3.
+    """Transcribe audio using Pathumma Whisper Large v3.
 
     If diarization_segments is provided (pre-computed by the caller),
     each Whisper chunk is labelled with the overlapping speaker.
@@ -448,7 +459,7 @@ def transcribe_thonburian(
     audio_duration_s = audio_duration_from_input(audio_input)
     timestamp_mode = _timestamp_mode(diarization_segments)
     logger.info(
-        "Thonburian transcription started: audio=%.1fs language=%s diarization=%s "
+        "Pathumma transcription started: audio=%.1fs language=%s diarization=%s "
         "timestamp_mode=%s batch=%d chunk=%ds",
         audio_duration_s,
         language,
@@ -458,7 +469,7 @@ def transcribe_thonburian(
         _chunk_length_s(),
     )
     if audio_duration_s >= _long_form_min_duration_s():
-        result = _run_long_form_asr(pipe, audio_input, language, timestamp_mode, "Thonburian")
+        result = _run_long_form_asr(pipe, audio_input, language, timestamp_mode, "Pathumma")
     else:
         try:
             result = _run_pipe(pipe, audio_input, language, timestamp_mode, _asr_batch_size())
@@ -467,13 +478,13 @@ def transcribe_thonburian(
                 raise
             retry_chunk_s = _retry_chunk_length_s()
             logger.warning(
-                "Thonburian CUDA OOM in strict 8 GB mode; retrying with batch=1, "
+                "Pathumma CUDA OOM in strict 8 GB mode; retrying with batch=1, "
                 "chunk=%ds and chunk timestamps.",
                 retry_chunk_s,
             )
             _clear_cuda_cache()
             result = _run_pipe(pipe, audio_input, language, True, 1, retry_chunk_s)
-    result = repair_asr_result(result, audio_duration_s, "Thonburian", logger)
+    result = repair_asr_result(result, audio_duration_s, "Pathumma", logger)
 
     if diarization_segments:
         from engines.diarization import assign_speakers

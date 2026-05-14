@@ -91,7 +91,7 @@ http://localhost:7896
 
 On 6-8 GB-class NVIDIA GPUs the app uses strict memory-safe mode:
 
-- Default engine: `Thonburian Whisper` for the fastest 8 GB path.
+- Default engine: `Pathumma Whisper` for the fastest 8 GB path.
 - One GPU ASR model at a time; both engines can be selected, but they run sequentially.
 - Forced parallel ASR is ignored on 8 GB-class GPUs when `ASR_HARD_MEMORY_SAFE=true`.
 - Pyannote diarization and preprocessing run on CPU by default.

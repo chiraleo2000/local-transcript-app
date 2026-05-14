@@ -8,7 +8,7 @@ No cloud APIs. No telemetry. All processing stays on your machine.
 ## Features
 
 - **Typhoon Whisper Large v3** — default ASR engine (Thai-optimised, high accuracy)
-- **Thonburian / Distill Whisper Thai Large v3** — fast alternative ASR engine
+- **Pathumma Whisper Thai Large v3** — fast alternative ASR engine
 - **Speaker diarization** — `pyannote/speaker-diarization-3.1`, fully local
 - **Advanced diarization tuning** — segmentation threshold, clustering threshold, min cluster size, silence gap — adjustable live in the UI
 - **Audio enhancement** — bandpass filter → spectral noise reduction → compressor / limiter chain
@@ -145,7 +145,7 @@ Visible only when **Speaker Diarization** is checked.
 ### 4. Transcribe
 
 Click **Transcribe**. A progress indicator appears while models run.  
-Results appear in the **Typhoon Whisper** and **Thonburian Whisper** tabs.
+Results appear in the **Typhoon Whisper** and **Pathumma Whisper** tabs.
 
 ### 5. Results
 
@@ -184,7 +184,7 @@ local-transcript-app/
 │       └── hardware_policy.py    # GPU/CPU backend detection
 ├── engines/
 │   ├── typhoon_asr.py            # Typhoon Whisper Large v3
-│   ├── thonburian_asr.py         # Distill Whisper Thai Large v3
+│   ├── thonburian_asr.py         # Pathumma Whisper Thai Large v3
 │   ├── diarization.py            # pyannote speaker diarization
 │   ├── preprocess.py             # 3-stage audio enhancement
 │   └── hardware.py               # Device helpers
@@ -334,7 +334,7 @@ All processing is local. No audio, video, or transcript data is sent to any clou
 - Video file transcription by extracting audio locally with FFmpeg.
 - Local ASR engines:
   - Typhoon Whisper Large v3.
-  - Thonburian / Distill Whisper Thai Large v3.
+  - Pathumma Whisper Thai Large v3.
 - Speaker diarization with local `pyannote/speaker-diarization-3.1` pipeline.
 - Optional local LLM correction through a local Ollama-compatible endpoint.
 - Folder-based storage inside the app path.
@@ -379,7 +379,7 @@ The app detects available resources and chooses the best local backend.
 
 The CUDA runtime now uses a strict 8 GB-class policy. On GPUs up to `ASR_8GB_CLASS_MAX_MB` (default 9000 MB, covering RTX 4060 Laptop cards that report about 8187 MB), the app keeps only one Whisper model resident on the GPU, unloads it before the next engine starts, ignores forced parallel ASR, caps CUDA batch size, and clears VRAM between engines/jobs. Speaker diarization and preprocessing run on CPU by default so ASR owns the GPU budget.
 
-For fastest 8 GB operation, the default UI selection is the distilled Thonburian engine. You can still select both engines for comparison, but they run sequentially to stay inside the VRAM budget, so total wall time will be longer.
+For fastest 8 GB operation, the default UI selection is the Pathumma engine. You can still select both engines for comparison, but they run sequentially to stay inside the VRAM budget, so total wall time will be longer.
 
 The selected backend and reason are saved to `config/app_config.json`.
 
@@ -492,7 +492,7 @@ ASR_PARALLEL_MODE=auto                    # forced parallel is ignored in strict
 ASR_PARALLEL_MIN_VRAM_MB=12288            # auto-parallel threshold for larger GPUs
 ASR_CLEAR_VRAM_BETWEEN_ENGINES=true       # unload before loading another engine
 ASR_CLEAR_VRAM_AFTER_JOB=true             # final CUDA cache cleanup after each job
-ASR_DEFAULT_ENGINES=Thonburian Whisper    # fastest default for 8 GB
+ASR_DEFAULT_ENGINES=Pathumma Whisper      # fastest default for 8 GB
 ASR_CUDA_BATCH_SIZE=1                     # strict 8 GB safe default
 ASR_8GB_MAX_BATCH_SIZE=1
 ASR_CUDA_MEMORY_FRACTION=0.90             # leave headroom for CUDA/runtime allocations

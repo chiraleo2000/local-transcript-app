@@ -228,6 +228,155 @@ def _repair_pathological_full_text_chunk(
     return None
 
 
+def _infer_audio_duration(chunks: list[dict], audio_duration_s: float) -> float:
+    """Fall back to the largest known chunk end when audio duration is unknown."""
+    if audio_duration_s > 0:
+        return audio_duration_s
+    max_known_end = 0.0
+    for chunk in chunks:
+        _, end = _timestamp_pair(chunk)
+        if end is not None and float(end) > max_known_end:
+            max_known_end = float(end)
+    return max_known_end
+
+
+def _classify_chunk(
+    chunk: dict, upper_bound: float | None, tolerance_s: float,
+) -> dict | None:
+    """Return a normalised {text, start, end, broken} record or None for empty text."""
+    text = chunk.get("text", "").strip()
+    if not text:
+        return None
+    start, end = _timestamp_pair(chunk)
+    s = None if start is None else float(start)
+    e = None if end is None else float(end)
+    broken = s is None
+    if s is not None:
+        if upper_bound is not None and s > upper_bound + tolerance_s:
+            broken = True
+        if e is not None and e < s:
+            broken = True
+    return {"text": text, "start": s, "end": e, "broken": broken}
+
+
+def _prepared_sort_key(item: dict) -> tuple[int, float]:
+    if item["broken"] or item["start"] is None:
+        return (1, 0.0)
+    return (0, item["start"])
+
+
+def _resolve_chunk_start(
+    item: dict, last_end: float, upper_bound: float | None,
+) -> float:
+    if item["start"] is None or item["broken"]:
+        return last_end
+    s = max(0.0, float(item["start"]))
+    if upper_bound is not None:
+        s = min(s, upper_bound)
+    return max(s, last_end)
+
+
+def _next_valid_start(
+    prepared: list[dict], start_index: int, current_start: float, upper_bound: float | None,
+) -> float | None:
+    for nxt in prepared[start_index + 1:]:
+        if nxt["broken"] or nxt["start"] is None:
+            continue
+        candidate = max(current_start, float(nxt["start"]))
+        if upper_bound is not None:
+            candidate = min(candidate, upper_bound)
+        return candidate
+    return None
+
+
+def _resolve_ceiling(
+    next_valid_start: float | None, upper_bound: float | None, current_start: float,
+) -> float:
+    if next_valid_start is not None:
+        return next_valid_start
+    if upper_bound is not None:
+        return upper_bound
+    return current_start
+
+
+def _resolve_chunk_end(
+    item: dict,
+    current_start: float,
+    ceiling: float,
+    upper_bound: float | None,
+    tolerance_s: float,
+) -> float:
+    e = item["end"]
+    if e is None or e < current_start:
+        return ceiling
+    if upper_bound is not None and e > upper_bound + tolerance_s:
+        return ceiling
+    return max(current_start, min(float(e), ceiling))
+
+
+def _timestamp_constructor(chunks: list[dict]):
+    timestamp_type = type(chunks[0].get("timestamp")) if chunks else tuple
+    if timestamp_type not in (tuple, list):
+        timestamp_type = tuple
+    return timestamp_type
+
+
+def _sanitize_chunk_timeline(
+    chunks: list[dict],
+    audio_duration_s: float,
+    engine_name: str,
+    logger: logging.Logger,
+) -> list[dict]:
+    """Force chunk timestamps into a monotonic, bounded timeline.
+
+    Whisper occasionally returns inverted timestamps (``end < start``), wildly
+    out-of-range timestamps (``start`` beyond the audio duration), or repeated
+    identical timestamps for several consecutive chunks. This helper drops
+    empty-text chunks, flags any chunk whose timestamps are missing, inverted,
+    or out of audio bounds as "broken", sorts well-formed chunks ascending by
+    start (broken chunks go to the end with timestamps re-estimated from their
+    neighbours), and clamps every ``(start, end)`` pair so
+    ``0 <= start <= end <= audio_duration`` and starts are non-decreasing.
+    """
+    if not chunks:
+        return chunks
+
+    duration = _infer_audio_duration(chunks, audio_duration_s)
+    tolerance_s = _env_float("ASR_TIMESTAMP_AUDIO_END_TOLERANCE_S", 30.0)
+    upper_bound = duration if duration > 0 else None
+
+    prepared: list[dict] = []
+    for chunk in chunks:
+        record = _classify_chunk(chunk, upper_bound, tolerance_s)
+        if record is not None:
+            prepared.append(record)
+
+    issues = sum(1 for item in prepared if item["broken"])
+    prepared.sort(key=_prepared_sort_key)
+    timestamp_type = _timestamp_constructor(chunks)
+
+    cleaned: list[dict] = []
+    last_end = 0.0
+    for i, item in enumerate(prepared):
+        s = _resolve_chunk_start(item, last_end, upper_bound)
+        ceiling = _resolve_ceiling(
+            _next_valid_start(prepared, i, s, upper_bound), upper_bound, s,
+        )
+        e = _resolve_chunk_end(item, s, ceiling, upper_bound, tolerance_s)
+        cleaned.append({"text": item["text"], "timestamp": timestamp_type((s, e))})
+        last_end = e
+
+    if issues:
+        logger.warning(
+            "%s ASR sanitiser fixed %d/%d chunks with invalid timestamps.",
+            engine_name,
+            issues,
+            len(prepared),
+        )
+
+    return cleaned
+
+
 def repair_asr_result(
     result: dict,
     audio_duration_s: float,
@@ -251,16 +400,28 @@ def repair_asr_result(
         result, audio_duration_s, engine_name, logger
     )
     if repaired is not None:
+        repaired = dict(repaired)
+        repaired["chunks"] = _sanitize_chunk_timeline(
+            repaired.get("chunks") or [], audio_duration_s, engine_name, logger
+        )
         return repaired
 
     if not chunks or first_start is None or last_end is None or audio_duration_s <= 0:
-        return result
+        cleaned = _sanitize_chunk_timeline(chunks, audio_duration_s, engine_name, logger)
+        if cleaned is chunks:
+            return result
+        repaired = dict(result)
+        repaired["chunks"] = cleaned
+        return repaired
 
     tolerance_s = _env_float("ASR_TIMESTAMP_AUDIO_END_TOLERANCE_S", 30.0)
     suspicious_start_s = _env_float("ASR_SUSPICIOUS_FIRST_TS_S", 60.0)
     if first_start >= suspicious_start_s and last_end > audio_duration_s + tolerance_s:
         repaired = dict(result)
-        repaired["chunks"] = _shift_timestamps(chunks, first_start)
+        shifted = _shift_timestamps(chunks, first_start)
+        repaired["chunks"] = _sanitize_chunk_timeline(
+            shifted, audio_duration_s, engine_name, logger
+        )
         logger.warning(
             "%s ASR timestamps exceeded audio duration "
             "(first=%.1fs last=%.1fs audio=%.1fs); shifted by %.1fs.",
@@ -280,4 +441,9 @@ def repair_asr_result(
             first_start,
             audio_duration_s,
         )
-    return result
+
+    repaired = dict(result)
+    repaired["chunks"] = _sanitize_chunk_timeline(
+        chunks, audio_duration_s, engine_name, logger
+    )
+    return repaired

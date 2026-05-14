@@ -79,7 +79,7 @@ from gradio.themes import Soft as _SoftTheme
 from backend.pipeline import run_transcription_job
 from backend.services.asr_local import (
     ALL_ENGINES,
-    ENGINE_THONBURIAN,
+    ENGINE_PATHUMMA,
     ENGINE_TYPHOON,
     LANGUAGES,
     default_asr_engines,
@@ -149,7 +149,7 @@ def _preload_models() -> None:
             logger.info("%s loaded.", engine)
         except Exception as exc:  # pylint: disable=broad-exception-caught
             _load_status[engine] = f"FAILED: {exc}"
-            logger.error("%s load failed: %s", engine, exc, exc_info=True)
+            logger.exception("%s load failed: %s", engine, exc)
 
     def _worker() -> None:
         for engine in preload_engines:
@@ -324,10 +324,10 @@ def transcribe(
         if "cancelled" in str(exc).lower():
             yield _empty_outputs(_CANCELLED)
             return
-        logger.error("Transcription job failed: %s", exc, exc_info=True)
+        logger.exception("Transcription job failed: %s", exc)
         yield _empty_outputs(f"ERROR: {exc}")
     except Exception as exc:  # pylint: disable=broad-exception-caught
-        logger.error("Transcription job failed: %s", exc, exc_info=True)
+        logger.exception("Transcription job failed: %s", exc)
         yield _empty_outputs(f"ERROR: {exc}")
 
 
@@ -525,7 +525,7 @@ def build_ui() -> gr.Blocks:
                     elem_classes=["correction-button"],
                 )
 
-            with gr.TabItem(ENGINE_THONBURIAN):
+            with gr.TabItem(ENGINE_PATHUMMA):
                 thonburian_text = gr.Textbox(
                     label="Transcript",
                     lines=20,
@@ -594,7 +594,7 @@ def build_ui() -> gr.Blocks:
         )
         thonburian_correct.click(  # pylint: disable=no-member
             fn=lambda text, elapsed, info: correct_transcript(
-                ENGINE_THONBURIAN,
+                ENGINE_PATHUMMA,
                 text,
                 elapsed,
                 info,
