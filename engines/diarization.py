@@ -77,6 +77,13 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _build_pipeline_params() -> dict | None:
     """Build pyannote pipeline instantiate() params from environment variables.
 
@@ -131,6 +138,17 @@ def _select_diarization_device(torch_module):
     requested = os.getenv("DIARIZATION_DEVICE", "cpu").strip().lower()
     min_cuda_vram_mb = _env_int("DIARIZATION_CUDA_MIN_VRAM_MB", 12288)
     vram_mb = _cuda_vram_mb(torch_module)
+    low_vram_limit_mb = _env_int("ASR_8GB_CLASS_MAX_MB", 9000)
+    low_vram_cuda = 0 < vram_mb <= low_vram_limit_mb
+    hard_memory_safe = _env_bool("ASR_HARD_MEMORY_SAFE", True)
+    allow_low_vram_cuda = _env_bool("DIARIZATION_ALLOW_8GB_CUDA", False)
+
+    if low_vram_cuda and hard_memory_safe and not allow_low_vram_cuda:
+        logger.info(
+            "Diarization uses CPU on %d MB CUDA GPU so ASR can keep GPU VRAM.",
+            vram_mb,
+        )
+        return torch_module.device("cpu")
 
     if requested in {"cuda", "gpu"}:
         if vram_mb >= min_cuda_vram_mb:
@@ -174,7 +192,7 @@ def _get_diarization_pipeline():
         try:
             pipeline.instantiate(custom_params)
             logger.info("Diarization hyperparameters applied: %s", custom_params)
-        except Exception as exc:  # pylint: disable=broad-except
+        except (KeyError, TypeError, ValueError, RuntimeError) as exc:
             logger.warning("Could not apply custom diarization params: %s", exc)
 
     _pipeline_cache.append(pipeline)
@@ -408,12 +426,51 @@ def _build_diarize_kwargs(num_speakers: int, max_speakers: int) -> dict:
 
 def _run_pyannote(pipe, audio_input: dict, kwargs: dict):
     """Call pyannote pipeline; use ProgressHook when available."""
+    _move_pipeline_to_cpu_if_cuda_memory_low(pipe)
+    return _call_pyannote(pipe, audio_input, kwargs)
+
+
+def _call_pyannote(pipe, audio_input: dict, kwargs: dict):
+    """Call pyannote with optional progress hook."""
     try:
         from pyannote.audio.pipelines.utils.hook import ProgressHook
         with ProgressHook() as hook:
             return pipe(audio_input, hook=hook, **kwargs)
-    except (ImportError, TypeError):
+    except ImportError:
         return pipe(audio_input, **kwargs)
+
+
+def _move_pipeline_to_cpu(pipe) -> None:
+    import torch
+
+    pipe.to(torch.device("cpu"))
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        try:
+            torch.cuda.ipc_collect()
+        except (RuntimeError, AttributeError):
+            pass
+
+
+def _move_pipeline_to_cpu_if_cuda_memory_low(pipe) -> None:
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return
+        min_free_mb = _env_int("DIARIZATION_CUDA_MIN_FREE_MB", 1024)
+        free_bytes, _total_bytes = torch.cuda.mem_get_info()
+        free_mb = int(free_bytes // (1024 * 1024))
+        if free_mb >= min_free_mb:
+            return
+        logger.warning(
+            "Diarization sees only %d MB free CUDA memory (< %d MB); using CPU.",
+            free_mb,
+            min_free_mb,
+        )
+        _move_pipeline_to_cpu(pipe)
+    except (ImportError, RuntimeError, OSError, AttributeError) as exc:
+        logger.debug("Diarization CUDA free-memory probe skipped: %s", exc)
 
 
 def _remap_speakers(segments: list[dict]) -> dict:
@@ -451,7 +508,7 @@ def diarize(
         try:
             pipe.instantiate(override)
             logger.info("Diarization params overridden for this run: %s", override)
-        except Exception as exc:  # pylint: disable=broad-except
+        except (KeyError, TypeError, ValueError, RuntimeError) as exc:
             logger.warning("Could not apply diarization param overrides: %s", exc)
 
     kwargs = _build_diarize_kwargs(num_speakers, max_speakers)

@@ -377,7 +377,7 @@ The app detects available resources and chooses the best local backend.
 | AMD GPU | Use CPU/OpenVINO fallback in v1 |
 | CPU only | Use OpenVINO CPU or CPU fallback |
 
-The CUDA runtime now uses a strict 8 GB-class policy. On GPUs up to `ASR_8GB_CLASS_MAX_MB` (default 9000 MB, covering RTX 4060 Laptop cards that report about 8187 MB), the app keeps only one Whisper model resident on the GPU, unloads it before the next engine starts, ignores forced parallel ASR, caps CUDA batch size, and clears VRAM between engines/jobs. Speaker diarization and preprocessing run on CPU by default so ASR owns the GPU budget.
+The CUDA runtime now uses a strict 8 GB-class policy. On GPUs up to `ASR_8GB_CLASS_MAX_MB` (default 9000 MB, covering RTX 4060 Laptop cards that report about 8187 MB), the app keeps only one Whisper model resident on the GPU, ignores parallel ASR unless `ASR_ALLOW_8GB_PARALLEL=true`, caps CUDA batch size, and keeps speaker diarization on CPU so ASR owns the GPU budget. If CUDA diarization is enabled on larger GPUs, pyannote moves to CPU when free CUDA memory drops below `DIARIZATION_CUDA_MIN_FREE_MB`.
 
 For fastest 8 GB operation, the default UI selection is the Pathumma engine. You can still select both engines for comparison, but they run sequentially to stay inside the VRAM budget, so total wall time will be longer.
 
@@ -493,6 +493,9 @@ ASR_PARALLEL_MIN_VRAM_MB=12288            # auto-parallel threshold for larger G
 ASR_CLEAR_VRAM_BETWEEN_ENGINES=true       # unload before loading another engine
 ASR_CLEAR_VRAM_AFTER_JOB=true             # final CUDA cache cleanup after each job
 ASR_DEFAULT_ENGINES=Pathumma Whisper      # fastest default for 8 GB
+ASR_ALLOW_8GB_PARALLEL=false             # keep two large ASR models off 8 GB GPUs
+ASR_CLEAR_VRAM_AFTER_JOB=true            # release ASR VRAM before the next job
+ASR_CLEAR_VRAM_BETWEEN_ENGINES=true      # unload one ASR model before loading the next
 ASR_CUDA_BATCH_SIZE=1                     # strict 8 GB safe default
 ASR_8GB_MAX_BATCH_SIZE=1
 ASR_CUDA_MEMORY_FRACTION=0.90             # leave headroom for CUDA/runtime allocations
@@ -511,6 +514,8 @@ AUDIO_ENHANCE_MAX_GAIN_DB=10.0            # cap boost so noise does not explode
 AUDIO_ENHANCE_NOISE_REDUCTION=0.65        # less destructive than heavy gating
 
 DIARIZATION_MODEL_ID=pyannote/speaker-diarization-3.1
+DIARIZATION_DEVICE=cpu                   # keep pyannote embeddings off 8 GB GPU VRAM
+DIARIZATION_CUDA_MIN_FREE_MB=1024        # move diarization to CPU if CUDA memory is crowded
 DIARIZATION_DEVICE=cuda                    # cuda = GPU diarization (much faster embeddings)
 DIARIZATION_CUDA_MIN_VRAM_MB=12288
 ```

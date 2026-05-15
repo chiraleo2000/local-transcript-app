@@ -77,6 +77,8 @@ def should_clear_model_between_engines() -> bool:
     Only applies in sequential mode. Parallel mode keeps both models in VRAM
     for the duration of both transcriptions.
     """
+    if strict_memory_mode_active():
+        return True
     return _env_bool("ASR_CLEAR_VRAM_BETWEEN_ENGINES", False)
 
 
@@ -129,6 +131,12 @@ def asr_worker_count(selected_count: int) -> int:
         return 1
 
     mode = os.getenv("ASR_PARALLEL_MODE", "auto").strip().lower()
+    if strict_memory_mode_active() and not _env_bool("ASR_ALLOW_8GB_PARALLEL", False):
+        logger.info(
+            "ASR parallelism limited to 1 worker by strict low-VRAM mode. "
+            "Set ASR_ALLOW_8GB_PARALLEL=true only on machines with enough free VRAM."
+        )
+        return 1
 
     if mode in {"parallel", "force", "true", "1"}:
         return selected_count
@@ -152,7 +160,7 @@ def asr_worker_count(selected_count: int) -> int:
 
 def should_clear_models_after_job() -> bool:
     """Return whether ASR models should be unloaded after each job."""
-    return _env_bool("ASR_CLEAR_VRAM_AFTER_JOB", False)
+    return _env_bool("ASR_CLEAR_VRAM_AFTER_JOB", strict_memory_mode_active())
 
 
 def load_model(engine_name: str) -> None:
