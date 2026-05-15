@@ -117,13 +117,13 @@ _load_status = dict.fromkeys(ALL_ENGINES, "pending")
 
 
 def _preload_models() -> None:
-    """Preload local ASR models only when explicitly requested.
+    """Preload the configured ASR model at startup by default.
 
-    The default lazy mode keeps 8 GB GPUs from holding both large Whisper models
-    in VRAM before a job starts. Set ASR_PRELOAD_MODE=eager to restore startup
-    preloading when the machine has enough memory.
+    Strict 8 GB mode limits this to the configured default engine and keeps
+    diarization on CPU, so the startup preload uses the local model cache without
+    competing with pyannote for CUDA memory.
     """
-    preload_mode = os.getenv("ASR_PRELOAD_MODE", "lazy").strip().lower()
+    preload_mode = os.getenv("ASR_PRELOAD_MODE", "eager").strip().lower()
     if preload_mode not in {"eager", "preload", "true", "1"}:
         for engine in ALL_ENGINES:
             _load_status[engine] = "available"
@@ -151,13 +151,10 @@ def _preload_models() -> None:
             _load_status[engine] = f"FAILED: {exc}"
             logger.exception("%s load failed: %s", engine, exc)
 
-    def _worker() -> None:
-        for engine in preload_engines:
-            _load(engine)
-        _models_ready.set()
-        logger.info("Model preload finished.")
-
-    threading.Thread(target=_worker, daemon=True).start()
+    for engine in preload_engines:
+        _load(engine)
+    _models_ready.set()
+    logger.info("Model preload finished.")
 
 
 def _get_load_status() -> str:

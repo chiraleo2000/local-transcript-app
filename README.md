@@ -211,8 +211,8 @@ HF_TOKEN=hf_your_token_here     # Required for gated models (Typhoon Whisper, py
 ### ASR
 
 ```dotenv
-ASR_DEFAULT_ENGINES=Typhoon Whisper   # Default engine shown checked in UI
-ASR_PRELOAD_MODE=eager                # eager = load model at startup; lazy = on first use
+ASR_DEFAULT_ENGINES=Pathumma Whisper  # Default engine shown checked in UI
+ASR_PRELOAD_MODE=eager                # load the configured default ASR model at startup
 MIN_NVIDIA_VRAM_MB=6000               # Minimum NVIDIA VRAM for CUDA mode
 ASR_HARD_MEMORY_SAFE=true             # One model at a time on low-VRAM GPUs
 ASR_8GB_CLASS_MAX_MB=9000             # GPUs up to this VRAM use strict policy
@@ -237,7 +237,7 @@ AUDIO_ENHANCE_NOISE_REDUCTION=0.65    # Spectral gating strength (0–1)
 
 ```dotenv
 DIARIZATION_MODEL_ID=pyannote/speaker-diarization-3.1
-DIARIZATION_DEVICE=cuda                # cuda = fast GPU embeddings (recommended)
+DIARIZATION_DEVICE=cpu                 # keep diarization off 8 GB GPU VRAM by default
 DIARIZATION_PREPROCESS_SR=44100       # Intermediate rate before 16 kHz downsample
 DIARIZATION_NOISE_REDUCTION=0.60      # NR strength for diarization audio
 
@@ -469,10 +469,12 @@ http://localhost:7896
 
 ### What to expect on first start
 
-1. Hardware is detected — NVIDIA CUDA (≥8 GB VRAM) is preferred; falls back to OpenVINO CPU or CPU.
-2. Models load lazily from `models/hf_cache/` on first use to keep VRAM free.
-3. Gradio UI starts; the terminal shows `Running on local URL: http://0.0.0.0:7896`.
+1. Hardware is detected — NVIDIA CUDA (>=8 GB VRAM) is preferred; falls back to OpenVINO CPU or CPU.
+2. The configured default ASR engine preloads from `models/hf_cache/hub` at startup before the UI is served; other engines load on demand.
+3. Gradio UI starts after preload; the terminal shows `Running on local URL: http://0.0.0.0:7896`.
 4. Upload an audio or video file, choose engine and language, click **Transcribe**.
+
+Keep Hugging Face model snapshots under the canonical hub cache: `models/hf_cache/hub/models--...`. Legacy duplicate folders directly under `models/hf_cache/models--...` are not used by this app and should be moved out of the active cache root.
 
 Optional runtime knobs in `.env`:
 
@@ -494,8 +496,6 @@ ASR_CLEAR_VRAM_BETWEEN_ENGINES=true       # unload before loading another engine
 ASR_CLEAR_VRAM_AFTER_JOB=true             # final CUDA cache cleanup after each job
 ASR_DEFAULT_ENGINES=Pathumma Whisper      # fastest default for 8 GB
 ASR_ALLOW_8GB_PARALLEL=false             # keep two large ASR models off 8 GB GPUs
-ASR_CLEAR_VRAM_AFTER_JOB=true            # release ASR VRAM before the next job
-ASR_CLEAR_VRAM_BETWEEN_ENGINES=true      # unload one ASR model before loading the next
 ASR_CUDA_BATCH_SIZE=1                     # strict 8 GB safe default
 ASR_8GB_MAX_BATCH_SIZE=1
 ASR_CUDA_MEMORY_FRACTION=0.90             # leave headroom for CUDA/runtime allocations
@@ -506,7 +506,7 @@ ASR_8GB_RETRY_CHUNK_LENGTH_S=10           # final retry after CUDA OOM
 ASR_WORD_TIMESTAMPS_WITH_DIARIZATION=true # better ASR-to-speaker alignment
 TYPHOON_WORD_TIMESTAMPS_ON_8GB=false      # Typhoon uses chunk timestamps on 8 GB to avoid OOM
 ASR_ATTENTION_IMPLEMENTATION=sdpa         # prefer memory-efficient torch attention
-ASR_PRELOAD_MODE=eager                    # preload the strict 8 GB default ASR engine at startup
+ASR_PRELOAD_MODE=eager                    # preload the strict 8 GB default ASR engine from models/ at startup
 
 AUDIO_ENHANCE_DEFAULT=false               # keep enhancement unchecked on startup
 AUDIO_ENHANCE_TARGET_PEAK_DB=-3.0         # make quiet speech louder without clipping
@@ -516,7 +516,6 @@ AUDIO_ENHANCE_NOISE_REDUCTION=0.65        # less destructive than heavy gating
 DIARIZATION_MODEL_ID=pyannote/speaker-diarization-3.1
 DIARIZATION_DEVICE=cpu                   # keep pyannote embeddings off 8 GB GPU VRAM
 DIARIZATION_CUDA_MIN_FREE_MB=1024        # move diarization to CPU if CUDA memory is crowded
-DIARIZATION_DEVICE=cuda                    # cuda = GPU diarization (much faster embeddings)
 DIARIZATION_CUDA_MIN_VRAM_MB=12288
 ```
 

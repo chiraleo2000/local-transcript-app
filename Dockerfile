@@ -53,7 +53,7 @@ ENV PYTHONPATH=/app \
 EXPOSE 7896
 
 # Health check — Gradio exposes a REST API at /gradio_api/
-HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=300s --retries=3 \
     CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:7896/gradio_api/startup-events')" || exit 1
 
 CMD ["python3", "app.py"]
