@@ -101,14 +101,13 @@ def audio_duration_seconds(audio_path: str) -> float:
 
 
 def diarize_audio(
-    audio_path: str, min_speakers: int = 0, max_speakers: int = 0,
+    audio_path: str, max_speakers: int = 0,
     diarize_kwargs: dict | None = None,
 ) -> list[dict]:
     """Run local speaker diarization."""
     from engines.diarization import diarize
 
-    return diarize(audio_path, min_speakers=min_speakers, max_speakers=max_speakers,
-                   **(diarize_kwargs or {}))
+    return diarize(audio_path, max_speakers=max_speakers, **(diarize_kwargs or {}))
 
 
 def clear_diarization_model() -> None:

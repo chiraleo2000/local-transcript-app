@@ -13,7 +13,6 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 MODEL_ID = (
     os.getenv("PATHUMMA_MODEL_ID")
-    or os.getenv("THONBURIAN_MODEL_ID")
     or "nectec/Pathumma-whisper-th-large-v3"
 )
 
@@ -151,7 +150,7 @@ def _timestamp_mode(diarization_segments: list | None):
     if diarization_segments and _env_bool("ASR_WORD_TIMESTAMPS_WITH_DIARIZATION", True):
         word_ts_on_8gb = _env_bool(
             "PATHUMMA_WORD_TIMESTAMPS_ON_8GB",
-            _env_bool("THONBURIAN_WORD_TIMESTAMPS_ON_8GB", False),
+            False,
         )
         if _strict_8gb_mode() and not word_ts_on_8gb:
             logger.info("Pathumma strict 8 GB mode uses chunk timestamps to avoid CUDA OOM.")
@@ -464,7 +463,7 @@ def _run_long_form_asr(
     return merge_window_results(results)
 
 
-def transcribe_thonburian(
+def transcribe_pathumma(
     audio_path: str, language: str = "thai",
     diarization_segments: list | None = None,
 ) -> str:

@@ -43,16 +43,14 @@ def _selected_engines(selected_engines: list[str]) -> list[str]:
     return selected or list(ALL_ENGINES)
 
 
-def _speaker_bounds(diarization: bool, min_speakers: int, max_speakers: int) -> tuple[int, int]:
+def _speaker_limit(diarization: bool, max_speakers: int) -> int:
     if not diarization:
-        return 0, 0
-    n_min = max(1, int(min_speakers))
-    n_max = max(n_min, int(max_speakers))
-    return n_min, n_max
+        return 0
+    return max(1, int(max_speakers))
 
 
 def _run_diarization(
-    process_path: str, enabled: bool, n_min: int, n_max: int,
+    process_path: str, enabled: bool, max_speakers: int,
     diarize_kwargs: dict | None = None,
 ) -> list[dict] | None:
     if not enabled:
@@ -60,12 +58,11 @@ def _run_diarization(
         return None
     try:
         logger.info(
-            "Diarization starting: min_speakers=%d max_speakers=%d overrides=%s",
-            n_min,
-            n_max,
+            "Diarization starting: max_speakers=%d overrides=%s",
+            max_speakers,
             diarize_kwargs or {},
         )
-        segments = diarize_audio(process_path, n_min, n_max, diarize_kwargs=diarize_kwargs)
+        segments = diarize_audio(process_path, max_speakers, diarize_kwargs=diarize_kwargs)
         logger.info("Diarization finished: segments=%d", len(segments))
         return segments
     except Exception as exc:  # pylint: disable=broad-exception-caught
@@ -247,7 +244,6 @@ def run_transcription_job(
     selected_engines: list[str],
     language: str,
     diarization: bool,
-    min_speakers: int,
     max_speakers: int,
     enhance: bool,
     local_correction: bool = False,
@@ -277,10 +273,10 @@ def run_transcription_job(
     logger.info("Job %s audio duration: %.2fs", job_id, audio_duration_s)
 
     selected = _selected_engines(selected_engines)
-    n_min, n_max = _speaker_bounds(diarization, min_speakers, max_speakers)
+    speaker_limit = _speaker_limit(diarization, max_speakers)
     logger.info("Job %s selected engines after policy: %s", job_id, selected)
     diar_segments = _run_diarization(
-        process_path, diarization, n_min, n_max, diarize_kwargs=diarize_kwargs
+        process_path, diarization, speaker_limit, diarize_kwargs=diarize_kwargs
     )
     _check_cancel(cancel_event)
     results, workers = _run_asr_engines(
@@ -309,8 +305,7 @@ def run_transcription_job(
         "selected_engines": selected,
         "language": language,
         "diarization": diarization,
-        "min_speakers": n_min,
-        "max_speakers": n_max,
+        "max_speakers": speaker_limit,
         "enhance": enhance,
         "local_correction": local_correction,
         "asr_workers": workers,

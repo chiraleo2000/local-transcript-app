@@ -396,16 +396,11 @@ def _override_params(
     return params if params else None
 
 
-def _build_diarize_kwargs(num_speakers: int, min_speakers: int, max_speakers: int) -> dict:
+def _build_diarize_kwargs(num_speakers: int, max_speakers: int) -> dict:
     """Construct pyannote pipeline call kwargs from speaker count hints."""
     if num_speakers > 0:
         return {"num_speakers": num_speakers}
-    # Force exact count when min == max to avoid pyannote collapsing to 1 speaker.
-    if min_speakers > 0 and max_speakers > 0 and min_speakers == max_speakers:
-        return {"num_speakers": min_speakers}
     kwargs: dict = {}
-    if min_speakers > 0:
-        kwargs["min_speakers"] = min_speakers
     if max_speakers > 0:
         kwargs["max_speakers"] = max_speakers
     return kwargs
@@ -432,7 +427,7 @@ def _remap_speakers(segments: list[dict]) -> dict:
 
 def diarize(
     audio_path: str, num_speakers: int = 0,
-    min_speakers: int = 0, max_speakers: int = 0,
+    max_speakers: int = 0,
     seg_threshold: float | None = None,
     seg_min_duration_off: float | None = None,
     clust_threshold: float | None = None,
@@ -459,7 +454,7 @@ def diarize(
         except Exception as exc:  # pylint: disable=broad-except
             logger.warning("Could not apply diarization param overrides: %s", exc)
 
-    kwargs = _build_diarize_kwargs(num_speakers, min_speakers, max_speakers)
+    kwargs = _build_diarize_kwargs(num_speakers, max_speakers)
     audio_input = _prepare_audio_for_pyannote(audio_path)
 
     logger.info("Running diarization on preloaded waveform kwargs=%s ...", kwargs or "(auto)")
@@ -487,11 +482,11 @@ def diarize(
         logger.warning("Diarization produced no segments; transcript will have no speaker labels.")
         return segments
 
-    if len(unique_raw) == 1 and (min_speakers > 1 or num_speakers > 1):
+    if len(unique_raw) == 1 and num_speakers > 1:
         logger.warning(
-            "Pyannote detected only 1 speaker despite hint (min=%d, num=%d). "
+            "Pyannote detected only 1 speaker despite exact speaker hint (num=%d). "
             "The audio may be too short, too noisy, or the speakers sound alike.",
-            min_speakers, num_speakers,
+            num_speakers,
         )
 
     speaker_map = _remap_speakers(segments)

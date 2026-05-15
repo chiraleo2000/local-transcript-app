@@ -128,7 +128,7 @@ Supported: `.mp3`, `.wav`, `.m4a`, `.flac`, `.ogg`, `.mp4`, `.mov`, `.mkv`, `.av
 | **Local ASR Engines** | Typhoon Whisper | Tick one or both; dual-engine runs sequentially on 8 GB GPUs |
 | **Audio Enhancement** | Off | Noise gate → spectral NR → compressor → limiter chain |
 | **Speaker Diarization** | Off | Identify and label individual speakers |
-| **Max Speakers** | 3 | Appears when Diarization is enabled |
+| **Max Speakers** | 3 | Appears when Diarization is enabled; pyannote auto-detects from 1 up to this limit |
 | **Advanced Diarization Settings** | (accordion) | Fine-tune pyannote accuracy per run — see below |
 
 ### 3. Advanced Diarization Settings (accordion)
@@ -184,7 +184,7 @@ local-transcript-app/
 │       └── hardware_policy.py    # GPU/CPU backend detection
 ├── engines/
 │   ├── typhoon_asr.py            # Typhoon Whisper Large v3
-│   ├── thonburian_asr.py         # Pathumma Whisper Thai Large v3
+│   ├── pathumma_asr.py           # Pathumma Whisper Thai Large v3
 │   ├── diarization.py            # pyannote speaker diarization
 │   ├── preprocess.py             # 3-stage audio enhancement
 │   └── hardware.py               # Device helpers
@@ -317,8 +317,8 @@ storage/logs/                 — optional log files
 | GPU not used | Requires NVIDIA GPU ≥ 8 GB VRAM and CUDA drivers |
 | Missing model fails in offline mode | Set `HF_HUB_OFFLINE=0`, run bootstrap or start the app once, then switch back to offline only after the model is cached |
 | Video upload fails | Install FFmpeg and add it to PATH |
-| Speaker diarization misses a speaker | Lower **Clustering Threshold** and **Min Cluster Size** in the UI |
-| Speakers merged into one | Lower **Clustering Threshold** (try 0.45–0.55) |
+| Speaker diarization misses a speaker | Raise **Max Speakers**, lower **Clustering Threshold**, and lower **Min Cluster Size** in the UI |
+| Speakers merged into one | Raise **Max Speakers** and lower **Clustering Threshold** (try 0.45–0.55) |
 | Desktop window shows blank / loading forever | Check `docker ps` or `venv/Scripts/python app.py` in a terminal |
 | CUDA out of memory | Already handled by strict 8 GB mode; if it still occurs, reduce `ASR_8GB_CHUNK_LENGTH_S` |
 

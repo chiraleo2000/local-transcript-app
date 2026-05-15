@@ -308,7 +308,6 @@ def transcribe(
             selected_engines=selected_engines or default_asr_engines(),
             language=language,
             diarization=diarization,
-            min_speakers=1,
             max_speakers=int(max_speakers),
             enhance=enhance,
             local_correction=False,
@@ -526,7 +525,7 @@ def build_ui() -> gr.Blocks:
                 )
 
             with gr.TabItem(ENGINE_PATHUMMA):
-                thonburian_text = gr.Textbox(
+                pathumma_text = gr.Textbox(
                     label="Transcript",
                     lines=20,
                     max_lines=200,
@@ -534,19 +533,19 @@ def build_ui() -> gr.Blocks:
                     interactive=False,
                 )
                 with gr.Row():
-                    thonburian_time = gr.Textbox(
+                    pathumma_time = gr.Textbox(
                         label=LABEL_ELAPSED,
                         interactive=False,
                         max_lines=1,
                         scale=3,
                     )
-                    thonburian_dl = gr.DownloadButton(
+                    pathumma_dl = gr.DownloadButton(
                         label=LABEL_DOWNLOAD,
                         value=None,
                         scale=1,
                         interactive=False,
                     )
-                thonburian_correct = gr.Button(
+                pathumma_correct = gr.Button(
                     "Run Local LLM Correction",
                     interactive=False,
                     elem_classes=["correction-button"],
@@ -572,7 +571,7 @@ def build_ui() -> gr.Blocks:
             ],
             outputs=[
                 typhoon_text, typhoon_time, typhoon_dl, typhoon_correct,
-                thonburian_text, thonburian_time, thonburian_dl, thonburian_correct,
+                pathumma_text, pathumma_time, pathumma_dl, pathumma_correct,
                 job_info,
             ],
         )
@@ -581,7 +580,7 @@ def build_ui() -> gr.Blocks:
             fn=_reset_ui_outputs,
             outputs=[
                 typhoon_text, typhoon_time, typhoon_dl, typhoon_correct,
-                thonburian_text, thonburian_time, thonburian_dl, thonburian_correct,
+                pathumma_text, pathumma_time, pathumma_dl, pathumma_correct,
                 job_info,
             ],
             cancels=[transcribe_event],
@@ -592,15 +591,15 @@ def build_ui() -> gr.Blocks:
             inputs=[typhoon_text, typhoon_time, job_info],
             outputs=[typhoon_text, typhoon_time, typhoon_dl, job_info],
         )
-        thonburian_correct.click(  # pylint: disable=no-member
+        pathumma_correct.click(  # pylint: disable=no-member
             fn=lambda text, elapsed, info: correct_transcript(
                 ENGINE_PATHUMMA,
                 text,
                 elapsed,
                 info,
             ),
-            inputs=[thonburian_text, thonburian_time, job_info],
-            outputs=[thonburian_text, thonburian_time, thonburian_dl, job_info],
+            inputs=[pathumma_text, pathumma_time, job_info],
+            outputs=[pathumma_text, pathumma_time, pathumma_dl, job_info],
         )
 
         timer = gr.Timer(value=2)

@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 ENGINE_TYPHOON = "Typhoon Whisper"
 ENGINE_PATHUMMA = "Pathumma Whisper"
-_LEGACY_ENGINE_NAMES = {"Thonburian Whisper": ENGINE_PATHUMMA}
+_LEGACY_ENGINE_NAMES: dict[str, str] = {}
 ALL_ENGINES = [ENGINE_TYPHOON, ENGINE_PATHUMMA]
 FAST_8GB_ENGINES = [ENGINE_PATHUMMA]
 
@@ -164,9 +164,9 @@ def load_model(engine_name: str) -> None:
         load_typhoon()
         return
     if engine_name == ENGINE_PATHUMMA:
-        from engines.thonburian_asr import load_model as load_thonburian
+        from engines.pathumma_asr import load_model as load_pathumma
 
-        load_thonburian()
+        load_pathumma()
         return
     raise ValueError(f"Unknown ASR engine: {engine_name}")
 
@@ -179,9 +179,9 @@ def unload_model(engine_name: str) -> None:
 
         unload_typhoon()
     elif engine_name == ENGINE_PATHUMMA:
-        from engines.thonburian_asr import unload_model as unload_thonburian
+        from engines.pathumma_asr import unload_model as unload_pathumma
 
-        unload_thonburian()
+        unload_pathumma()
     else:
         raise ValueError(f"Unknown ASR engine: {engine_name}")
     clear_accelerator_cache()
@@ -208,9 +208,9 @@ def transcribe_engine(
 
         text = transcribe_typhoon(audio_path, whisper_language, diarization_segments)
     elif engine_name == ENGINE_PATHUMMA:
-        from engines.thonburian_asr import transcribe_thonburian
+        from engines.pathumma_asr import transcribe_pathumma
 
-        text = transcribe_thonburian(audio_path, whisper_language, diarization_segments)
+        text = transcribe_pathumma(audio_path, whisper_language, diarization_segments)
     else:
         raise ValueError(f"Unknown ASR engine: {engine_name}")
     elapsed = time.perf_counter() - started
