@@ -17,7 +17,7 @@ ENGINE_TYPHOON = "Typhoon Whisper"
 ENGINE_PATHUMMA = "Pathumma Whisper"
 _LEGACY_ENGINE_NAMES: dict[str, str] = {}
 ALL_ENGINES = [ENGINE_TYPHOON, ENGINE_PATHUMMA]
-FAST_8GB_ENGINES = [ENGINE_PATHUMMA]
+FAST_8GB_ENGINES = [ENGINE_TYPHOON]
 
 LANGUAGES = {
     "Thai": "thai",
@@ -81,7 +81,7 @@ def should_clear_model_between_engines() -> bool:
 
 
 def default_asr_engines() -> list[str]:
-    """Return UI/default engine selection for the current memory policy."""
+    """Return one default ASR engine for startup preload and UI selection."""
     configured = os.getenv("ASR_DEFAULT_ENGINES", "").strip()
     if configured:
         names = [part.strip() for part in configured.split(",") if part.strip()]
@@ -91,13 +91,13 @@ def default_asr_engines() -> list[str]:
             if _LEGACY_ENGINE_NAMES.get(engine, engine) in ALL_ENGINES
         ]
         if selected:
-            return selected
+            return selected[:1]
         logger.warning(
             "ASR_DEFAULT_ENGINES=%r has no known engines; using policy default.", configured
         )
     if strict_memory_mode_active():
         return FAST_8GB_ENGINES.copy()
-    return ALL_ENGINES.copy()
+    return [ALL_ENGINES[0]]
 
 
 def clear_accelerator_cache() -> None:

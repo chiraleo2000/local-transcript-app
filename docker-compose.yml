@@ -15,13 +15,18 @@ services:
       - APP_MODEL_ROOT=/app/models
       - HF_HOME=/app/models/hf_cache
       - HF_HUB_CACHE=/app/models/hf_cache/hub
-      - HF_HUB_OFFLINE=0
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
+      - APP_AUTO_DOWNLOAD_MISSING_MODELS=false
       - HUGGINGFACE_HUB_CACHE=/app/models/hf_cache/hub
       - TORCH_HOME=/app/models/torch
       - OV_CACHE_DIR=/app/models/ov_cache
-      - APP_SUPPRESS_WARNING_LOGS=true
+      - APP_SUPPRESS_WARNING_LOGS=false
+      - PYTHONUNBUFFERED=1
       - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-      - ASR_PARALLEL_MODE=auto
+      # Sequential on 8 GB: parallel causes CUDA allocator corruption.
+      # Single engine at batch=8 saturates the GPU and beats audio/3 anyway.
+      - ASR_PARALLEL_MODE=sequential
       - ASR_PARALLEL_MIN_VRAM_MB=12288
       - ASR_ALLOW_8GB_PARALLEL=false
       - ASR_HARD_MEMORY_SAFE=true
@@ -29,14 +34,14 @@ services:
       - ASR_8GB_CLASS_MAX_MB=9000
       - ASR_CLEAR_VRAM_AFTER_JOB=false
       - ASR_CLEAR_VRAM_BETWEEN_ENGINES=false
-      - ASR_DEFAULT_ENGINES=Pathumma Whisper,Typhoon Whisper
-      - ASR_CUDA_BATCH_SIZE=1
-      - ASR_8GB_BATCH_SIZE=1
-      - ASR_8GB_MAX_BATCH_SIZE=1
-      - ASR_CUDA_MEMORY_FRACTION=0.90
+      - ASR_DEFAULT_ENGINES=Typhoon Whisper
+      - ASR_CUDA_BATCH_SIZE=8
+      - ASR_8GB_BATCH_SIZE=8
+      - ASR_8GB_MAX_BATCH_SIZE=8
+      - ASR_CUDA_MEMORY_FRACTION=0.92
       - ASR_CHUNK_LENGTH_S=30
-      - ASR_8GB_CHUNK_LENGTH_S=40
-      - ASR_8GB_MAX_CHUNK_LENGTH_S=40
+      - ASR_8GB_CHUNK_LENGTH_S=30
+      - ASR_8GB_MAX_CHUNK_LENGTH_S=30
       - ASR_8GB_RETRY_CHUNK_LENGTH_S=10
       - ASR_WORD_TIMESTAMPS_WITH_DIARIZATION=true
       - TYPHOON_WORD_TIMESTAMPS_ON_8GB=false
@@ -53,11 +58,12 @@ services:
       - AUDIO_ENHANCE_TARGET_PEAK_DB=-3.0
       - AUDIO_ENHANCE_MAX_GAIN_DB=10.0
       - AUDIO_ENHANCE_NOISE_REDUCTION=0.65
-      - DIARIZATION_MODEL_ID=pyannote/speaker-diarization-3.1
-      - DIARIZATION_DEVICE=cpu
-      - DIARIZATION_CUDA_MIN_VRAM_MB=12288
-      - DIARIZATION_CUDA_MIN_FREE_MB=1024
-      - DIARIZATION_ALLOW_8GB_CUDA=false
+      - DIARIZATION_MODEL_ID=pyannote/speaker-diarization-community-1
+      - DIARIZATION_DEVICE=cuda
+      - DIARIZATION_PRELOAD_MODE=eager
+      - DIARIZATION_CUDA_MIN_VRAM_MB=6000
+      - DIARIZATION_CUDA_MIN_FREE_MB=0
+      - DIARIZATION_ALLOW_8GB_CUDA=true
     volumes:
       # Bind-mount so models and transcripts persist and don't re-download
       - ./models:/app/models

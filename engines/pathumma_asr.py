@@ -174,6 +174,13 @@ def _model_load_kwargs(hf_token: str | None, dtype) -> dict:
 
 
 def _is_cuda_oom(exc: Exception) -> bool:
+    """Return True for any CUDA memory-pressure failure, including:
+      * allocator OOM (`torch.cuda.OutOfMemoryError`, "CUDA out of memory")
+      * driver OOM ("CUDA driver error: out of memory")
+      * allocator corruption that follows a peer-thread OOM
+        ("CUDACachingAllocator", "handles_.at", "INTERNAL ASSERT FAILED").
+    The retry path will halve the batch and finally drop to batch=1.
+    """
     try:
         import torch
 
@@ -181,7 +188,13 @@ def _is_cuda_oom(exc: Exception) -> bool:
             return True
     except (ImportError, OSError, AttributeError):
         pass
-    return "CUDA out of memory" in str(exc)
+    msg = str(exc)
+    needles = (
+        "out of memory",
+        "CUDACachingAllocator",
+        "handles_.at",
+    )
+    return any(n in msg for n in needles)
 
 
 def _fmt_ts(seconds: float) -> str:
@@ -233,6 +246,7 @@ def _load_cuda_pipeline(hf_token: str | None):
         tokenizer=processor.tokenizer,  # pylint: disable=no-member
         feature_extractor=processor.feature_extractor,  # pylint: disable=no-member
         chunk_length_s=_chunk_length_s(),
+        ignore_warning=True,
         return_timestamps=True,
         max_new_tokens=445,
     )
@@ -261,6 +275,7 @@ def _load_cpu_pipeline(hf_token: str | None):
         tokenizer=processor.tokenizer,  # pylint: disable=no-member
         feature_extractor=processor.feature_extractor,  # pylint: disable=no-member
         chunk_length_s=_chunk_length_s(),
+        ignore_warning=True,
         return_timestamps=True,
         max_new_tokens=445,
     )
@@ -310,6 +325,7 @@ def _load_ov_pipeline(device: str, hf_token: str | None):
             tokenizer=processor.tokenizer,  # pylint: disable=no-member
             feature_extractor=processor.feature_extractor,  # pylint: disable=no-member
             chunk_length_s=_chunk_length_s(),
+            ignore_warning=True,
             return_timestamps=True,
             max_new_tokens=445,
         )
@@ -391,12 +407,23 @@ def _run_pipe(
     }
     if chunk_length_s is not None:
         kwargs["chunk_length_s"] = chunk_length_s
+    import time as _t
+    started = _t.perf_counter()
     try:
         import torch
     except (ImportError, OSError):
-        return pipe(pipeline_input, **kwargs)
-    with torch.inference_mode():
-        return pipe(pipeline_input, **kwargs)
+        result = pipe(pipeline_input, **kwargs)
+    else:
+        with torch.inference_mode():
+            result = pipe(pipeline_input, **kwargs)
+    logger.info(
+        "Pathumma _run_pipe done: batch=%d chunk=%s elapsed=%.2fs chars=%d",
+        batch_size,
+        chunk_length_s,
+        _t.perf_counter() - started,
+        len(result.get("text", "")) if isinstance(result, dict) else 0,
+    )
+    return result
 
 
 def _run_long_form_asr(
@@ -407,11 +434,18 @@ def _run_long_form_asr(
     engine_name: str,
 ) -> dict:
     """Run ASR in bounded windows and assemble timestamps into the full timeline."""
-    from engines.timestamps import audio_windows, merge_window_results, offset_result_timestamps
+    from engines.timestamps import (
+        audio_windows,
+        merge_window_results,
+        normalize_window_chunks,
+        offset_result_timestamps,
+        subdivide_large_chunks,
+    )
 
     window_s = _long_form_window_s()
     overlap_s = min(_long_form_overlap_s(), max(0, window_s // 3))
     windows = audio_windows(audio_input, window_s, overlap_s)
+    max_chars_per_subchunk = max(40, _env_int("ASR_MAX_CHARS_PER_SUBCHUNK", 200))
     logger.info(
         "%s long-form windowing: windows=%d window=%ds overlap=%ds timestamp_mode=%s",
         engine_name,
@@ -422,34 +456,65 @@ def _run_long_form_asr(
     )
     results: list[dict] = []
     for index, (offset_s, window_input) in enumerate(windows, start=1):
+        window_duration_s = len(window_input["raw"]) / window_input["sampling_rate"]
         logger.info(
             "%s ASR window %d/%d started: offset=%.1fs duration=%.1fs",
             engine_name,
             index,
             len(windows),
             offset_s,
-            len(window_input["raw"]) / window_input["sampling_rate"],
+            window_duration_s,
         )
+        def _post_process(window_result):
+            normalised = normalize_window_chunks(window_result, window_duration_s)
+            subdivided = subdivide_large_chunks(normalised, max_chars_per_subchunk)
+            return offset_result_timestamps(subdivided, offset_s)
         try:
             window_result = _run_pipe(
                 pipe, window_input, language, timestamp_mode, _asr_batch_size()
             )
         except Exception as exc:  # pylint: disable=broad-exception-caught
-            if not (_strict_8gb_mode() and _is_cuda_oom(exc)):
+            if not _is_cuda_oom(exc):
                 raise
+            # Step 1: halve batch (parallel-mode friendly), keeping chunk size.
+            cur_batch = _asr_batch_size()
+            if cur_batch > 1:
+                halved = max(1, cur_batch // 2)
+                logger.warning(
+                    "%s CUDA OOM on window %d/%d at batch=%d; retrying batch=%d.",
+                    engine_name, index, len(windows), cur_batch, halved,
+                )
+                _clear_cuda_cache()
+                try:
+                    window_result = _run_pipe(
+                        pipe, window_input, language, timestamp_mode, halved,
+                    )
+                except Exception as exc2:  # pylint: disable=broad-exception-caught
+                    if not _is_cuda_oom(exc2):
+                        raise
+                    exc = exc2
+                else:
+                    shifted = _post_process(window_result)
+                    logger.info(
+                        "%s ASR window %d/%d finished (recovered batch=%d): chars=%d chunks=%d",
+                        engine_name, index, len(windows), halved,
+                        len(shifted.get("text", "")),
+                        len(shifted.get("chunks") or []),
+                    )
+                    results.append(shifted)
+                    _clear_cuda_cache()
+                    continue
+            # Step 2: drop to batch=1 with a smaller chunk and chunk timestamps.
             retry_chunk_s = _retry_chunk_length_s()
             logger.warning(
-                "%s CUDA OOM on window %d/%d; retrying batch=1 chunk=%ds "
+                "%s CUDA OOM persists on window %d/%d; retrying batch=1 chunk=%ds "
                 "with chunk timestamps.",
-                engine_name,
-                index,
-                len(windows),
-                retry_chunk_s,
+                engine_name, index, len(windows), retry_chunk_s,
             )
             _clear_cuda_cache()
             window_result = _run_pipe(pipe, window_input, language, True, 1, retry_chunk_s)
 
-        shifted = offset_result_timestamps(window_result, offset_s)
+        shifted = _post_process(window_result)
         logger.info(
             "%s ASR window %d/%d finished: chars=%d chunks=%d",
             engine_name,
@@ -494,16 +559,31 @@ def transcribe_pathumma(
         try:
             result = _run_pipe(pipe, audio_input, language, timestamp_mode, _asr_batch_size())
         except Exception as exc:  # pylint: disable=broad-exception-caught
-            if not (_strict_8gb_mode() and _is_cuda_oom(exc)):
+            if not _is_cuda_oom(exc):
                 raise
-            retry_chunk_s = _retry_chunk_length_s()
-            logger.warning(
-                "Pathumma CUDA OOM in strict 8 GB mode; retrying with batch=1, "
-                "chunk=%ds and chunk timestamps.",
-                retry_chunk_s,
-            )
-            _clear_cuda_cache()
-            result = _run_pipe(pipe, audio_input, language, True, 1, retry_chunk_s)
+            cur_batch = _asr_batch_size()
+            recovered = False
+            if cur_batch > 1:
+                halved = max(1, cur_batch // 2)
+                logger.warning(
+                    "Pathumma CUDA OOM at batch=%d; retrying batch=%d.",
+                    cur_batch, halved,
+                )
+                _clear_cuda_cache()
+                try:
+                    result = _run_pipe(pipe, audio_input, language, timestamp_mode, halved)
+                    recovered = True
+                except Exception as exc2:  # pylint: disable=broad-exception-caught
+                    if not _is_cuda_oom(exc2):
+                        raise
+            if not recovered:
+                retry_chunk_s = _retry_chunk_length_s()
+                logger.warning(
+                    "Pathumma CUDA OOM persists; retrying batch=1, chunk=%ds, chunk timestamps.",
+                    retry_chunk_s,
+                )
+                _clear_cuda_cache()
+                result = _run_pipe(pipe, audio_input, language, True, 1, retry_chunk_s)
     result = repair_asr_result(result, audio_duration_s, "Pathumma", logger)
 
     if diarization_segments:

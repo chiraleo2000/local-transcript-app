@@ -26,29 +26,39 @@ services:
       - APP_MODEL_ROOT=/app/models
       - HF_HOME=/app/models/hf_cache
       - HF_HUB_CACHE=/app/models/hf_cache/hub
-      - HF_HUB_OFFLINE=0
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
+      - APP_AUTO_DOWNLOAD_MISSING_MODELS=false
       - HUGGINGFACE_HUB_CACHE=/app/models/hf_cache/hub
       - TORCH_HOME=/app/models/torch
       - OV_CACHE_DIR=/app/models/ov_cache
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-      - APP_SUPPRESS_WARNING_LOGS=true
+      - APP_SUPPRESS_WARNING_LOGS=false
+      - PYTHONUNBUFFERED=1
       - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-      - ASR_PARALLEL_MODE=auto
+      # --- ASR concurrency ---
+      # On an 8 GB GPU, running BOTH 1.5 B Whisper models in parallel causes
+      # CUDA driver OOM and corrupts the caching allocator (handles_.at INTERNAL
+      # ASSERT FAILED). We run them sequentially instead, but with a much
+      # larger batch so a single engine fully saturates the GPU. Total wall
+      # time still beats audio/3 because batched fp16 inference is ~4x faster.
+      - ASR_PARALLEL_MODE=sequential
       - ASR_PARALLEL_MIN_VRAM_MB=12288
+      - ASR_ALLOW_8GB_PARALLEL=false
       - ASR_HARD_MEMORY_SAFE=true
       - MIN_NVIDIA_VRAM_MB=6000
       - ASR_8GB_CLASS_MAX_MB=9000
       - ASR_CLEAR_VRAM_AFTER_JOB=false
       - ASR_CLEAR_VRAM_BETWEEN_ENGINES=false
-      - ASR_DEFAULT_ENGINES=Pathumma Whisper,Typhoon Whisper
-      - ASR_CUDA_BATCH_SIZE=1
-      - ASR_8GB_BATCH_SIZE=1
-      - ASR_8GB_MAX_BATCH_SIZE=1
-      - ASR_CUDA_MEMORY_FRACTION=0.90
+      - ASR_DEFAULT_ENGINES=Typhoon Whisper
+      - ASR_CUDA_BATCH_SIZE=8
+      - ASR_8GB_BATCH_SIZE=8
+      - ASR_8GB_MAX_BATCH_SIZE=8
+      - ASR_CUDA_MEMORY_FRACTION=0.92
       - ASR_CHUNK_LENGTH_S=30
-      - ASR_8GB_CHUNK_LENGTH_S=40
-      - ASR_8GB_MAX_CHUNK_LENGTH_S=40
+      - ASR_8GB_CHUNK_LENGTH_S=30
+      - ASR_8GB_MAX_CHUNK_LENGTH_S=30
       - ASR_8GB_RETRY_CHUNK_LENGTH_S=10
       - ASR_WORD_TIMESTAMPS_WITH_DIARIZATION=true
       - TYPHOON_WORD_TIMESTAMPS_ON_8GB=false
@@ -65,17 +75,21 @@ services:
       - AUDIO_ENHANCE_TARGET_PEAK_DB=-3.0
       - AUDIO_ENHANCE_MAX_GAIN_DB=10.0
       - AUDIO_ENHANCE_NOISE_REDUCTION=0.65
-      - DIARIZATION_MODEL_ID=pyannote/speaker-diarization-3.1
-      - DIARIZATION_DEVICE=cpu
-      - DIARIZATION_CUDA_MIN_VRAM_MB=12288
-      - DIARIZATION_CUDA_MIN_FREE_MB=1024
-      - DIARIZATION_ALLOW_8GB_CUDA=false
-      - DIARIZATION_SEGMENTATION_THRESHOLD=0.42
-      - DIARIZATION_MIN_DURATION_OFF=0.1
-      - DIARIZATION_CLUSTERING_THRESHOLD=0.60
-      - DIARIZATION_MIN_CLUSTER_SIZE=6
-      - DIARIZATION_PREPROCESS_SR=44100
-      - DIARIZATION_NOISE_REDUCTION=0.60
+      - DIARIZATION_MODEL_ID=pyannote/speaker-diarization-community-1
+      - DIARIZATION_DEVICE=cuda
+      - DIARIZATION_PRELOAD_MODE=eager
+      - DIARIZATION_CUDA_MIN_VRAM_MB=6000
+      - DIARIZATION_CUDA_MIN_FREE_MB=0
+      - DIARIZATION_ALLOW_8GB_CUDA=true
+      # Hyperparameter overrides intentionally omitted: community-1 ships with
+      # training-tuned defaults that out-perform manual overrides for most audio.
+      # Uncomment and set values >= 0 only if you have characterised your domain.
+      #- DIARIZATION_SEGMENTATION_THRESHOLD=-1
+      #- DIARIZATION_MIN_DURATION_OFF=-1
+      #- DIARIZATION_CLUSTERING_THRESHOLD=-1
+      #- DIARIZATION_MIN_CLUSTER_SIZE=-1
+      - DIARIZATION_PREPROCESS_SR=16000
+      - DIARIZATION_NOISE_REDUCTION=0.0
     volumes:
       # Persist models and transcripts — bind-mount project-local dirs
       - ./models:/app/models

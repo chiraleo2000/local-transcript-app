@@ -80,6 +80,121 @@ def offset_result_timestamps(result: dict, offset_s: float) -> dict:
     return shifted
 
 
+def normalize_window_chunks(result: dict, window_duration_s: float) -> dict:
+    """Ensure every chunk in a window result has a valid timestamp inside [0, window_duration_s].
+
+    Whisper occasionally returns ``(None, None)`` for a whole chunk (especially
+    when it fails to emit timestamp tokens for a long input). Without a real
+    timestamp the downstream merge/sanitiser collapses the chunk into a zero-
+    duration span and the diarizer assigns the entire (huge) text to whichever
+    speaker happens to dominate that point in time. Here we fill in any
+    missing/inverted timestamps by tiling chunks evenly across the window
+    duration, so each chunk retains a meaningful position.
+    """
+    chunks = list(result.get("chunks") or [])
+    if not chunks or window_duration_s <= 0:
+        return result
+    normalised = deepcopy(chunks)
+    timestamp_type = type(normalised[0].get("timestamp")) if normalised else tuple
+    if timestamp_type not in (tuple, list):
+        timestamp_type = tuple
+
+    n = len(normalised)
+    step = window_duration_s / max(n, 1)
+    for idx, chunk in enumerate(normalised):
+        start, end = _timestamp_pair(chunk)
+        even_start = idx * step
+        even_end = min(window_duration_s, even_start + step)
+        new_start = even_start if start is None else max(0.0, min(float(start), window_duration_s))
+        if end is None:
+            new_end = even_end
+        else:
+            new_end = max(new_start, min(float(end), window_duration_s))
+        if new_end <= new_start:
+            new_end = min(window_duration_s, new_start + step)
+        chunk["timestamp"] = timestamp_type((new_start, new_end))
+    out = dict(result)
+    out["chunks"] = normalised
+    return out
+
+
+def subdivide_large_chunks(
+    result: dict,
+    max_chars_per_chunk: int = 200,
+) -> dict:
+    """Split oversized text chunks into sub-chunks with proportional timestamps.
+
+    Whisper sometimes returns a single chunk containing minutes of speech as
+    one giant text blob. Diarization cannot align speakers to such a coarse
+    block, so we split the chunk's words evenly across its time range,
+    producing many small chunks. This keeps the merged transcript identical
+    while giving the diarizer fine-grained timing to assign speakers to.
+    """
+    if max_chars_per_chunk <= 0:
+        return result
+    chunks = list(result.get("chunks") or [])
+    if not chunks:
+        return result
+    out_chunks: list[dict] = []
+    timestamp_type = type(chunks[0].get("timestamp")) if chunks else tuple
+    if timestamp_type not in (tuple, list):
+        timestamp_type = tuple
+
+    for chunk in chunks:
+        text = (chunk.get("text") or "").strip()
+        start, end = _timestamp_pair(chunk)
+        if (
+            not text
+            or len(text) <= max_chars_per_chunk
+            or start is None
+            or end is None
+            or end <= start
+        ):
+            out_chunks.append(chunk)
+            continue
+
+        # Split on whitespace; for Thai (no spaces) fall back to fixed-size slices.
+        tokens = text.split()
+        if len(tokens) < 2:
+            # Fixed-size character slices.
+            n_parts = max(1, len(text) // max_chars_per_chunk)
+            slice_len = (len(text) + n_parts - 1) // n_parts
+            parts = [text[i:i + slice_len] for i in range(0, len(text), slice_len)]
+        else:
+            n_parts = max(1, (len(text) + max_chars_per_chunk - 1) // max_chars_per_chunk)
+            per = max(1, len(tokens) // n_parts)
+            parts = []
+            for i in range(0, len(tokens), per):
+                parts.append(" ".join(tokens[i:i + per]))
+            # Merge a tiny last part into the previous one.
+            if len(parts) > 1 and len(parts[-1]) < max_chars_per_chunk // 4:
+                parts[-2] = parts[-2] + " " + parts[-1]
+                parts.pop()
+
+        if len(parts) <= 1:
+            out_chunks.append(chunk)
+            continue
+
+        total_chars = sum(len(p) for p in parts) or 1
+        duration = float(end) - float(start)
+        cursor = float(start)
+        for i, part in enumerate(parts):
+            share = len(part) / total_chars
+            sub_end = float(end) if i == len(parts) - 1 else cursor + duration * share
+            sub_end = max(cursor, min(float(end), sub_end))
+            out_chunks.append({
+                "text": part,
+                "timestamp": timestamp_type((cursor, sub_end)),
+            })
+            cursor = sub_end
+
+    if len(out_chunks) == len(chunks):
+        return result
+    new_result = dict(result)
+    new_result["chunks"] = out_chunks
+    return new_result
+
+
 def _chunk_sort_key(chunk: dict) -> tuple[float, float]:
     start, end = _timestamp_pair(chunk)
     return (
@@ -193,6 +308,18 @@ def _is_pathological_full_text_chunk(
     looks_too_dense = len(text) / max(duration, 0.001) > max_chars_per_second
     starts_late = float(start) > _env_float("ASR_SUSPICIOUS_FIRST_TS_S", 60.0)
     too_short_for_full_audio = audio_duration_s > 0 and duration < audio_duration_s * 0.50
+    tolerance_s = _env_float("ASR_TIMESTAMP_AUDIO_END_TOLERANCE_S", 30.0)
+    # A single chunk that contains the entire transcript and whose timestamps
+    # land far outside the real audio (start past audio end, or end exceeding
+    # audio by more than tolerance, or chunk spanning > 1.5x the audio) is
+    # always pathological regardless of character density.
+    out_of_bounds = audio_duration_s > 0 and (
+        float(start) > audio_duration_s
+        or float(end) > audio_duration_s + tolerance_s
+        or duration > audio_duration_s * 1.5
+    )
+    if out_of_bounds:
+        return True
     return looks_too_dense and (starts_late or too_short_for_full_audio)
 
 
@@ -304,14 +431,17 @@ def _resolve_chunk_end(
     current_start: float,
     ceiling: float,
     upper_bound: float | None,
-    tolerance_s: float,
 ) -> float:
     e = item["end"]
     if e is None or e < current_start:
         return ceiling
-    if upper_bound is not None and e > upper_bound + tolerance_s:
-        return ceiling
-    return max(current_start, min(float(e), ceiling))
+    candidate = max(current_start, min(float(e), ceiling))
+    if upper_bound is not None:
+        # Hard cap: never let a chunk end past the real audio duration, even
+        # within tolerance. Tolerance is only used to *classify* a chunk as
+        # broken; the displayed output must always stay inside the audio.
+        candidate = min(candidate, upper_bound)
+    return candidate
 
 
 def _timestamp_constructor(chunks: list[dict]):
@@ -362,7 +492,7 @@ def _sanitize_chunk_timeline(
         ceiling = _resolve_ceiling(
             _next_valid_start(prepared, i, s, upper_bound), upper_bound, s,
         )
-        e = _resolve_chunk_end(item, s, ceiling, upper_bound, tolerance_s)
+        e = _resolve_chunk_end(item, s, ceiling, upper_bound)
         cleaned.append({"text": item["text"], "timestamp": timestamp_type((s, e))})
         last_end = e
 

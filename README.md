@@ -9,7 +9,7 @@ No cloud APIs. No telemetry. All processing stays on your machine.
 
 - **Typhoon Whisper Large v3** — default ASR engine (Thai-optimised, high accuracy)
 - **Pathumma Whisper Thai Large v3** — fast alternative ASR engine
-- **Speaker diarization** — `pyannote/speaker-diarization-3.1`, fully local
+- **Speaker diarization** — `pyannote/speaker-diarization-community-1` (Sep 2025), fully local
 - **Advanced diarization tuning** — segmentation threshold, clustering threshold, min cluster size, silence gap — adjustable live in the UI
 - **Audio enhancement** — bandpass filter → spectral noise reduction → compressor / limiter chain
 - **Local LLM correction** — optional post-transcription text cleanup via llama.cpp or Ollama
@@ -236,10 +236,10 @@ AUDIO_ENHANCE_NOISE_REDUCTION=0.65    # Spectral gating strength (0–1)
 ### Speaker Diarization
 
 ```dotenv
-DIARIZATION_MODEL_ID=pyannote/speaker-diarization-3.1
+DIARIZATION_MODEL_ID=pyannote/speaker-diarization-community-1
 DIARIZATION_DEVICE=cpu                 # keep diarization off 8 GB GPU VRAM by default
-DIARIZATION_PREPROCESS_SR=44100       # Intermediate rate before 16 kHz downsample
-DIARIZATION_NOISE_REDUCTION=0.60      # NR strength for diarization audio
+DIARIZATION_PREPROCESS_SR=16000       # community-1 ingests 16 kHz mono directly
+DIARIZATION_NOISE_REDUCTION=0.0       # NR off by default (degrades speaker embeddings)
 
 # Pyannote accuracy tuning (also editable live in the UI)
 DIARIZATION_SEGMENTATION_THRESHOLD=0.42
@@ -281,7 +281,7 @@ Run once after setup to download and cache all models locally:
 python scripts/bootstrap_models.py
 ```
 
-`pyannote/speaker-diarization-3.1` is a gated model — accept its terms on Hugging Face, then set `HF_TOKEN` in `.env`.
+`pyannote/speaker-diarization-community-1` is a gated model — accept its terms on Hugging Face, then set `HF_TOKEN` in `.env`.
 
 Keep `HF_HUB_OFFLINE=0` during setup and model swaps so missing model files can be downloaded. After every selected model has been bootstrapped, you may set `HF_HUB_OFFLINE=1` for fully offline runs.
 
@@ -335,7 +335,7 @@ All processing is local. No audio, video, or transcript data is sent to any clou
 - Local ASR engines:
   - Typhoon Whisper Large v3.
   - Pathumma Whisper Thai Large v3.
-- Speaker diarization with local `pyannote/speaker-diarization-3.1` pipeline.
+- Speaker diarization with local `pyannote/speaker-diarization-community-1` pipeline.
 - Optional local LLM correction through a local Ollama-compatible endpoint.
 - Folder-based storage inside the app path.
 - Hardware-aware backend selection for NVIDIA GPU, Intel OpenVINO GPU/NPU, AMD GPU fallback, and CPU-only systems.
@@ -513,7 +513,7 @@ AUDIO_ENHANCE_TARGET_PEAK_DB=-3.0         # make quiet speech louder without cli
 AUDIO_ENHANCE_MAX_GAIN_DB=10.0            # cap boost so noise does not explode
 AUDIO_ENHANCE_NOISE_REDUCTION=0.65        # less destructive than heavy gating
 
-DIARIZATION_MODEL_ID=pyannote/speaker-diarization-3.1
+DIARIZATION_MODEL_ID=pyannote/speaker-diarization-community-1
 DIARIZATION_DEVICE=cpu                   # keep pyannote embeddings off 8 GB GPU VRAM
 DIARIZATION_CUDA_MIN_FREE_MB=1024        # move diarization to CPU if CUDA memory is crowded
 DIARIZATION_CUDA_MIN_VRAM_MB=12288
@@ -553,7 +553,7 @@ The bootstrap script:
 - Stores model artifacts under app-local `models/` paths.
 - Reuses existing model cache on repeated runs.
 
-`pyannote/speaker-diarization-3.1` is a gated Hugging Face model. Accept the model terms on Hugging Face, then set your token in `.env`:
+`pyannote/speaker-diarization-community-1` is a gated Hugging Face model. Accept the model terms on Hugging Face, then set your token in `.env`:
 
 ```text
 HF_TOKEN=your-token-here
@@ -561,7 +561,7 @@ HF_TOKEN=your-token-here
 
 ## Pyannote Version
 
-The project pins the Python runtime package to `pyannote.audio==4.0.4`. This is different from the diarization model ID, which remains `pyannote/speaker-diarization-3.1`.
+The project pins the Python runtime package to `pyannote.audio==4.0.4`. This is different from the diarization model ID, which defaults to `pyannote/speaker-diarization-community-1` (override via `DIARIZATION_MODEL_ID` if you need the legacy `pyannote/speaker-diarization-3.1`).
 
 For normal online installation, do not download GitHub release assets manually. `pip install -r requirements.txt` downloads and installs the correct wheel automatically.
 

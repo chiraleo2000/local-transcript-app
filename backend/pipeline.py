@@ -9,13 +9,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from backend.services.asr_local import (
     ALL_ENGINES,
-    ENGINE_PATHUMMA,
-    ENGINE_TYPHOON,
     asr_worker_count,
     clear_accelerator_cache,
+    default_asr_engines,
+    load_model,
     should_clear_model_between_engines,
     should_clear_models_after_job,
-    strict_memory_mode_active,
     transcribe_engine,
     unload_model,
 )
@@ -38,9 +37,13 @@ def _check_cancel(cancel_event: threading.Event | None) -> None:
         raise RuntimeError("Job cancelled by user.")
 
 
-def _selected_engines(selected_engines: list[str]) -> list[str]:
-    selected = [engine for engine in selected_engines if engine in ALL_ENGINES]
-    return selected or list(ALL_ENGINES)
+def _selected_engines(selected_engines: list[str] | str) -> list[str]:
+    if isinstance(selected_engines, str):
+        candidates = [selected_engines]
+    else:
+        candidates = list(selected_engines or [])
+    selected = [engine for engine in candidates if engine in ALL_ENGINES]
+    return (selected or default_asr_engines())[:1]
 
 
 def _speaker_limit(diarization: bool, max_speakers: int) -> int:
@@ -115,10 +118,6 @@ def _is_cuda_oom(exc: Exception) -> bool:
     return "CUDA out of memory" in str(exc)
 
 
-def _should_fallback_to_pathumma(engine: str, exc: Exception) -> bool:
-    return engine == ENGINE_TYPHOON and strict_memory_mode_active() and _is_cuda_oom(exc)
-
-
 def _run_one_asr_engine(
     job_id: str,
     engine: str,
@@ -130,23 +129,6 @@ def _run_one_asr_engine(
         text, elapsed = transcribe_engine(engine, process_path, language, diar_segments)
         return _success_result(job_id, engine, text, elapsed)
     except Exception as exc:  # pylint: disable=broad-exception-caught
-        if _should_fallback_to_pathumma(engine, exc):
-            logger.warning(
-                "Typhoon hit CUDA OOM on an 8 GB-class GPU; falling back to Pathumma."
-            )
-            _unload_asr_engine(engine)
-            try:
-                text, elapsed = transcribe_engine(
-                    ENGINE_PATHUMMA,
-                    process_path,
-                    language,
-                    diar_segments,
-                )
-                result = _success_result(job_id, engine, text, elapsed)
-                result["note"] = "Typhoon recovered by falling back to Pathumma."
-                return result
-            except Exception as fallback_exc:  # pylint: disable=broad-exception-caught
-                return _error_result(ENGINE_PATHUMMA, fallback_exc)
         return _error_result(engine, exc)
 
 
@@ -155,6 +137,18 @@ def _unload_asr_engine(engine: str) -> None:
         unload_model(engine)
     except Exception as exc:  # pylint: disable=broad-exception-caught
         logger.debug("%s unload skipped: %s", engine, exc)
+    clear_accelerator_cache()
+
+
+def _prepare_selected_asr_model(selected: list[str]) -> None:
+    if not selected:
+        return
+    selected_engine = selected[0]
+    for engine in ALL_ENGINES:
+        if engine != selected_engine:
+            _unload_asr_engine(engine)
+    logger.info("Ensuring selected ASR model is loaded: %s", selected_engine)
+    load_model(selected_engine)
     clear_accelerator_cache()
 
 
@@ -275,6 +269,7 @@ def run_transcription_job(
     selected = _selected_engines(selected_engines)
     speaker_limit = _speaker_limit(diarization, max_speakers)
     logger.info("Job %s selected engines after policy: %s", job_id, selected)
+    _prepare_selected_asr_model(selected)
     diar_segments = _run_diarization(
         process_path, diarization, speaker_limit, diarize_kwargs=diarize_kwargs
     )

@@ -96,7 +96,7 @@ On 6-8 GB-class NVIDIA GPUs the app uses strict memory-safe mode:
 - Forced parallel ASR is ignored on 8 GB-class GPUs when `ASR_HARD_MEMORY_SAFE=true`.
 - Pyannote diarization and preprocessing run on CPU by default.
 - CUDA batch size is capped at 1, long-form ASR uses 360-second windows with 30-second overlap, and CUDA cache is cleared between long-form windows.
-- Diarization uses `pyannote/speaker-diarization-3.1`; accept the model terms on Hugging Face and set `HF_TOKEN`.
+- Diarization uses `pyannote/speaker-diarization-community-1` by default (Sep 2025, 30-50% lower DER than the legacy 3.1 pipeline). Accept the model terms on Hugging Face and set `HF_TOKEN`. Set `DIARIZATION_MODEL_ID` if you need the legacy `pyannote/speaker-diarization-3.1`.
 - The pyannote runtime package is pinned to `pyannote.audio==4.0.4`. For offline setup, the only release asset you need is `pyannote_audio-4.0.4-py3-none-any.whl`; source archives are not required.
 - Audio Enhancement is enabled by default and applies capped gain toward `-3 dBFS` so quiet speech is louder without clipping. Uploading a file clears the enhanced preview instead of generating it immediately, so transcription does not spend CPU time enhancing the same file twice.
 

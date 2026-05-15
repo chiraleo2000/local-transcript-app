@@ -1,4 +1,10 @@
-"""Shared speaker diarization using pyannote/speaker-diarization-3.1."""
+"""Shared speaker diarization using pyannote/speaker-diarization-community-1.
+
+Defaults to the September 2025 community-1 pipeline (pyannote.audio 4.x), which
+reports 30-50% lower DER than the legacy 3.1 pipeline on most benchmarks and
+adds an `exclusive_speaker_diarization` output designed for clean alignment
+with transcription timestamps. Override via DIARIZATION_MODEL_ID.
+"""
 
 # pylint: disable=import-outside-toplevel
 
@@ -30,7 +36,7 @@ warnings.filterwarnings(
 
 logger = logging.getLogger(__name__)
 
-MODEL_ID = os.getenv("DIARIZATION_MODEL_ID", "pyannote/speaker-diarization-3.1")
+MODEL_ID = os.getenv("DIARIZATION_MODEL_ID", "pyannote/speaker-diarization-community-1")
 
 _pipeline_cache: list = []
 
@@ -87,7 +93,8 @@ def _env_bool(name: str, default: bool) -> bool:
 def _build_pipeline_params() -> dict | None:
     """Build pyannote pipeline instantiate() params from environment variables.
 
-    Tuning guide:
+    Tuning guide (only applied when value >= 0; otherwise the model's own
+    training-tuned defaults are kept — recommended for community-1):
       DIARIZATION_SEGMENTATION_THRESHOLD  — activity threshold; lower = catches
           quieter / shorter speaker turns (pyannote default ~0.5).
       DIARIZATION_MIN_DURATION_OFF        — minimum silence gap (s) to split
@@ -121,6 +128,41 @@ def _build_pipeline_params() -> dict | None:
         params["clustering"] = clust_params
 
     return params if params else None
+
+
+def _supported_pipeline_params(pipe) -> dict[str, set[str]]:
+    supported: dict[str, set[str]] = {}
+    for source in ("parameters", "default_parameters"):
+        try:
+            values = getattr(pipe, source)(instantiated=True) if source == "parameters" else getattr(pipe, source)()
+        except (AttributeError, TypeError, RuntimeError, ValueError):
+            continue
+        for section, section_values in (values or {}).items():
+            if isinstance(section_values, dict):
+                supported.setdefault(section, set()).update(section_values)
+    return supported
+
+
+def _filter_pipeline_params(pipe, params: dict | None) -> dict | None:
+    if not params:
+        return None
+    supported = _supported_pipeline_params(pipe)
+    if not supported:
+        return params
+    filtered: dict = {}
+    skipped: list[str] = []
+    for section, section_values in params.items():
+        allowed = supported.get(section, set())
+        if not isinstance(section_values, dict) or not allowed:
+            skipped.append(section)
+            continue
+        kept = {key: value for key, value in section_values.items() if key in allowed}
+        skipped.extend(f"{section}.{key}" for key in section_values if key not in allowed)
+        if kept:
+            filtered[section] = kept
+    if skipped:
+        logger.debug("Diarization params ignored by this pyannote pipeline: %s", skipped)
+    return filtered or None
 
 
 def _cuda_vram_mb(torch_module) -> int:
@@ -187,7 +229,7 @@ def _get_diarization_pipeline():
     pipeline = pipeline.to(device)
 
     # Apply tunable segmentation / clustering hyperparameters.
-    custom_params = _build_pipeline_params()
+    custom_params = _filter_pipeline_params(pipeline, _build_pipeline_params())
     if custom_params:
         try:
             pipeline.instantiate(custom_params)
@@ -198,6 +240,12 @@ def _get_diarization_pipeline():
     _pipeline_cache.append(pipeline)
     logger.info("Pyannote diarization pipeline ready on %s.", device)
     return _pipeline_cache[0]
+
+
+def load_model() -> None:
+    """Pre-load the pyannote diarization pipeline. Safe to call multiple times."""
+    _get_diarization_pipeline()
+    logger.info("Pyannote diarization model pre-loaded.")
 
 
 def unload_model() -> None:
@@ -237,8 +285,12 @@ def _prepare_audio_for_pyannote(audio_path: str) -> dict:
     """
     import torch
 
-    preprocess_sr = _env_int("DIARIZATION_PREPROCESS_SR", 44100)
-    noise_reduction = _env_float("DIARIZATION_NOISE_REDUCTION", 0.60)
+    # community-1 ingests 16 kHz mono per its model card. Using 16 kHz directly
+    # skips a needless resample. Noise reduction defaults to OFF because
+    # aggressive spectral gating degrades speaker embedding quality; the
+    # ffmpeg loudness normalization below handles level/clipping issues.
+    preprocess_sr = _env_int("DIARIZATION_PREPROCESS_SR", 16000)
+    noise_reduction = _env_float("DIARIZATION_NOISE_REDUCTION", 0.0)
     source_path, tmp_files = _build_diarization_source(
         audio_path, preprocess_sr, noise_reduction
     )
@@ -300,7 +352,10 @@ def _run_ffmpeg_diarization_prep(
 ) -> str:
     """Run FFmpeg bandpass/loudness normalization for diarization."""
     inter_path = os.path.splitext(audio_path)[0] + "_diarize_inter.wav"
-    diarize_filters = "highpass=f=80,lowpass=f=8000,loudnorm=I=-16:TP=-1.5:LRA=11"
+    # Widened bandpass (50 Hz - 9 kHz) preserves more voice fidelity for the
+    # WeSpeaker embedding model used by community-1, while still suppressing
+    # rumble and out-of-band noise. Loudness normalization keeps levels stable.
+    diarize_filters = "highpass=f=50,lowpass=f=9000,loudnorm=I=-16:TP=-1.5:LRA=11"
     cmd = [
         ffmpeg, "-y", "-i", audio_path,
         "-af", diarize_filters,
@@ -498,11 +553,14 @@ def diarize(
     pipe = _get_diarization_pipeline()
 
     # Apply per-call UI overrides (re-instantiate pipeline params for this run).
-    override = _override_params(
-        seg_threshold,
-        seg_min_duration_off,
-        clust_threshold,
-        clust_min_size,
+    override = _filter_pipeline_params(
+        pipe,
+        _override_params(
+            seg_threshold,
+            seg_min_duration_off,
+            clust_threshold,
+            clust_min_size,
+        ),
     )
     if override:
         try:
@@ -517,8 +575,16 @@ def diarize(
     logger.info("Running diarization on preloaded waveform kwargs=%s ...", kwargs or "(auto)")
     diarization = _run_pyannote(pipe, audio_input, kwargs)
 
-    # pyannote 3.x returns Annotation directly; some community wrappers wrap it.
-    annotation = getattr(diarization, "speaker_diarization", diarization)
+    # community-1 wraps Annotations in a result object and exposes:
+    #   - speaker_diarization              (overlapping turns; fine-grained)
+    #   - exclusive_speaker_diarization    (non-overlapping; ideal for ASR alignment)
+    # Legacy 3.1 returns the Annotation directly.
+    annotation = (
+        getattr(diarization, "exclusive_speaker_diarization", None)
+        or getattr(diarization, "speaker_diarization", diarization)
+    )
+    if annotation is not diarization and getattr(diarization, "exclusive_speaker_diarization", None) is not None:
+        logger.info("Using community-1 exclusive_speaker_diarization for ASR alignment.")
 
     segments: list[dict] = []
     for turn, _, speaker in annotation.itertracks(yield_label=True):
@@ -623,6 +689,62 @@ def _estimate_chunk_ts(
     return c_start, c_end
 
 
+def _chunk_ts_out_of_bounds(
+    start: float | None, end: float | None, total_dur: float,
+) -> bool:
+    if total_dur <= 0:
+        return False
+    tolerance_s = _env_float("ASR_TIMESTAMP_AUDIO_END_TOLERANCE_S", 30.0)
+    if start is None:
+        return True
+    if start < 0 or start > total_dur + tolerance_s:
+        return True
+    if end is not None and (end < start or end > total_dur + tolerance_s):
+        return True
+    return False
+
+
+def _bounded_chunk_ts(
+    start: float | None,
+    end: float | None,
+    chunk_idx: int,
+    total_chunks: int,
+    total_dur: float,
+) -> tuple[float | None, float | None, bool]:
+    if total_dur <= 0:
+        return start, end, False
+    if _chunk_ts_out_of_bounds(start, end, total_dur):
+        est_start, est_end = _estimate_chunk_ts(chunk_idx, total_chunks, total_dur)
+        return est_start, est_end, True
+    bounded_start = max(0.0, min(float(start), total_dur)) if start is not None else None
+    if end is None:
+        bounded_end = None
+    else:
+        bounded_end = max(bounded_start or 0.0, min(float(end), total_dur))
+    return bounded_start, bounded_end, False
+
+
+def _chunk_ts_for_assignment(
+    chunk: dict,
+    chunk_idx: int,
+    all_ts_none: bool,
+    total_chunks: int,
+    total_dur: float,
+) -> tuple[float | None, float | None, bool]:
+    ts = chunk.get("timestamp")
+    if ts is not None and not _ts_is_none(ts):
+        c_start, c_end = ts[0], ts[1]
+    else:
+        c_start, c_end = None, None
+
+    if (all_ts_none or c_start is None) and total_dur > 0 and total_chunks > 0:
+        c_start, c_end = _estimate_chunk_ts(chunk_idx, total_chunks, total_dur)
+
+    if total_dur <= 0 or total_chunks <= 0:
+        return c_start, c_end, False
+    return _bounded_chunk_ts(c_start, c_end, chunk_idx, total_chunks, total_dur)
+
+
 def _ts_is_none(ts) -> bool:
     """Return True when a Whisper timestamp value is effectively absent.
 
@@ -714,21 +836,15 @@ def _iter_chunks(
 ):
     """Yield (c_start, c_end, text, speaker) for each non-empty chunk."""
     chunk_idx = 0
+    fixed_timestamps = 0
     for chunk in chunks:
         text = chunk.get("text", "").strip()
         if not text:
             continue
-        ts = chunk.get("timestamp")
-        if ts is not None and not _ts_is_none(ts):
-            c_start, c_end = ts[0], ts[1]
-        else:
-            c_start, c_end = None, None
-
-        # When ALL timestamps are None OR this individual chunk is missing
-        # timestamps, fall back to positional estimation so the chunk is still
-        # mapped to the correct time-window and therefore the correct speaker.
-        if (all_ts_none or c_start is None) and total_dur > 0 and total_chunks > 0:
-            c_start, c_end = _estimate_chunk_ts(chunk_idx, total_chunks, total_dur)
+        c_start, c_end, fixed = _chunk_ts_for_assignment(
+            chunk, chunk_idx, all_ts_none, total_chunks, total_dur,
+        )
+        fixed_timestamps += int(fixed)
 
         turns = _overlapping_speaker_turns(c_start, c_end, diarization_segments)
         split_pieces = _split_text_across_turns(text, turns)
@@ -740,6 +856,13 @@ def _iter_chunks(
         speaker = _find_speaker(c_start, c_end, diarization_segments)
         chunk_idx += 1
         yield c_start, c_end, text, speaker
+
+    if fixed_timestamps:
+        logger.warning(
+            "assign_speakers repaired %d ASR chunk timestamp(s) outside audio duration %.1fs.",
+            fixed_timestamps,
+            total_dur,
+        )
 
 
 def assign_speakers(result: dict, diarization_segments: list[dict]) -> str:
@@ -766,15 +889,12 @@ def assign_speakers(result: dict, diarization_segments: list[dict]) -> str:
     # Detect if ALL chunks lack timestamps.
     all_ts_none = all(_ts_is_none(c.get("timestamp")) for c in non_empty)
 
-    # Use the later of the last diarization segment end OR the last chunk
-    # timestamp end, so position-estimation covers the full audio duration.
+    # Diarization was computed against the real preprocessed audio, so its last
+    # segment is the safe upper bound. Do not trust ASR chunk ends here: Whisper
+    # can hallucinate timestamps far beyond the file (e.g. 01:13:59 for a 7-min
+    # clip), and using that as total duration leaks impossible times to output.
     diar_end = diarization_segments[-1]["end"] if diarization_segments else 0.0
-    chunk_ts_end = 0.0
-    for c in non_empty:
-        ts = c.get("timestamp")
-        if ts and not _ts_is_none(ts) and ts[1] is not None:
-            chunk_ts_end = max(chunk_ts_end, ts[1])
-    total_dur = max(diar_end, chunk_ts_end)
+    total_dur = diar_end
 
     logger.info(
         "assign_speakers: total_chunks=%d  all_ts_none=%s  total_dur=%.1fs  "

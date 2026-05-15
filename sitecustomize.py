@@ -34,8 +34,10 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 if _env_bool("APP_SUPPRESS_WARNING_LOGS", True):
-    logging.disable(logging.WARNING)
-    # Silence tracer warnings from torch.jit.trace during OpenVINO export
+    # Only silence noisy third-party loggers. Do NOT call
+    # logging.disable(WARNING) because that also kills our own INFO progress
+    # logs (engine start/finish, window 1/N, etc.) which the user needs to see
+    # in `docker compose logs -f`.
     logging.getLogger("torch._dynamo").setLevel(logging.ERROR)
     logging.getLogger("torch._inductor").setLevel(logging.ERROR)
     logging.getLogger("torch").setLevel(logging.ERROR)
@@ -76,10 +78,25 @@ warnings.filterwarnings(
     message=r".*std\(\): degrees of freedom is <= 0.*",
     category=UserWarning,
 )
+warnings.filterwarnings(
+    "ignore",
+    message=r".*generation_config.*default values have been modified.*",
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r".*A custom logits processor of type.*",
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r".*Using `chunk_length_s` is very experimental.*",
+)
 
 for logger_name in [
     "torch.utils.flop_counter",
     "torch._dynamo",
     "torch._inductor",
+    "transformers.generation.utils",
+    "transformers.generation.configuration_utils",
+    "transformers.pipelines.automatic_speech_recognition",
 ]:
     logging.getLogger(logger_name).setLevel(logging.ERROR)

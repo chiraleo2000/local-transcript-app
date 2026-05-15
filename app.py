@@ -70,8 +70,11 @@ load_dotenv()
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+    force=True,
+    stream=sys.stdout,
 )
 logger = logging.getLogger(__name__)
+logging.captureWarnings(True)
 
 import gradio as gr
 from gradio.themes import Soft as _SoftTheme
@@ -106,6 +109,24 @@ APP_CSS = """
 .tall-video-preview { min-height: 360px !important; }
 .tall-video-preview video { min-height: 320px !important; }
 .correction-button { margin-top: 4px; }
+.live-status {
+    padding: 14px 18px;
+    border-radius: 10px;
+    font-weight: 600;
+    font-size: 16px;
+    margin: 8px 0;
+    border: 1px solid transparent;
+}
+.live-status.idle    { background: #f4f4f5; color: #52525b; border-color: #e4e4e7; }
+.live-status.running { background: #fef3c7; color: #92400e; border-color: #fde68a;
+                       animation: live-pulse 1.4s ease-in-out infinite; }
+.live-status.done    { background: #dcfce7; color: #166534; border-color: #bbf7d0; }
+.live-status.error   { background: #fee2e2; color: #991b1b; border-color: #fecaca; }
+.live-status .spinner { display: inline-block; margin-right: 8px; }
+@keyframes live-pulse {
+    0%, 100% { opacity: 1.0; }
+    50%      { opacity: 0.65; }
+}
 @media (max-width: 900px) {
     .config-landscape { flex-wrap: wrap; }
 }
@@ -117,12 +138,7 @@ _load_status = dict.fromkeys(ALL_ENGINES, "pending")
 
 
 def _preload_models() -> None:
-    """Preload the configured ASR model at startup by default.
-
-    Strict 8 GB mode limits this to the configured default engine and keeps
-    diarization on CPU, so the startup preload uses the local model cache without
-    competing with pyannote for CUDA memory.
-    """
+    """Preload the configured ASR model at startup by default."""
     preload_mode = os.getenv("ASR_PRELOAD_MODE", "eager").strip().lower()
     if preload_mode not in {"eager", "preload", "true", "1"}:
         for engine in ALL_ENGINES:
@@ -141,18 +157,38 @@ def _preload_models() -> None:
             ", ".join(preload_engines),
         )
 
+    preload_failed = False
+
     def _load(engine: str) -> None:
+        nonlocal preload_failed
         try:
             _load_status[engine] = "loading..."
             load_model(engine)
             _load_status[engine] = "ready"
             logger.info("%s loaded.", engine)
         except Exception as exc:  # pylint: disable=broad-exception-caught
+            preload_failed = True
             _load_status[engine] = f"FAILED: {exc}"
             logger.exception("%s load failed: %s", engine, exc)
 
     for engine in preload_engines:
         _load(engine)
+
+    diarization_preload_mode = os.getenv("DIARIZATION_PRELOAD_MODE", "eager").strip().lower()
+    if diarization_preload_mode in {"eager", "preload", "true", "1"}:
+        try:
+            from engines.diarization import load_model as load_diarization_model
+
+            logger.info("Preloading pyannote diarization model...")
+            load_diarization_model()
+            logger.info("Pyannote diarization loaded.")
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            preload_failed = True
+            logger.exception("Pyannote diarization load failed: %s", exc)
+
+    if preload_failed:
+        logger.error("Model preload failed; upload remains disabled until Docker cache/env is fixed.")
+        return
     _models_ready.set()
     logger.info("Model preload finished.")
 
@@ -169,13 +205,36 @@ def _get_load_status() -> str:
     return "\n".join(lines)
 
 
-def _empty_outputs(message: str) -> tuple:
+def _status_html(state: str, message: str) -> str:
+    """Render a status banner shown ABOVE the engine output tabs.
+
+    state: 'idle' | 'running' | 'done' | 'error'
+    """
+    icon = {
+        "idle":    "\u23F8",   # pause
+        "running": "\u23F3",   # hourglass
+        "done":    "\u2705",   # check
+        "error":   "\u26A0\uFE0F",  # warning
+    }.get(state, "\u2139\uFE0F")
+    return (
+        f'<div class="live-status {state}">'
+        f'<span class="spinner">{icon}</span>{message}'
+        f"</div>"
+    )
+
+
+STATUS_IDLE = _status_html("idle", "Idle. Upload media and click Transcribe.")
+
+
+def _empty_outputs(message: str, status_state: str = "idle",
+                   status_message: str = "Idle.") -> tuple:
     no_download = gr.update(value=None, interactive=False)
     no_correction = gr.update(interactive=False)
     return (
         message, "", no_download, no_correction,
         message, "", no_download, no_correction,
         "",
+        _status_html(status_state, status_message),
     )
 
 
@@ -233,6 +292,16 @@ def _build_outputs(job_result: dict, selected_engines: list[str]) -> tuple:
     ]
     if notes:
         outputs[-1] = f"{outputs[-1]}\n" + "\n".join(notes)
+    target_met = bool(job_result.get("target_met"))
+    if target_elapsed:
+        target_state = "met \u2705" if target_met else "over target"
+        perf_text = (
+            f"Done in {total_elapsed:.1f}s (audio {audio_duration:.1f}s, "
+            f"target {target_elapsed:.1f}s, {target_state})"
+        )
+    else:
+        perf_text = f"Done in {total_elapsed:.1f}s."
+    outputs.append(_status_html("done", perf_text))
     return tuple(outputs)
 
 
@@ -245,6 +314,7 @@ def _reset_ui_outputs() -> tuple:
         _CANCELLED, "", no_dl, no_btn,
         _CANCELLED, "", no_dl, no_btn,
         "Cancelled by user.",
+        _status_html("error", "Cancelled by user."),
     )
 
 
@@ -255,6 +325,7 @@ def transcribe(
     diarization,
     max_speakers,
     enhance,
+    diar_override_defaults,
     diar_seg_threshold,
     diar_min_off,
     diar_clust_threshold,
@@ -274,23 +345,38 @@ def transcribe(
     """
     _cancel_event.clear()
     if not media_path:
-        yield _empty_outputs("(no media provided)")
+        yield _empty_outputs("(no media provided)", "error", "No media uploaded.")
         return
     if not _models_ready.is_set():
-        yield _empty_outputs("Models are still loading, please wait...")
+        yield _empty_outputs(
+            "Models are still loading, please wait...",
+            "running",
+            "Models are still loading\u2026",
+        )
         return
 
-    # Yield 1 — clear previous outputs immediately so the user knows a new job started.
+    if isinstance(selected_engines, str):
+        selected = [selected_engines]
+    else:
+        selected = list(selected_engines or default_asr_engines())[:1]
+
+    # Yield 1 \u2014 clear transcript boxes; show progress banner above the tabs.
     no_dl = gr.update(value=None, interactive=False)
     no_btn = gr.update(interactive=False)
+    engines_label = selected[0]
     yield (
-        "⏳ Transcribing...", "", no_dl, no_btn,
-        "⏳ Transcribing...", "", no_dl, no_btn,
-        "Processing — please wait...",
+        "", "", no_dl, no_btn,
+        "", "", no_dl, no_btn,
+        "Processing \u2014 see container logs for progress.",
+        _status_html(
+            "running",
+            f"Transcribing with {engines_label}\u2026 GPU is running; "
+            f"check `docker compose logs -f` for per-window progress.",
+        ),
     )
 
     diarize_kwargs: dict | None = None
-    if diarization:
+    if diarization and diar_override_defaults:
         diarize_kwargs = {
             "seg_threshold":        float(diar_seg_threshold),
             "seg_min_duration_off": float(diar_min_off),
@@ -302,7 +388,7 @@ def transcribe(
         # Blocking call — Gradio 6.x WS heartbeat keeps the browser connection alive.
         result = run_transcription_job(
             media_path=media_path,
-            selected_engines=selected_engines or default_asr_engines(),
+            selected_engines=selected,
             language=language,
             diarization=diarization,
             max_speakers=int(max_speakers),
@@ -312,19 +398,19 @@ def transcribe(
             cancel_event=_cancel_event,
         )
         if _cancel_event.is_set():
-            yield _empty_outputs(_CANCELLED)
+            yield _empty_outputs(_CANCELLED, "error", "Cancelled.")
             return
-        # Yield 2 — push the completed result to the browser.
-        yield _build_outputs(result, selected_engines or default_asr_engines())
+        # Yield 2 \u2014 push the completed result to the browser.
+        yield _build_outputs(result, selected)
     except RuntimeError as exc:
         if "cancelled" in str(exc).lower():
-            yield _empty_outputs(_CANCELLED)
+            yield _empty_outputs(_CANCELLED, "error", "Cancelled.")
             return
         logger.exception("Transcription job failed: %s", exc)
-        yield _empty_outputs(f"ERROR: {exc}")
+        yield _empty_outputs(f"ERROR: {exc}", "error", f"Error: {exc}")
     except Exception as exc:  # pylint: disable=broad-exception-caught
         logger.exception("Transcription job failed: %s", exc)
-        yield _empty_outputs(f"ERROR: {exc}")
+        yield _empty_outputs(f"ERROR: {exc}", "error", f"Error: {exc}")
 
 
 def _job_id_from_info(job_info: str) -> str | None:
@@ -379,10 +465,10 @@ def build_ui() -> gr.Blocks:
                     label="Language",
                 )
             with gr.Column(scale=2, min_width=260):
-                engine_selector = gr.CheckboxGroup(
+                engine_selector = gr.Radio(
                     choices=ALL_ENGINES,
-                    value=default_asr_engines(),
-                    label="Local ASR Engines",
+                    value=default_asr_engines()[0],
+                    label="Local ASR Engine",
                 )
             with gr.Column(scale=1, min_width=180):
                 enhance = gr.Checkbox(
@@ -400,34 +486,40 @@ def build_ui() -> gr.Blocks:
         with gr.Group(visible=False) as diarize_config_group:
             with gr.Accordion("Advanced Diarization Settings", open=False):
                 gr.Markdown(
-                    "Tune pyannote speaker detection accuracy. "
-                    "Defaults are loaded from `.env`. Changes apply only to the current run."
+                    "Tune pyannote speaker detection. **Leave at defaults for best accuracy** — "
+                    "community-1 ships with training-tuned hyperparameters. "
+                    "Only adjust if you have characterised your specific audio domain."
+                )
+                diar_override_defaults = gr.Checkbox(  # noqa: F841  (wired via inputs= below)
+                    value=False,
+                    label="Override model-tuned defaults with the sliders below",
+                    info="Unchecked (recommended) = use community-1's own tuned hyperparameters.",
                 )
                 with gr.Row():
                     diar_seg_threshold = gr.Slider(
                         minimum=0.10, maximum=0.90, step=0.01,
-                        value=float(os.getenv("DIARIZATION_SEGMENTATION_THRESHOLD", "0.42")),
+                        value=float(os.getenv("DIARIZATION_SEGMENTATION_THRESHOLD", "0.5")),
                         label="Segmentation Threshold",
-                        info="Lower = catches quieter / shorter speaker turns (default 0.42)",
+                        info="Lower = catches quieter / shorter speaker turns (community-1 default ~0.5)",
                     )
                     diar_min_off = gr.Slider(
                         minimum=0.0, maximum=1.0, step=0.01,
-                        value=float(os.getenv("DIARIZATION_MIN_DURATION_OFF", "0.10")),
+                        value=float(os.getenv("DIARIZATION_MIN_DURATION_OFF", "0.0")),
                         label="Min Silence Gap (s)",
-                        info="Min silence before splitting a turn (default 0.10)",
+                        info="Min silence before splitting a turn (default 0.0)",
                     )
                 with gr.Row():
                     diar_clust_threshold = gr.Slider(
                         minimum=0.10, maximum=0.90, step=0.01,
-                        value=float(os.getenv("DIARIZATION_CLUSTERING_THRESHOLD", "0.60")),
+                        value=float(os.getenv("DIARIZATION_CLUSTERING_THRESHOLD", "0.7")),
                         label="Clustering Threshold",
-                        info="Lower = more speakers kept separate (default 0.60)",
+                        info="Lower = more speakers kept separate (community-1 default ~0.7)",
                     )
                     diar_clust_min_size = gr.Slider(
                         minimum=1, maximum=30, step=1,
-                        value=int(os.getenv("DIARIZATION_MIN_CLUSTER_SIZE", "6")),
+                        value=int(os.getenv("DIARIZATION_MIN_CLUSTER_SIZE", "12")),
                         label="Min Cluster Size",
-                        info="Min segments to form a speaker cluster (default 6)",
+                        info="Min segments to form a speaker cluster (default 12)",
                     )
 
         diarization.change(  # pylint: disable=no-member
@@ -491,6 +583,12 @@ def build_ui() -> gr.Blocks:
             fn=lambda _path: None,
             inputs=[media_input],
             outputs=[enhanced_audio],
+        )
+
+        live_status = gr.HTML(
+            value=STATUS_IDLE,
+            elem_id="live-status",
+            label="Status",
         )
 
         with gr.Tabs():
@@ -561,6 +659,7 @@ def build_ui() -> gr.Blocks:
                 diarization,
                 max_speakers,
                 enhance,
+                diar_override_defaults,
                 diar_seg_threshold,
                 diar_min_off,
                 diar_clust_threshold,
@@ -570,6 +669,7 @@ def build_ui() -> gr.Blocks:
                 typhoon_text, typhoon_time, typhoon_dl, typhoon_correct,
                 pathumma_text, pathumma_time, pathumma_dl, pathumma_correct,
                 job_info,
+                live_status,
             ],
         )
 
@@ -579,6 +679,7 @@ def build_ui() -> gr.Blocks:
                 typhoon_text, typhoon_time, typhoon_dl, typhoon_correct,
                 pathumma_text, pathumma_time, pathumma_dl, pathumma_correct,
                 job_info,
+                live_status,
             ],
             cancels=[transcribe_event],
         )
