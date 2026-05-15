@@ -211,7 +211,7 @@ HF_TOKEN=hf_your_token_here     # Required for gated models (Typhoon Whisper, py
 ### ASR
 
 ```dotenv
-ASR_DEFAULT_ENGINES=Pathumma Whisper  # Default engine shown checked in UI
+ASR_DEFAULT_ENGINES=Pathumma Whisper,Typhoon Whisper  # Default engines shown checked in UI
 ASR_PRELOAD_MODE=eager                # load the configured default ASR model at startup
 MIN_NVIDIA_VRAM_MB=6000               # Minimum NVIDIA VRAM for CUDA mode
 ASR_HARD_MEMORY_SAFE=true             # One model at a time on low-VRAM GPUs
@@ -269,7 +269,7 @@ LOCAL_LLM_MAX_TOKENS=4096
 | AMD GPU | OpenVINO CPU fallback (v1) |
 | CPU only | OpenVINO CPU |
 
-The RTX 4060 Laptop (8 GB) is the reference hardware. Strict low-VRAM mode keeps only one Whisper model in VRAM at a time, uses bounded long-form ASR windows, and uses sequential multi-engine mode.
+The RTX 4060 Laptop (8 GB) is the reference hardware. Strict low-VRAM mode uses bounded long-form ASR windows and sequential multi-engine transcription by default, while the configured preloaded ASR models stay in VRAM for reuse across transcript rounds.
 
 ---
 
@@ -377,9 +377,9 @@ The app detects available resources and chooses the best local backend.
 | AMD GPU | Use CPU/OpenVINO fallback in v1 |
 | CPU only | Use OpenVINO CPU or CPU fallback |
 
-The CUDA runtime now uses a strict 8 GB-class policy. On GPUs up to `ASR_8GB_CLASS_MAX_MB` (default 9000 MB, covering RTX 4060 Laptop cards that report about 8187 MB), the app keeps only one Whisper model resident on the GPU, ignores parallel ASR unless `ASR_ALLOW_8GB_PARALLEL=true`, caps CUDA batch size, and keeps speaker diarization on CPU so ASR owns the GPU budget. If CUDA diarization is enabled on larger GPUs, pyannote moves to CPU when free CUDA memory drops below `DIARIZATION_CUDA_MIN_FREE_MB`.
+The CUDA runtime now uses a strict 8 GB-class policy. On GPUs up to `ASR_8GB_CLASS_MAX_MB` (default 9000 MB, covering RTX 4060 Laptop cards that report about 8187 MB), the app keeps configured ASR models resident for reuse, uses sequential ASR unless `ASR_ALLOW_8GB_PARALLEL=true`, caps CUDA batch size, and keeps speaker diarization on CPU so ASR owns the GPU budget. If CUDA diarization is enabled on larger GPUs, pyannote moves to CPU when free CUDA memory drops below `DIARIZATION_CUDA_MIN_FREE_MB`.
 
-For fastest 8 GB operation, the default UI selection is the Pathumma engine. You can still select both engines for comparison, but they run sequentially to stay inside the VRAM budget, so total wall time will be longer.
+For repeated 8 GB operation, the default UI selection preloads both Pathumma and Typhoon. They run sequentially to stay inside the VRAM budget, then remain loaded for the next transcript round.
 
 The selected backend and reason are saved to `config/app_config.json`.
 
@@ -488,14 +488,14 @@ HUGGINGFACE_HUB_CACHE=./models/hf_cache/hub
 TORCH_HOME=./models/torch
 OV_CACHE_DIR=./models/ov_cache            # reuse OpenVINO exports
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True # reduce CUDA allocator fragmentation
-ASR_HARD_MEMORY_SAFE=true                 # enforce one GPU ASR model on 8 GB-class cards
+ASR_HARD_MEMORY_SAFE=true                 # enforce strict 8 GB batch/worker policy
 ASR_8GB_CLASS_MAX_MB=9000                 # treat reported 8 GB laptop GPUs as low-VRAM
 ASR_PARALLEL_MODE=auto                    # forced parallel is ignored in strict 8 GB mode
 ASR_PARALLEL_MIN_VRAM_MB=12288            # auto-parallel threshold for larger GPUs
-ASR_CLEAR_VRAM_BETWEEN_ENGINES=true       # unload before loading another engine
-ASR_CLEAR_VRAM_AFTER_JOB=true             # final CUDA cache cleanup after each job
-ASR_DEFAULT_ENGINES=Pathumma Whisper      # fastest default for 8 GB
-ASR_ALLOW_8GB_PARALLEL=false             # keep two large ASR models off 8 GB GPUs
+ASR_CLEAR_VRAM_BETWEEN_ENGINES=false      # keep preloaded ASR models resident between engines
+ASR_CLEAR_VRAM_AFTER_JOB=false            # keep ASR models in VRAM for the next transcript round
+ASR_DEFAULT_ENGINES=Pathumma Whisper,Typhoon Whisper  # preload both local ASR engines at startup
+ASR_ALLOW_8GB_PARALLEL=false             # run selected ASR engines sequentially on 8 GB GPUs
 ASR_CUDA_BATCH_SIZE=1                     # strict 8 GB safe default
 ASR_8GB_MAX_BATCH_SIZE=1
 ASR_CUDA_MEMORY_FRACTION=0.90             # leave headroom for CUDA/runtime allocations
@@ -506,7 +506,7 @@ ASR_8GB_RETRY_CHUNK_LENGTH_S=10           # final retry after CUDA OOM
 ASR_WORD_TIMESTAMPS_WITH_DIARIZATION=true # better ASR-to-speaker alignment
 TYPHOON_WORD_TIMESTAMPS_ON_8GB=false      # Typhoon uses chunk timestamps on 8 GB to avoid OOM
 ASR_ATTENTION_IMPLEMENTATION=sdpa         # prefer memory-efficient torch attention
-ASR_PRELOAD_MODE=eager                    # preload the strict 8 GB default ASR engine from models/ at startup
+ASR_PRELOAD_MODE=eager                    # preload the configured ASR engines from models/ at startup
 
 AUDIO_ENHANCE_DEFAULT=false               # keep enhancement unchecked on startup
 AUDIO_ENHANCE_TARGET_PEAK_DB=-3.0         # make quiet speech louder without clipping

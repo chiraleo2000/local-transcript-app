@@ -27,9 +27,9 @@ services:
       - ASR_HARD_MEMORY_SAFE=true
       - MIN_NVIDIA_VRAM_MB=6000
       - ASR_8GB_CLASS_MAX_MB=9000
-      - ASR_CLEAR_VRAM_AFTER_JOB=true
-      - ASR_CLEAR_VRAM_BETWEEN_ENGINES=true
-      - ASR_DEFAULT_ENGINES=Pathumma Whisper
+      - ASR_CLEAR_VRAM_AFTER_JOB=false
+      - ASR_CLEAR_VRAM_BETWEEN_ENGINES=false
+      - ASR_DEFAULT_ENGINES=Pathumma Whisper,Typhoon Whisper
       - ASR_CUDA_BATCH_SIZE=1
       - ASR_8GB_BATCH_SIZE=1
       - ASR_8GB_MAX_BATCH_SIZE=1

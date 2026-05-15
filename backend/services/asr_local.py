@@ -1,6 +1,6 @@
 """Local ASR service facade."""
 
-# pylint: disable=import-outside-toplevel
+# pylint: disable=duplicate-code,import-outside-toplevel
 
 from __future__ import annotations
 
@@ -77,8 +77,6 @@ def should_clear_model_between_engines() -> bool:
     Only applies in sequential mode. Parallel mode keeps both models in VRAM
     for the duration of both transcriptions.
     """
-    if strict_memory_mode_active():
-        return True
     return _env_bool("ASR_CLEAR_VRAM_BETWEEN_ENGINES", False)
 
 
@@ -127,40 +125,35 @@ def asr_worker_count(selected_count: int) -> int:
     ASR_PARALLEL_MODE=auto runs in parallel only when VRAM is comfortably above
     ASR_PARALLEL_MIN_VRAM_MB, avoiding Windows shared-memory spill on 8 GB cards.
     """
-    if selected_count <= 1:
-        return 1
-
-    mode = os.getenv("ASR_PARALLEL_MODE", "auto").strip().lower()
-    if strict_memory_mode_active() and not _env_bool("ASR_ALLOW_8GB_PARALLEL", False):
-        logger.info(
-            "ASR parallelism limited to 1 worker by strict low-VRAM mode. "
-            "Set ASR_ALLOW_8GB_PARALLEL=true only on machines with enough free VRAM."
-        )
-        return 1
-
-    if mode in {"parallel", "force", "true", "1"}:
-        return selected_count
-    if mode in {"memory_safe", "safe", "sequential", "false", "0"}:
-        return 1
-
-    min_parallel_mb = _env_int("ASR_PARALLEL_MIN_VRAM_MB", 12 * 1024)
-    vram_mb = _cuda_vram_mb()
-    if not vram_mb:
-        logger.info("ASR parallelism limited to 1 worker (CUDA VRAM not detected).")
-        return 1
-    if vram_mb and vram_mb < min_parallel_mb:
-        logger.info(
-            "ASR parallelism limited to 1 worker (%d MB VRAM < %d MB threshold).",
-            vram_mb,
-            min_parallel_mb,
-        )
-        return 1
-    return selected_count
+    worker_count = 1
+    if selected_count > 1:
+        mode = os.getenv("ASR_PARALLEL_MODE", "auto").strip().lower()
+        if strict_memory_mode_active() and not _env_bool("ASR_ALLOW_8GB_PARALLEL", False):
+            logger.info(
+                "ASR parallelism limited to 1 worker by strict low-VRAM mode. "
+                "Set ASR_ALLOW_8GB_PARALLEL=true only on machines with enough free VRAM."
+            )
+        elif mode in {"parallel", "force", "true", "1"}:
+            worker_count = selected_count
+        elif mode not in {"memory_safe", "safe", "sequential", "false", "0"}:
+            min_parallel_mb = _env_int("ASR_PARALLEL_MIN_VRAM_MB", 12 * 1024)
+            vram_mb = _cuda_vram_mb()
+            if not vram_mb:
+                logger.info("ASR parallelism limited to 1 worker (CUDA VRAM not detected).")
+            elif vram_mb < min_parallel_mb:
+                logger.info(
+                    "ASR parallelism limited to 1 worker (%d MB VRAM < %d MB threshold).",
+                    vram_mb,
+                    min_parallel_mb,
+                )
+            else:
+                worker_count = selected_count
+    return worker_count
 
 
 def should_clear_models_after_job() -> bool:
     """Return whether ASR models should be unloaded after each job."""
-    return _env_bool("ASR_CLEAR_VRAM_AFTER_JOB", strict_memory_mode_active())
+    return _env_bool("ASR_CLEAR_VRAM_AFTER_JOB", False)
 
 
 def load_model(engine_name: str) -> None:

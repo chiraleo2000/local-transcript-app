@@ -1,6 +1,6 @@
 """Hardware detection and backend selection policy for local inference."""
 
-# pylint: disable=import-outside-toplevel
+# pylint: disable=duplicate-code,import-outside-toplevel
 
 from __future__ import annotations
 
@@ -107,25 +107,27 @@ def _select_openvino_device(
     devices = ov_info["available_devices"]
     env_device = os.getenv("OV_DEVICE", "").upper()
     if env_device == "AUTO":
-        return "AUTO", "OpenVINO AUTO selected by OV_DEVICE."
-    if env_device and env_device in devices:
-        return env_device, f"OpenVINO {env_device} selected by OV_DEVICE."
-    if ov_info["npu"]:
-        return "NPU", "OpenVINO NPU detected and selected."
-    if ov_info["gpu"]:
-        return (
+        selected = "AUTO", "OpenVINO AUTO selected by OV_DEVICE."
+    elif env_device and env_device in devices:
+        selected = env_device, f"OpenVINO {env_device} selected by OV_DEVICE."
+    elif ov_info["npu"]:
+        selected = "NPU", "OpenVINO NPU detected and selected."
+    elif ov_info["gpu"]:
+        selected = (
             next(device for device in devices if device.startswith("GPU")),
             "OpenVINO GPU detected and selected.",
         )
-    if torch_info["cuda"]:
-        return (
+    elif torch_info["cuda"]:
+        selected = (
             "CPU",
             f"NVIDIA GPU has less than {MIN_NVIDIA_VRAM_MB} MB VRAM; "
             "using OpenVINO CPU fallback.",
         )
-    if has_amd_gpu:
-        return "CPU", "AMD GPU detected; using OpenVINO CPU fallback in v1."
-    return "CPU", "OpenVINO CPU selected."
+    elif has_amd_gpu:
+        selected = "CPU", "AMD GPU detected; using OpenVINO CPU fallback in v1."
+    else:
+        selected = "CPU", "OpenVINO CPU selected."
+    return selected
 
 
 def _select_backend(
@@ -220,7 +222,8 @@ def hardware_summary() -> str:
         if os.getenv("ASR_HARD_MEMORY_SAFE", "true").strip().lower() in {"1", "true", "yes", "on"}:
             if hw["cuda_vram_mb"] <= class_limit:
                 lines.append(
-                    "- **VRAM policy:** strict low-VRAM mode; one GPU ASR model at a time, "
+                    "- **VRAM policy:** strict low-VRAM mode; "
+                    "preloaded ASR models retained for reuse, "
                     "CPU diarization by default"
                 )
     if hw["amd_gpu"]:

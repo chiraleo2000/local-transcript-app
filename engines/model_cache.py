@@ -1,9 +1,16 @@
 """Hugging Face cache helpers for local model loading."""
 
+# pylint: disable=duplicate-code
+
 from __future__ import annotations
 
 import os
 from pathlib import Path
+
+try:
+    import huggingface_hub.constants as hub_constants
+except ImportError:
+    hub_constants = None
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -57,12 +64,11 @@ def allow_online_download_if_missing(model_id: str, logger) -> None:
 
     os.environ["HF_HUB_OFFLINE"] = "0"
     os.environ["TRANSFORMERS_OFFLINE"] = "0"
-    try:
-        import huggingface_hub.constants as hub_constants
-
-        hub_constants.HF_HUB_OFFLINE = False
-    except (ImportError, AttributeError):
-        pass
+    if hub_constants is not None:
+        try:
+            hub_constants.HF_HUB_OFFLINE = False
+        except AttributeError:
+            pass
     logger.warning(
         "Model %s is not in the local Hugging Face cache; enabling online download.",
         model_id,
