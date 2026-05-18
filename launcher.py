@@ -2,13 +2,14 @@
 
 Modes
 -----
-  python launcher.py            — auto-detect: Docker if available, else venv
-  python launcher.py --docker   — force Docker Compose (GPU) mode
+  python launcher.py            — auto-detect: direct venv by default
+  python launcher.py --docker   — force Docker Compose (GPU) mode (dev only)
   python launcher.py --direct   — force direct venv / Python mode
 
-When bundled by PyInstaller into LocalTranscriptApp.exe, double-clicking
-starts Docker Compose (or the venv), waits for the Gradio server, then
-opens the UI inside a native desktop window via pywebview — no browser needed.
+When bundled by PyInstaller into LocalTranscriptApp.exe the launcher ALWAYS
+uses direct mode — Docker is treated as a developer-only convenience and is
+never invoked from the installed application. Set APP_FORCE_DIRECT=1 in any
+run to opt out of the Docker auto-detection path.
 """
 
 from __future__ import annotations
@@ -189,12 +190,26 @@ def main() -> None:
     print("  Local Transcript App")
     print("=" * 56)
 
+    # Packaged installer builds (PyInstaller) and APP_FORCE_DIRECT always
+    # take the direct venv path — Docker is never invoked from the GUI exe.
+    is_frozen = bool(getattr(sys, "frozen", False))
+    force_direct = is_frozen or os.getenv("APP_FORCE_DIRECT", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
     backend_proc: subprocess.Popen | None = None
 
-    if args.docker or (not args.direct and _docker_available()):
+    if args.docker and not force_direct:
         _start_docker()
-    else:
+    elif force_direct or args.direct or not _docker_available():
+        if args.docker and force_direct:
+            print("[launcher] --docker ignored: packaged/forced direct mode active.")
         backend_proc = _start_direct()
+    else:
+        _start_docker()
 
     _open_native_window()
 

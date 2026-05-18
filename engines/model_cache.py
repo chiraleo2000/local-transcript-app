@@ -55,11 +55,22 @@ def allow_online_download_if_missing(model_id: str, logger) -> None:
     """Disable offline flags when the requested model is not cached yet.
 
     Model swaps should not brick the runtime just because a previous version had
-    offline mode enabled after bootstrapping a different model.
+    offline mode enabled after bootstrapping a different model. In packaged
+    installer builds where APP_AUTO_DOWNLOAD_MISSING_MODELS=false, this
+    function is a no-op and the caller will see a clear OSError pointing to
+    the missing bundled cache.
     """
     if has_cached_model_file(model_id):
         return
     if not hf_offline_enabled() or not env_bool("APP_AUTO_DOWNLOAD_MISSING_MODELS", True):
+        logger.error(
+            "Model %s is not in the local cache at %s. "
+            "This installer build is configured for offline use; reinstall the "
+            "application or set APP_AUTO_DOWNLOAD_MISSING_MODELS=true together "
+            "with HF_HUB_OFFLINE=0 to fetch the model online.",
+            model_id,
+            _model_cache_dir(model_id),
+        )
         return
 
     os.environ["HF_HUB_OFFLINE"] = "0"

@@ -1,12 +1,20 @@
-; Inno Setup script for the Windows installer executable.
-; Build after preparing a distribution folder that contains app.py, backend,
-; engines, scripts, requirements, and the Python runtime/venv strategy chosen
-; for release packaging.
+; Inno Setup script for the Windows GUI installer.
+;
+; Build flow:
+;   1. Build the standalone GUI executable:
+;        pyinstaller LocalTranscriptApp.spec
+;      Output: dist\LocalTranscriptApp.exe
+;   2. Pre-cache gated models into .\models\ on the BUILD machine using a
+;      valid HF_TOKEN, then strip the token from .env.production. The
+;      installer copies the resulting cache as part of the payload so end
+;      users never need a Hugging Face token.
+;   3. Compile this script with Inno Setup Compiler (iscc) to produce
+;      LocalTranscriptAppSetup.exe.
 
 #define MyAppName "Local Transcript App"
-#define MyAppVersion "1.1.0"
+#define MyAppVersion "1.2.0"
 #define MyAppPublisher "Local Transcript App"
-#define MyAppExeName "run.bat"
+#define MyAppExeName "LocalTranscriptApp.exe"
 
 [Setup]
 AppId={{7D0E9EF4-5703-4F2D-9C8F-8E0F0A6C4E10}}
@@ -16,27 +24,32 @@ AppPublisher={#MyAppPublisher}
 DefaultDirName={autopf}\LocalTranscriptApp
 DefaultGroupName={#MyAppName}
 OutputBaseFilename=LocalTranscriptAppSetup
-Compression=lzma
+Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
+PrivilegesRequired=lowest
+PrivilegesRequiredOverridesAllowed=dialog
+ArchitecturesAllowed=x64compatible
+ArchitecturesInstallIn64BitMode=x64compatible
 
 [Files]
-Source: "..\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "venv\*,.git\*,storage\*,models\*,speaker-aware-ai\*,test-transcript-service\*,__pycache__\*,*.pyc"
+; GUI executable produced by PyInstaller.
+Source: "..\dist\LocalTranscriptApp.exe"; DestDir: "{app}"; Flags: ignoreversion
+; Production env template (no HF_TOKEN; offline cache-first).
+Source: "..\.env.production"; DestDir: "{app}"; DestName: ".env"; Flags: onlyifdoesntexist
+; Pre-cached model payload (gated models bundled at build time — no token needed at runtime).
+Source: "..\models\*"; DestDir: "{app}\models"; Flags: ignoreversion recursesubdirs createallsubdirs
+; Optional: ship source for advanced users / offline diagnostics.
+Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\RUN_INSTRUCTIONS.md"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
-Name: "{commondesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"
+Name: "{group}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"
+Name: "{commondesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"
-Name: "downloadmodels"; Description: "Download and prepare local models after install"; GroupDescription: "Model setup:"
 
 [Run]
-Filename: "{cmd}"; Parameters: "/c python -m venv venv"; WorkingDir: "{app}"; StatusMsg: "Creating Python environment..."; Flags: runhidden waituntilterminated
-Filename: "{cmd}"; Parameters: "/c venv\Scripts\python.exe -m pip install --upgrade pip"; WorkingDir: "{app}"; StatusMsg: "Updating installer tools..."; Flags: runhidden waituntilterminated
-Filename: "{cmd}"; Parameters: "/c venv\Scripts\pip.exe install openvino==2026.1.0"; WorkingDir: "{app}"; StatusMsg: "Installing OpenVINO..."; Flags: waituntilterminated
-Filename: "{cmd}"; Parameters: "/c venv\Scripts\pip.exe install -r requirements.txt"; WorkingDir: "{app}"; StatusMsg: "Installing app dependencies..."; Flags: waituntilterminated
-Filename: "{cmd}"; Parameters: "/c venv\Scripts\pip.exe uninstall torchcodec -y"; WorkingDir: "{app}"; StatusMsg: "Finalizing dependencies..."; Flags: runhidden waituntilterminated
-Filename: "{cmd}"; Parameters: "/c venv\Scripts\pip.exe install pywebview"; WorkingDir: "{app}"; StatusMsg: "Installing desktop window support..."; Flags: runhidden waituntilterminated
-Filename: "{cmd}"; Parameters: "/c venv\Scripts\python.exe scripts\bootstrap_models.py"; WorkingDir: "{app}"; StatusMsg: "Checking hardware and downloading local models..."; Flags: waituntilterminated; Tasks: downloadmodels
-Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: postinstall skipifsilent nowait
+Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; WorkingDir: "{app}"; Flags: postinstall skipifsilent nowait

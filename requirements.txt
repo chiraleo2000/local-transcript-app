@@ -13,3 +13,16 @@ noisereduce>=3.0
 librosa
 soundfile
 python-dotenv
+psutil>=5.9
+pywebview>=5.0
+
+# --- Build / packaging (maintainer machine only) ----------------------------
+# Install with: pip install -r requirements.txt pyinstaller
+# pyinstaller>=6.10
+
+# --- Optional accelerator backends (install per host platform) --------------
+# Windows AMD/Intel GPU acceleration via DirectML (Windows only):
+#   pip install torch-directml
+# AMD ROCm acceleration (Linux only) requires a ROCm PyTorch build:
+#   pip install --index-url https://download.pytorch.org/whl/rocm6.2 torch torchvision torchaudio
+
