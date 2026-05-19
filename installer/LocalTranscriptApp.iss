@@ -8,13 +8,16 @@
 ;      valid HF_TOKEN, then strip the token from .env.production. The
 ;      installer copies the resulting cache as part of the payload so end
 ;      users never need a Hugging Face token.
-;   3. Compile this script with Inno Setup Compiler (iscc) to produce
+;   3. Materialize Hugging Face snapshot links for Inno Setup:
+;        powershell -ExecutionPolicy Bypass -File scripts\materialize_hf_cache_for_inno.ps1
+;   4. Compile this script with Inno Setup Compiler (iscc) to produce
 ;      LocalTranscriptAppSetup.exe.
 
 #define MyAppName "Local Transcript App"
 #define MyAppVersion "1.2.0"
 #define MyAppPublisher "Local Transcript App"
 #define MyAppExeName "LocalTranscriptApp.exe"
+#define ModelStageRoot "C:\lta-installer-stage-real"
 
 [Setup]
 AppId={{7D0E9EF4-5703-4F2D-9C8F-8E0F0A6C4E10}}
@@ -42,8 +45,8 @@ Source: "..\dist\LocalTranscriptApp\*"; DestDir: "{app}"; Flags: ignoreversion r
 Source: "..\.env.production"; DestDir: "{app}"; DestName: ".env"; Flags: onlyifdoesntexist
 ; Pre-cached HF model payload (gated models bundled at build time — no token needed at runtime).
 ; Do not ship models\_archive or generated OpenVINO caches; they can be huge and stale.
-Source: "..\models\hf_cache\*"; DestDir: "{app}\models\hf_cache"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "..\models\torch\*"; DestDir: "{app}\models\torch"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
+Source: "{#ModelStageRoot}\models\hf_cache\*"; DestDir: "{app}\models\hf_cache"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#ModelStageRoot}\models\torch\*"; DestDir: "{app}\models\torch"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 ; Optional: ship source for advanced users / offline diagnostics.
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\RUN_INSTRUCTIONS.md"; DestDir: "{app}"; Flags: ignoreversion
