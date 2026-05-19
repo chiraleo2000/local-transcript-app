@@ -2,8 +2,8 @@
 ;
 ; Build flow:
 ;   1. Build the standalone GUI executable:
-;        pyinstaller LocalTranscriptApp.spec
-;      Output: dist\LocalTranscriptApp.exe
+;        python -m PyInstaller --noconfirm --clean LocalTranscriptApp.spec
+;      Output: dist\LocalTranscriptApp\LocalTranscriptApp.exe plus _internal\
 ;   2. Pre-cache gated models into .\models\ on the BUILD machine using a
 ;      valid HF_TOKEN, then strip the token from .env.production. The
 ;      installer copies the resulting cache as part of the payload so end
@@ -23,9 +23,12 @@ AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
 DefaultDirName={autopf}\LocalTranscriptApp
 DefaultGroupName={#MyAppName}
+OutputDir=..\release\v1.2.0
 OutputBaseFilename=LocalTranscriptAppSetup
 Compression=lzma2/max
 SolidCompression=yes
+DiskSpanning=yes
+DiskSliceSize=1900000000
 WizardStyle=modern
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
@@ -33,12 +36,14 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 
 [Files]
-; GUI executable produced by PyInstaller.
-Source: "..\dist\LocalTranscriptApp.exe"; DestDir: "{app}"; Flags: ignoreversion
+; GUI application produced by PyInstaller onedir mode.
+Source: "..\dist\LocalTranscriptApp\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; Production env template (no HF_TOKEN; offline cache-first).
 Source: "..\.env.production"; DestDir: "{app}"; DestName: ".env"; Flags: onlyifdoesntexist
-; Pre-cached model payload (gated models bundled at build time — no token needed at runtime).
-Source: "..\models\*"; DestDir: "{app}\models"; Flags: ignoreversion recursesubdirs createallsubdirs
+; Pre-cached HF model payload (gated models bundled at build time — no token needed at runtime).
+; Do not ship models\_archive or generated OpenVINO caches; they can be huge and stale.
+Source: "..\models\hf_cache\*"; DestDir: "{app}\models\hf_cache"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\models\torch\*"; DestDir: "{app}\models\torch"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 ; Optional: ship source for advanced users / offline diagnostics.
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\RUN_INSTRUCTIONS.md"; DestDir: "{app}"; Flags: ignoreversion
