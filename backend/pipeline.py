@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import logging
+import os
+import shutil
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -35,6 +38,45 @@ def _check_cancel(cancel_event: threading.Event | None) -> None:
     """Raise RuntimeError if a cancellation has been requested."""
     if cancel_event and cancel_event.is_set():
         raise RuntimeError("Job cancelled by user.")
+
+
+def _cleanup_cancelled_job(temp_files: list[str]) -> None:
+    """Unload all models and delete temp files for a cancelled job.
+
+    Unloading is mandatory: a broad-except in ASR engine code may have already
+    swallowed the cancel RuntimeError, leaving model weights pinned in VRAM.
+    Without an explicit unload, the next job starts with a fragmented VRAM
+    state and frequently hits OOM.
+    """
+    # Unload ASR models first — releases the largest VRAM consumers.
+    for engine in ALL_ENGINES:
+        try:
+            unload_model(engine)
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            logger.debug("Cancel cleanup: ASR model unload failed for %s: %s", engine, exc)
+    # Unload diarization pipeline.
+    try:
+        clear_diarization_model()
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        logger.debug("Cancel cleanup: diarization model unload failed: %s", exc)
+    # Delete temporary audio files created for this job.
+    tmp_root = tempfile.gettempdir()
+    for path in temp_files:
+        try:
+            if not os.path.isfile(path):
+                continue
+            parent = os.path.dirname(os.path.abspath(path))
+            # preprocess_audio writes into mkdtemp(prefix="asr_preprocess_") dirs
+            if os.path.basename(parent).startswith("asr_preprocess_") and \
+                    os.path.commonpath([parent, tmp_root]) == tmp_root:
+                shutil.rmtree(parent, ignore_errors=True)
+                logger.info("Cancel cleanup: removed preprocess dir %s", parent)
+            else:
+                os.remove(path)
+                logger.info("Cancel cleanup: removed temp audio %s", path)
+        except OSError as exc:
+            logger.debug("Cancel cleanup failed for %s: %s", path, exc)
+    clear_accelerator_cache()
 
 
 def _selected_engines(selected_engines: list[str] | str) -> list[str]:
@@ -124,10 +166,19 @@ def _run_one_asr_engine(
     process_path: str,
     language: str,
     diar_segments: list[dict] | None,
+    cancel_event: threading.Event | None = None,
 ) -> dict:
     try:
-        text, elapsed = transcribe_engine(engine, process_path, language, diar_segments)
+        text, elapsed = transcribe_engine(
+            engine, process_path, language, diar_segments, cancel_event=cancel_event
+        )
         return _success_result(job_id, engine, text, elapsed)
+    except RuntimeError as exc:
+        # Re-raise cancellation so run_transcription_job's cleanup handler fires.
+        # A broad except further up the call chain must not swallow this.
+        if "cancelled" in str(exc).lower():
+            raise
+        return _error_result(engine, exc)
     except Exception as exc:  # pylint: disable=broad-exception-caught
         return _error_result(engine, exc)
 
@@ -164,7 +215,9 @@ def _run_asr_sequential(
     clear_between = should_clear_model_between_engines()
     for engine in selected:
         _check_cancel(cancel_event)
-        results[engine] = _run_one_asr_engine(job_id, engine, process_path, language, diar_segments)
+        results[engine] = _run_one_asr_engine(
+            job_id, engine, process_path, language, diar_segments, cancel_event
+        )
         if clear_between:
             _unload_asr_engine(engine)
     return results
@@ -256,28 +309,41 @@ def run_transcription_job(
         diarization,
         enhance,
     )
-    process_path = normalize_media(media_path, job_id)
-    logger.info("Job %s normalized media path: %s", job_id, process_path)
-    _check_cancel(cancel_event)
-    if enhance:
-        process_path = enhance_audio(process_path)
-        logger.info("Job %s enhanced audio path: %s", job_id, process_path)
-    _check_cancel(cancel_event)
-    audio_duration_s = audio_duration_seconds(process_path)
-    logger.info("Job %s audio duration: %.2fs", job_id, audio_duration_s)
+    _temp_files: list[str] = []
+    try:
+        process_path = normalize_media(media_path, job_id)
+        if process_path != media_path:
+            _temp_files.append(process_path)
+        logger.info("Job %s normalized media path: %s", job_id, process_path)
+        _check_cancel(cancel_event)
+        if enhance:
+            enhanced_path = enhance_audio(process_path)
+            if enhanced_path != process_path:
+                _temp_files.append(enhanced_path)
+            process_path = enhanced_path
+            logger.info("Job %s enhanced audio path: %s", job_id, process_path)
+        _check_cancel(cancel_event)
+        audio_duration_s = audio_duration_seconds(process_path)
+        logger.info("Job %s audio duration: %.2fs", job_id, audio_duration_s)
 
-    selected = _selected_engines(selected_engines)
-    speaker_limit = _speaker_limit(diarization, max_speakers)
-    logger.info("Job %s selected engines after policy: %s", job_id, selected)
-    _prepare_selected_asr_model(selected)
-    diar_segments = _run_diarization(
-        process_path, diarization, speaker_limit, diarize_kwargs=diarize_kwargs
-    )
-    _check_cancel(cancel_event)
-    results, workers = _run_asr_engines(
-        job_id, selected, process_path, language, diar_segments, cancel_event
-    )
-    _clear_asr_models(selected)
+        selected = _selected_engines(selected_engines)
+        speaker_limit = _speaker_limit(diarization, max_speakers)
+        logger.info("Job %s selected engines after policy: %s", job_id, selected)
+        _prepare_selected_asr_model(selected)
+        diar_segments = _run_diarization(
+            process_path, diarization, speaker_limit, diarize_kwargs=diarize_kwargs
+        )
+        _check_cancel(cancel_event)
+        results, workers = _run_asr_engines(
+            job_id, selected, process_path, language, diar_segments, cancel_event
+        )
+        _clear_asr_models(selected)
+    except RuntimeError as exc:
+        if "cancelled" in str(exc).lower():
+            logger.info("Job %s cancelled; cleaning up GPU and temp files.", job_id)
+            _cleanup_cancelled_job(_temp_files)
+            raise
+        raise
 
     total_elapsed_s = time.perf_counter() - job_started
     target_elapsed_s = _performance_target_seconds(audio_duration_s)

@@ -420,6 +420,7 @@ def _run_long_form_asr(
     language: str,
     timestamp_mode,
     engine_name: str,
+    cancel_event=None,
 ) -> dict:
     """Run ASR in bounded windows and assemble timestamps into the full timeline."""
     from engines.timestamps import (
@@ -444,6 +445,8 @@ def _run_long_form_asr(
     )
     results: list[dict] = []
     for index, (offset_s, window_input) in enumerate(windows, start=1):
+        if cancel_event and cancel_event.is_set():
+            raise RuntimeError("Job cancelled by user.")
         window_duration_s = len(window_input["raw"]) / window_input["sampling_rate"]
         logger.info(
             "%s ASR window %d/%d started: offset=%.1fs duration=%.1fs",
@@ -519,6 +522,7 @@ def _run_long_form_asr(
 def transcribe_typhoon(
     audio_path: str, language: str = "thai",
     diarization_segments: list | None = None,
+    cancel_event=None,
 ) -> str:
     """Transcribe audio using Typhoon Whisper Large v3.
 
@@ -542,8 +546,12 @@ def transcribe_typhoon(
         _chunk_length_s(),
     )
     if audio_duration_s >= _long_form_min_duration_s():
-        result = _run_long_form_asr(pipe, audio_input, language, timestamp_mode, "Typhoon")
+        result = _run_long_form_asr(
+            pipe, audio_input, language, timestamp_mode, "Typhoon", cancel_event
+        )
     else:
+        if cancel_event and cancel_event.is_set():
+            raise RuntimeError("Job cancelled by user.")
         try:
             result = _run_pipe(pipe, audio_input, language, timestamp_mode, _asr_batch_size())
         except Exception as exc:  # pylint: disable=broad-exception-caught

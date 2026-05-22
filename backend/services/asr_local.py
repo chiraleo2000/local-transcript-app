@@ -193,6 +193,7 @@ def transcribe_engine(
     audio_path: str,
     language: str,
     diarization_segments: list[dict] | None = None,
+    cancel_event=None,
 ) -> tuple[str, float]:
     """Run one ASR engine and return transcript text plus elapsed seconds."""
     engine_name = _LEGACY_ENGINE_NAMES.get(engine_name, engine_name)
@@ -207,11 +208,15 @@ def transcribe_engine(
     if engine_name == ENGINE_TYPHOON:
         from engines.typhoon_asr import transcribe_typhoon
 
-        text = transcribe_typhoon(audio_path, whisper_language, diarization_segments)
+        text = transcribe_typhoon(
+            audio_path, whisper_language, diarization_segments, cancel_event=cancel_event
+        )
     elif engine_name == ENGINE_PATHUMMA:
         from engines.pathumma_asr import transcribe_pathumma
 
-        text = transcribe_pathumma(audio_path, whisper_language, diarization_segments)
+        text = transcribe_pathumma(
+            audio_path, whisper_language, diarization_segments, cancel_event=cancel_event
+        )
     else:
         raise ValueError(f"Unknown ASR engine: {engine_name}")
     elapsed = time.perf_counter() - started

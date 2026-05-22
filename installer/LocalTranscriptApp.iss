@@ -14,7 +14,7 @@
 ;      LocalTranscriptAppSetup.exe.
 
 #define MyAppName "Local Transcript App"
-#define MyAppVersion "1.2.0"
+#define MyAppVersion "1.2.1"
 #define MyAppPublisher "Local Transcript App"
 #define MyAppExeName "LocalTranscriptApp.exe"
 #define ModelStageRoot "C:\lta-installer-stage-real"
@@ -26,7 +26,7 @@ AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
 DefaultDirName={autopf}\LocalTranscriptApp
 DefaultGroupName={#MyAppName}
-OutputDir=..\release\v1.2.0
+OutputDir=..\release\v1.2.1
 OutputBaseFilename=LocalTranscriptAppSetup
 Compression=none
 SolidCompression=no

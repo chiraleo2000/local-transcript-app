@@ -352,10 +352,22 @@ def _run_ffmpeg_diarization_prep(
 ) -> str:
     """Run FFmpeg bandpass/loudness normalization for diarization."""
     inter_path = os.path.splitext(audio_path)[0] + "_diarize_inter.wav"
-    # Widened bandpass (50 Hz - 9 kHz) preserves more voice fidelity for the
-    # WeSpeaker embedding model used by community-1, while still suppressing
-    # rumble and out-of-band noise. Loudness normalization keeps levels stable.
-    diarize_filters = "highpass=f=50,lowpass=f=9000,loudnorm=I=-16:TP=-1.5:LRA=11"
+    # Audio filter chain optimised for WeSpeaker speaker embeddings
+    # (pyannote community-1 backbone, trained on VoxCeleb at 16 kHz):
+    #   highpass=80 Hz  — removes sub-80 Hz rumble/HVAC; no speaker-ID info below this.
+    #   lowpass=8000 Hz — 8 kHz is the Nyquist limit of 16 kHz audio; upper freqs
+    #                     add no embedding information and only increase noise.
+    #   acompressor     — gentle 3:1 downward compression starting at -20 dBFS;
+    #                     equalises loud/quiet speakers so embeddings cluster tighter.
+    #   loudnorm        — EBU R128 -23 LUFS integrated, LRA=7 (tight range) ensures
+    #                     consistent per-speaker loudness and prevents clipping artefacts
+    #                     that corrupt similarity scores.
+    diarize_filters = (
+        "highpass=f=80,"
+        "lowpass=f=8000,"
+        "acompressor=threshold=-20dB:ratio=3:attack=5:release=50,"
+        "loudnorm=I=-23:TP=-1.0:LRA=7"
+    )
     cmd = [
         ffmpeg, "-y", "-i", audio_path,
         "-af", diarize_filters,
@@ -528,6 +540,69 @@ def _move_pipeline_to_cpu_if_cuda_memory_low(pipe) -> None:
         logger.debug("Diarization CUDA free-memory probe skipped: %s", exc)
 
 
+def _is_transition_fragment(
+    seg: dict, prev_seg: dict, next_seg: dict, min_duration_s: float,
+) -> bool:
+    """Return True when seg is a short mis-attributed boundary fragment."""
+    if seg["end"] - seg["start"] >= min_duration_s:
+        return False
+    gap_left = seg["start"] - prev_seg["end"]
+    gap_right = next_seg["start"] - seg["end"]
+    return (
+        prev_seg["speaker"] != seg["speaker"]
+        and next_seg["speaker"] != seg["speaker"]
+        and gap_left <= 0.1
+        and gap_right <= 0.1
+    )
+
+
+def _absorb_fragment(merged: list[dict], seg: dict, next_seg_ref: list[dict]) -> None:
+    """Absorb a transition fragment into the longer of its two neighbours."""
+    prev = merged[-1]
+    nxt = next_seg_ref[0]
+    left_dur = prev["end"] - prev["start"]
+    right_dur = nxt["end"] - nxt["start"]
+    if left_dur >= right_dur:
+        merged[-1] = {**prev, "end": seg["end"]}
+    else:
+        next_seg_ref[0] = {**nxt, "start": seg["start"]}
+
+
+def _merge_short_segments(
+    segments: list[dict], min_duration_s: float = 0.4,
+) -> list[dict]:
+    """Merge isolated short boundary fragments into the longer adjacent turn.
+
+    Pyannote can produce sub-0.4s segments at speaker-change boundaries that
+    are mis-attributed noise.  A segment is merged only when its duration is
+    below the threshold AND it has a different speaker on both sides AND both
+    neighbouring gaps are <= 0.1s (i.e. it is a genuine transition fragment).
+    """
+    if len(segments) < 3:
+        return segments
+    result = list(segments)
+    changed = True
+    while changed:
+        changed = False
+        merged: list[dict] = []
+        i = 0
+        while i < len(result):
+            seg = result[i]
+            prev = merged[-1] if merged else None
+            nxt_ref = [result[i + 1]] if i < len(result) - 1 else None
+            if prev is not None and nxt_ref is not None and _is_transition_fragment(
+                seg, prev, nxt_ref[0], min_duration_s
+            ):
+                _absorb_fragment(merged, seg, nxt_ref)
+                result[i + 1] = nxt_ref[0]
+                changed = True
+            else:
+                merged.append(seg)
+            i += 1
+        result = merged
+    return result
+
+
 def _remap_speakers(segments: list[dict]) -> dict:
     """Remap pyannote 0-indexed labels to 1-indexed in-place; return map."""
     unique_raw = sorted({s["speaker"] for s in segments})
@@ -594,6 +669,9 @@ def diarize(
             "speaker": str(speaker),
         })
     segments.sort(key=lambda s: s["start"])
+
+    # Merge sub-0.4s transition fragments before speaker remapping.
+    segments = _merge_short_segments(segments)
 
     unique_raw = sorted({s["speaker"] for s in segments})
     logger.info(

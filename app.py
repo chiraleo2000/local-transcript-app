@@ -85,6 +85,7 @@ from backend.services.asr_local import (
     ENGINE_PATHUMMA,
     ENGINE_TYPHOON,
     LANGUAGES,
+    clear_accelerator_cache,
     default_asr_engines,
     load_model,
 )
@@ -308,6 +309,7 @@ def _build_outputs(job_result: dict, selected_engines: list[str]) -> tuple:
 def _reset_ui_outputs() -> tuple:
     """Signal cancellation and return a blank UI state for all transcript outputs."""
     _cancel_event.set()
+    clear_accelerator_cache()  # immediately release GPU VRAM held by in-flight inference
     no_dl = gr.update(value=None, interactive=False)
     no_btn = gr.update(interactive=False)
     return (
