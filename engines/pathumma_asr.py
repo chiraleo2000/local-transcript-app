@@ -356,6 +356,7 @@ def _get_pipeline():
         return _pipeline_cache[0]
 
     from engines.hardware import detect_hardware
+    from engines.runtime_backend import uses_openvino_pipeline, uses_pytorch_cuda_pipeline
 
     hw = detect_hardware()
     device = hw["selected_device"]
@@ -363,10 +364,12 @@ def _get_pipeline():
 
     allow_online_download_if_missing(MODEL_ID, logger)
     logger.info("Loading Pathumma Whisper (%s) on device=%s ...", MODEL_ID, device)
-    if hw["backend"] == "cuda":
+    if uses_pytorch_cuda_pipeline(hw):
         pipe = _load_cuda_pipeline(hf_token)
-    else:
+    elif uses_openvino_pipeline(hw):
         pipe = _load_ov_pipeline(device, hf_token)
+    else:
+        pipe = _load_cpu_pipeline(hf_token)
     _pipeline_cache.append(pipe)
     logger.info("Pathumma Whisper pipeline ready on %s.", device)
     return _pipeline_cache[0]
@@ -433,6 +436,7 @@ def _run_long_form_asr(
     timestamp_mode,
     engine_name: str,
     cancel_event=None,
+    window_progress=None,
 ) -> dict:
     """Run ASR in bounded windows and assemble timestamps into the full timeline."""
     from engines.timestamps import (
@@ -456,6 +460,9 @@ def _run_long_form_asr(
         timestamp_mode,
     )
     results: list[dict] = []
+    total_windows = len(windows)
+    if window_progress:
+        window_progress(0, total_windows)
     for index, (offset_s, window_input) in enumerate(windows, start=1):
         if cancel_event and cancel_event.is_set():
             raise RuntimeError("Job cancelled by user.")
@@ -506,6 +513,8 @@ def _run_long_form_asr(
                     )
                     results.append(shifted)
                     _clear_cuda_cache()
+                    if window_progress:
+                        window_progress(index, total_windows)
                     continue
             # Step 2: drop to batch=1 with a smaller chunk and chunk timestamps.
             retry_chunk_s = _retry_chunk_length_s()
@@ -528,6 +537,8 @@ def _run_long_form_asr(
         )
         results.append(shifted)
         _clear_cuda_cache()
+        if window_progress:
+            window_progress(index, total_windows)
     return merge_window_results(results)
 
 
@@ -535,6 +546,7 @@ def transcribe_pathumma(
     audio_path: str, language: str = "thai",
     diarization_segments: list | None = None,
     cancel_event=None,
+    window_progress=None,
 ) -> str:
     """Transcribe audio using Pathumma Whisper Large v3.
 
@@ -559,9 +571,12 @@ def transcribe_pathumma(
     )
     if audio_duration_s >= _long_form_min_duration_s():
         result = _run_long_form_asr(
-            pipe, audio_input, language, timestamp_mode, "Pathumma", cancel_event
+            pipe, audio_input, language, timestamp_mode, "Pathumma", cancel_event,
+            window_progress=window_progress,
         )
     else:
+        if window_progress:
+            window_progress(0, 1)
         if cancel_event and cancel_event.is_set():
             raise RuntimeError("Job cancelled by user.")
         try:
@@ -592,6 +607,8 @@ def transcribe_pathumma(
                 )
                 _clear_cuda_cache()
                 result = _run_pipe(pipe, audio_input, language, True, 1, retry_chunk_s)
+        if window_progress:
+            window_progress(1, 1)
     result = repair_asr_result(result, audio_duration_s, "Pathumma", logger)
 
     if diarization_segments:

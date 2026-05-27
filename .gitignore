@@ -22,6 +22,7 @@ __pycache__/
 build/
 dist/
 *.spec
+!LocalTranscriptApp.spec
 
 # Env / secrets
 .env

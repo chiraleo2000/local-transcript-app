@@ -30,6 +30,11 @@ from backend.services.media_pipeline import (
 )
 from backend.storage import new_job_id, now_iso, save_job_manifest, save_transcript
 
+try:
+    from backend.progress import JobProgress
+except ImportError:  # pragma: no cover
+    JobProgress = None  # type: ignore[misc,assignment]
+
 
 logger = logging.getLogger(__name__)
 
@@ -167,10 +172,16 @@ def _run_one_asr_engine(
     language: str,
     diar_segments: list[dict] | None,
     cancel_event: threading.Event | None = None,
+    window_progress=None,
 ) -> dict:
     try:
         text, elapsed = transcribe_engine(
-            engine, process_path, language, diar_segments, cancel_event=cancel_event
+            engine,
+            process_path,
+            language,
+            diar_segments,
+            cancel_event=cancel_event,
+            window_progress=window_progress,
         )
         return _success_result(job_id, engine, text, elapsed)
     except RuntimeError as exc:
@@ -210,13 +221,20 @@ def _run_asr_sequential(
     language: str,
     diar_segments: list[dict] | None,
     cancel_event: threading.Event | None = None,
+    window_progress=None,
 ) -> dict[str, dict]:
     results: dict[str, dict] = {}
     clear_between = should_clear_model_between_engines()
     for engine in selected:
         _check_cancel(cancel_event)
         results[engine] = _run_one_asr_engine(
-            job_id, engine, process_path, language, diar_segments, cancel_event
+            job_id,
+            engine,
+            process_path,
+            language,
+            diar_segments,
+            cancel_event,
+            window_progress=window_progress,
         )
         if clear_between:
             _unload_asr_engine(engine)
@@ -254,12 +272,19 @@ def _run_asr_engines(
     language: str,
     diar_segments: list[dict] | None,
     cancel_event: threading.Event | None = None,
+    window_progress=None,
 ) -> tuple[dict[str, dict], int]:
     workers = asr_worker_count(len(selected))
     logger.info("Running %d ASR engine(s) with %d worker(s).", len(selected), workers)
     if workers == 1:
         results = _run_asr_sequential(
-            job_id, selected, process_path, language, diar_segments, cancel_event
+            job_id,
+            selected,
+            process_path,
+            language,
+            diar_segments,
+            cancel_event,
+            window_progress=window_progress,
         )
         return results, workers
 
@@ -296,10 +321,19 @@ def run_transcription_job(
     local_correction: bool = False,
     diarize_kwargs: dict | None = None,
     cancel_event: threading.Event | None = None,
+    progress: JobProgress | None = None,
 ) -> dict:
     """Run the full local transcript pipeline and persist outputs."""
+
+    def _phase(phase: str, message: str, percent: float) -> None:
+        if progress is not None:
+            progress.set_phase(phase, message, percent)
+
     job_started = time.perf_counter()
+    _phase("starting", "Starting transcription job\u2026", 2)
     job_id = new_job_id()
+    if progress is not None:
+        progress.set_job_id(job_id)
     logger.info(
         "Job %s started: source=%s engines=%s language=%s diarization=%s enhance=%s",
         job_id,
@@ -311,12 +345,14 @@ def run_transcription_job(
     )
     _temp_files: list[str] = []
     try:
+        _phase("normalize", "Normalizing media\u2026", 8)
         process_path = normalize_media(media_path, job_id)
         if process_path != media_path:
             _temp_files.append(process_path)
         logger.info("Job %s normalized media path: %s", job_id, process_path)
         _check_cancel(cancel_event)
         if enhance:
+            _phase("enhance", "Enhancing audio\u2026", 18)
             enhanced_path = enhance_audio(process_path)
             if enhanced_path != process_path:
                 _temp_files.append(enhanced_path)
@@ -324,19 +360,39 @@ def run_transcription_job(
             logger.info("Job %s enhanced audio path: %s", job_id, process_path)
         _check_cancel(cancel_event)
         audio_duration_s = audio_duration_seconds(process_path)
+        if progress is not None:
+            progress.set_audio_duration(audio_duration_s)
         logger.info("Job %s audio duration: %.2fs", job_id, audio_duration_s)
+        _phase("prepare", "Preparing models\u2026", 28)
 
         selected = _selected_engines(selected_engines)
         speaker_limit = _speaker_limit(diarization, max_speakers)
         logger.info("Job %s selected engines after policy: %s", job_id, selected)
         _prepare_selected_asr_model(selected)
-        diar_segments = _run_diarization(
-            process_path, diarization, speaker_limit, diarize_kwargs=diarize_kwargs
-        )
+        _phase("asr_prepare", "Loading ASR model on GPU\u2026", 40)
+        diar_segments = None
+        if diarization:
+            _phase("diarize", "Running speaker diarization\u2026", 32)
+            diar_segments = _run_diarization(
+                process_path, diarization, speaker_limit, diarize_kwargs=diarize_kwargs
+            )
         _check_cancel(cancel_event)
+
+        def _window_progress(current: int, total: int) -> None:
+            if progress is not None:
+                progress.set_asr_window(current, total)
+
+        _phase("asr", "Transcribing on GPU\u2026", 45)
         results, workers = _run_asr_engines(
-            job_id, selected, process_path, language, diar_segments, cancel_event
+            job_id,
+            selected,
+            process_path,
+            language,
+            diar_segments,
+            cancel_event,
+            window_progress=_window_progress,
         )
+        _phase("finalize", "Saving transcript\u2026", 96)
         _clear_asr_models(selected)
     except RuntimeError as exc:
         if "cancelled" in str(exc).lower():
@@ -377,6 +433,8 @@ def run_transcription_job(
         "results": results,
     }
     manifest_path = save_job_manifest(job_id, manifest)
+    if progress is not None:
+        progress.finish("Transcription complete.")
     return {
         "job_id": job_id,
         "manifest_path": manifest_path,

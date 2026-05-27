@@ -37,14 +37,17 @@ if [ "${1:-}" = "docker" ]; then
     command -v docker &>/dev/null || { echo "[ERROR] Docker not installed."; exit 1; }
     docker info &>/dev/null     || { echo "[ERROR] Docker daemon not running."; exit 1; }
 
-    echo "[2/3] Detecting GPU support in Docker..."
-    COMPOSE_FILES="-f docker-compose.yml"
+    echo "[2/3] Detecting accelerator support in Docker..."
     if docker run --rm --gpus all nvidia/cuda:13.0.0-runtime-ubuntu24.04 nvidia-smi &>/dev/null; then
-        echo "      GPU available in Docker — using CUDA mode."
+        echo "      NVIDIA GPU available — using CUDA compose."
         COMPOSE_FILES="-f docker-compose.gpu.yml"
+    elif [[ -f docker-compose.openvino.yml ]]; then
+        echo "      No NVIDIA GPU in Docker — using OpenVINO/CPU AI compose."
+        COMPOSE_FILES="-f docker-compose.openvino.yml"
     else
-        echo "      GPU not available in Docker — using CPU/OpenVINO mode."
-        echo "      To enable GPU: install nvidia-container-toolkit and restart Docker."
+        echo "      GPU not available — using generic CPU compose."
+        COMPOSE_FILES="-f docker-compose.yml"
+        echo "      To enable NVIDIA GPU: install nvidia-container-toolkit and restart Docker."
     fi
 
     echo "[3/3] Starting Docker container on http://localhost:7896 ..."

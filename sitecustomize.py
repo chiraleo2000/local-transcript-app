@@ -2,12 +2,23 @@
 
 import logging
 import os
+import sys
 import warnings
 
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-_model_root = os.getenv("APP_MODEL_ROOT") or os.path.join(os.getcwd(), "models")
+
+def _install_root() -> str:
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.getcwd()
+
+
+_root = _install_root()
+_model_root = os.getenv("APP_MODEL_ROOT") or os.path.join(_root, "models")
+if not os.path.isabs(_model_root):
+    _model_root = os.path.normpath(os.path.join(_root, _model_root))
 _hf_home = os.path.join(_model_root, "hf_cache")
 os.environ.setdefault("APP_MODEL_ROOT", _model_root)
 os.environ.setdefault("HF_HOME", _hf_home)

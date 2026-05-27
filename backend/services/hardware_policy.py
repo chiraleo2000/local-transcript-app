@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import os
+import platform
 import shutil
 import subprocess
 
@@ -117,6 +118,16 @@ def _check_openvino() -> dict:
     return result
 
 
+def _check_platform() -> dict:
+    """Detect CPU architecture for ARM/x86 policy hints."""
+    machine = platform.machine().lower()
+    return {
+        "cpu_arch": machine,
+        "is_arm": machine in {"aarch64", "arm64", "armv7l", "armv8", "armv8l"},
+        "is_x86_64": machine in {"x86_64", "amd64"},
+    }
+
+
 def _detect_amd_gpu() -> bool:
     if os.name != "nt":
         return False
@@ -217,6 +228,15 @@ def _select_backend(
             f"AMD ROCm selected (HIP {torch_info['rocm_version']}); using PyTorch HIP backend.",
             nvidia_vram_ok,
         )
+    plat = _check_platform()
+    if plat["is_arm"] and ov_info["openvino_version"]:
+        device, reason = _select_openvino_device(torch_info, ov_info, has_amd_gpu)
+        return (
+            "openvino",
+            device,
+            f"{reason} ARM64 host prefers OpenVINO.",
+            nvidia_vram_ok,
+        )
     if ov_info["openvino_version"] and (ov_info["npu"] or ov_info["gpu"]):
         device, reason = _select_openvino_device(torch_info, ov_info, has_amd_gpu)
         return "openvino", device, reason, nvidia_vram_ok
@@ -257,6 +277,7 @@ def detect_hardware(refresh: bool = False) -> dict:
     ov_info = _check_openvino()
     dml_info = _check_directml()
     ram_info = _check_system_ram()
+    plat_info = _check_platform()
     ffmpeg_path = shutil.which("ffmpeg")
     has_amd_gpu = _detect_amd_gpu()
 
@@ -279,6 +300,7 @@ def detect_hardware(refresh: bool = False) -> dict:
         **ov_info,
         **dml_info,
         **ram_info,
+        **plat_info,
         "ffmpeg": ffmpeg_path,
         "amd_gpu": has_amd_gpu,
         "nvidia_vram_ok": nvidia_vram_ok,
@@ -336,6 +358,8 @@ def hardware_summary() -> str:
         f"- **OpenVINO devices:** {', '.join(hw['available_devices']) or 'none'}",
         f"- **FFmpeg:** {'available' if hw['ffmpeg'] else 'NOT FOUND'}",
     ])
+    arch = hw.get("cpu_arch") or "unknown"
+    lines.append(f"- **CPU arch:** {arch}" + (" (ARM)" if hw.get("is_arm") else ""))
     ram_mb = hw.get("system_ram_mb") or 0
     if ram_mb:
         ram_note = "OK" if hw.get("system_ram_ok") else f"below recommended {hw.get('min_system_ram_mb', MIN_SYSTEM_RAM_MB)} MB"

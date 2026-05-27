@@ -103,7 +103,7 @@ services:
               capabilities: [gpu]
     healthcheck:
       test: ["CMD", "python3", "-c",
-        "import urllib.request; urllib.request.urlopen('http://localhost:7896/gradio_api/startup-events')"]
+        "import urllib.request; urllib.request.urlopen('http://localhost:7896/startup-events')"]
       interval: 30s
       timeout: 10s
       start_period: 120s

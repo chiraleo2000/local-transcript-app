@@ -73,14 +73,19 @@ if errorlevel 1 ( echo [ERROR] Docker not installed. && pause && exit /b 1 )
 docker info >nul 2>&1
 if errorlevel 1 ( echo [ERROR] Docker Desktop is not running. Start it first. && pause && exit /b 1 )
 
-echo [2/3] Detecting GPU support in Docker...
-set COMPOSE_FILES=-f docker-compose.yml
+echo [2/3] Detecting accelerator support in Docker...
+set COMPOSE_FILES=-f docker-compose.openvino.yml
 docker run --rm --gpus all nvidia/cuda:13.0.0-runtime-ubuntu24.04 nvidia-smi >nul 2>&1
 if errorlevel 1 (
-    echo       GPU not available in Docker — using CPU/OpenVINO mode.
-    echo       To enable GPU: Docker Desktop ^> Settings ^> Resources ^> GPU ^> Enable
+    if exist docker-compose.openvino.yml (
+        echo       No NVIDIA GPU in Docker — using OpenVINO/CPU AI compose.
+    ) else (
+        echo       GPU not available — using generic CPU compose.
+        set COMPOSE_FILES=-f docker-compose.yml
+        echo       To enable NVIDIA GPU: Docker Desktop ^> Settings ^> Resources ^> GPU ^> Enable
+    )
 ) else (
-    echo       GPU available in Docker — using CUDA mode.
+    echo       NVIDIA GPU available — using CUDA compose.
     set COMPOSE_FILES=-f docker-compose.gpu.yml
 )
 

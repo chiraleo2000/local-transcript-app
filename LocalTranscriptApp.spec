@@ -1,167 +1,115 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller build spec for LocalTranscriptApp (GUI installer release).
+# PyInstaller spec — native desktop bundle (Windows/Linux/macOS).
+#
+# Build:
+#   pip install pyinstaller>=6.10
+#   pyinstaller --noconfirm --clean LocalTranscriptApp.spec
+#
+# Output: dist/LocalTranscriptApp/LocalTranscriptApp.exe (+ _internal/)
 
-This bundles the launcher together with the full app (app.py + backend +
-engines + torchcodec stub + config), all required dynamic imports, and a
-windowed (no-console) executable suitable for end-user distribution.
-"""
+import sys
+from pathlib import Path
 
-import os
-from PyInstaller.utils.hooks import (
-    collect_data_files,
-    collect_dynamic_libs,
-    collect_submodules,
-)
+from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_submodules
+
+ROOT = Path(SPECPATH)
 
 block_cipher = None
 
-# --- Bundled data: app code + assets + production env template ---------------
-_datas = [
-    ('app.py', '.'),
-    ('sitecustomize.py', '.'),
-    ('backend', 'backend'),
-    ('engines', 'engines'),
-    ('torchcodec', 'torchcodec'),
-    ('config', 'config'),
-    ('scripts', 'scripts'),
-]
-if os.path.exists('.env.production'):
-    _datas.append(('.env.production', '.'))
-if os.path.exists('.env.example'):
-    _datas.append(('.env.example', '.'))
-
-# Ship third-party package data files (Gradio assets, openvino plugin xml, etc.)
-for _pkg in (
-    'gradio',
-    'gradio_client',
-    'openvino',
-    'pyannote',
-    'pyannote.audio',
-    'transformers',
-    'huggingface_hub',
-    'librosa',
-    'soundfile',
-    'noisereduce',
-    'pedalboard',
-):
-    try:
-        _datas += collect_data_files(_pkg, include_py_files=False)
-    except Exception:  # pylint: disable=broad-except
-        pass
-
-_binaries = []
-for _pkg in ('torch', 'openvino', 'onnxruntime', 'soundfile'):
-    try:
-        _binaries += collect_dynamic_libs(_pkg)
-    except Exception:  # pylint: disable=broad-except
-        pass
-
-_hidden = []
-for _pkg in (
-    'gradio',
-    'gradio.themes',
-    'gradio_client',
-    'torch',
-    'transformers',
-    'pyannote.audio',
-    'openvino',
-    'librosa',
-    'soundfile',
-    'noisereduce',
-    'pedalboard',
-    'webview',
-    'psutil',
-    'dotenv',
-):
-    try:
-        _hidden += collect_submodules(_pkg)
-    except Exception:  # pylint: disable=broad-except
-        pass
-
-_hidden += [
-    'backend.pipeline',
-    'backend.storage',
-    'backend.services.asr_local',
-    'backend.services.correction_local',
-    'backend.services.hardware_policy',
-    'backend.services.media_pipeline',
-    'engines.diarization',
-    'engines.hardware',
-    'engines.model_cache',
-    'engines.pathumma_asr',
-    'engines.preprocess',
-    'engines.timestamps',
-    'engines.typhoon_asr',
-    'torchcodec',
-    'torchcodec.decoders',
-    'torchcodec.encoders',
-    'torchcodec.samplers',
-    'torchcodec.transforms',
+# --- Data files shipped beside bytecode -----------------------------------
+datas = [
+    (str(ROOT / "config"), "config"),
+    (str(ROOT / ".env.production"), "."),
+    (str(ROOT / "sitecustomize.py"), "."),
+    (str(ROOT / "app.py"), "."),
 ]
 
-# torch_directml is optional; include if installed.
-try:
-    import torch_directml  # noqa: F401
-    _hidden.append('torch_directml')
-except ImportError:
-    pass
+# Optional vendor native binaries (ffmpeg, platform-specific libs) — if a
+# `vendor/` directory exists at the project root, ship its contents into a
+# top-level `bin/` directory next to the executable so runtime subprocesses
+# can find bundled tools without relying on system-installed packages.
+vendor_root = ROOT / "vendor"
+if vendor_root.exists() and vendor_root.is_dir():
+    for p in vendor_root.rglob("*"):
+        if p.is_file():
+            rel = p.relative_to(vendor_root)
+            datas.append((str(p), str(Path("bin") / rel.parent)))
 
+# --- Collect only core runtime packages by default to avoid brittle
+# optional package collection failures on build hosts that don't have
+# large ML packages pre-installed. Add additional packages here only when
+# you've verified they exist in the build venv and need to be bundled.
+_collect_packages = [
+    "gradio",
+    "fastapi",
+    "starlette",
+    "dotenv",
+    "webview",
+    "torch",
+]
+
+binaries = []
+hiddenimports = [
+    "app",
+    "sitecustomize",
+    "backend",
+    "backend.pipeline",
+    "backend.progress",
+    "backend.storage",
+    "backend.paths",
+    "backend.services.asr_local",
+    "backend.services.correction_local",
+    "backend.services.hardware_policy",
+    "backend.services.media_pipeline",
+    "engines",
+    "engines.typhoon_asr",
+    "engines.pathumma_asr",
+    "engines.timestamps",
+    "engines.diarization",
+    "engines.preprocess",
+    "engines.model_cache",
+    "torchcodec",
+    "torchcodec.decoders",
+    "torchcodec.encoders",
+]
+
+for pkg in _collect_packages:
+    try:
+        tmp_ret = collect_all(pkg)
+        datas += tmp_ret[0]
+        binaries += tmp_ret[1]
+        hiddenimports += tmp_ret[2]
+    except Exception as exc:  # noqa: BLE001 — optional on minimal build hosts
+        print(f"[spec] collect_all skipped for {pkg}: {exc}", file=sys.stderr)
+
+hiddenimports += collect_submodules("backend")
+hiddenimports += collect_submodules("engines")
+hiddenimports = sorted(set(hiddenimports))
 
 a = Analysis(
-    ['launcher.py'],
-    pathex=['.'],
-    binaries=_binaries,
-    datas=_datas,
-    hiddenimports=_hidden,
+    [str(ROOT / "launcher.py")],
+    pathex=[str(ROOT)],
+    binaries=binaries,
+    datas=datas,
+    hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[
-        'tkinter',
-        'matplotlib',
-        'matplotlib.tests',
-        'numpy.tests',
-        'scipy.tests',
-        'pandas.tests',
-        'sklearn.tests',
-        'cupy',
-        'cupy_backends',
-        'cupyx',
-        'tensorflow',
-        'tensorflow_cpu',
-        'tensorboard',
-        'jax',
-        'jaxlib',
-        'flax',
-        'IPython',
-        'jupyter',
-        'notebook',
-        'pytest',
-        'PyQt5',
-        'PyQt6',
-        'PySide2',
-        'PySide6',
-        'wx',
-        'sympy',
-        'bokeh',
-        'plotly',
-        'altair',
-        'streamlit',
-    ],
+    excludes=["tkinter"],
+    win_no_prefer_redirects=False,
+    win_private_assemblies=False,
+    cipher=block_cipher,
     noarchive=False,
-    optimize=0,
 )
-pyz = PYZ(a.pure)
 
-# Onedir build: EXE contains only the bootloader + scripts; binaries/datas are
-# collected alongside via COLLECT. This avoids the PyInstaller single-file 4 GB
-# CArchive limit (torch+openvino+transformers+pyannote+gradio is well past it).
+pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+
 exe = EXE(
     pyz,
     a.scripts,
     [],
     exclude_binaries=True,
-    name='LocalTranscriptApp',
+    name="LocalTranscriptApp",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -177,9 +125,10 @@ exe = EXE(
 coll = COLLECT(
     exe,
     a.binaries,
+    a.zipfiles,
     a.datas,
     strip=False,
     upx=False,
     upx_exclude=[],
-    name='LocalTranscriptApp',
+    name="LocalTranscriptApp",
 )

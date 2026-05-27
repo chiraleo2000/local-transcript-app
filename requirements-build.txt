@@ -1,0 +1,2 @@
+# Maintainer-only build tools (not required for end-user runtime)
+pyinstaller>=6.10

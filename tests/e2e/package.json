@@ -1,0 +1,15 @@
+{
+  "name": "local-transcript-app-e2e",
+  "private": true,
+  "scripts": {
+    "fixtures": "python generate_fixtures.py",
+    "test": "playwright test",
+    "test:headed": "playwright test --headed",
+    "report": "playwright show-report"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.51.0",
+    "@types/node": "^22.13.0",
+    "typescript": "^5.8.0"
+  }
+}

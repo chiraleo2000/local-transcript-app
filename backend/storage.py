@@ -10,8 +10,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from backend.paths import app_root, resolve_path
 
-APP_ROOT = Path(__file__).resolve().parents[1]
+
+APP_ROOT = app_root()
 CONFIG_DIR = APP_ROOT / "config"
 STORAGE_DIR = APP_ROOT / "storage"
 INPUT_DIR = STORAGE_DIR / "input"
@@ -19,7 +21,7 @@ AUDIO_DIR = STORAGE_DIR / "audio"
 TRANSCRIPT_DIR = STORAGE_DIR / "transcripts"
 JOB_DIR = STORAGE_DIR / "jobs"
 LOG_DIR = STORAGE_DIR / "logs"
-MODEL_DIR = APP_ROOT / "models"
+MODEL_DIR = resolve_path(os.getenv("APP_MODEL_ROOT", "models"))
 HF_CACHE_DIR = MODEL_DIR / "hf_cache"
 OV_CACHE_DIR = MODEL_DIR / "ov_cache"
 APP_CONFIG_PATH = CONFIG_DIR / "app_config.json"

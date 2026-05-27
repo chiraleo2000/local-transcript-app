@@ -1,25 +1,25 @@
-# ---------- Stage 1: Build dependencies ----------
-FROM nvidia/cuda:13.0.0-runtime-ubuntu24.04 AS base
+# OpenVINO / CPU AI image — Intel Core Ultra (NPU/GPU), AMD AI CPU, ARM64 Linux hosts.
+# No NVIDIA CUDA runtime. Use docker-compose.openvino.yml.
+FROM ubuntu:24.04 AS base
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    HF_HUB_DISABLE_SYMLINKS_WARNING=1
+    HF_HUB_DISABLE_SYMLINKS_WARNING=1 \
+    APP_FORCE_BACKEND=openvino \
+    OV_DEVICE=AUTO
 
-# System dependencies (ffmpeg needed for audio preprocessing)
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-pip python3-venv ffmpeg libsndfile1 git libatomic1 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Pre-create persistent-mount directories so volumes work without root
 RUN mkdir -p models/hf_cache models/ov_cache storage/input storage/audio \
              storage/transcripts storage/jobs storage/logs config
 
-# Install Python deps first (layer cache)
-COPY requirements.txt .
-RUN python3 -m pip install --no-cache-dir --break-system-packages -r requirements.txt \
+COPY requirements-docker-openvino.txt .
+RUN python3 -m pip install --no-cache-dir --break-system-packages -r requirements-docker-openvino.txt \
     && (python3 -m pip uninstall --break-system-packages -y torchcodec || true) \
     && python3 -c "import site,os; \
 stub=[os.path.join(p,'torchcodec-0.0.1.dist-info') for p in site.getsitepackages() if os.path.isdir(p)]; \
@@ -30,7 +30,6 @@ open(os.path.join(d,'RECORD'),'w').write(''); \
 open(os.path.join(d,'INSTALLER'),'w').write('pip'); \
 print('torchcodec stub created at',d)"
 
-# Copy application code
 COPY engines/ engines/
 COPY backend/ backend/
 COPY torchcodec/ torchcodec/
@@ -46,13 +45,10 @@ ENV PYTHONPATH=/app \
     HF_HUB_OFFLINE=0 \
     HUGGINGFACE_HUB_CACHE=/app/models/hf_cache/hub \
     TORCH_HOME=/app/models/torch \
-    OV_CACHE_DIR=/app/models/ov_cache \
-    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    OV_CACHE_DIR=/app/models/ov_cache
 
-# Gradio listens on 7896
 EXPOSE 7896
 
-# Health check — Gradio exposes startup-events at /startup-events (not /gradio_api/...)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=300s --retries=3 \
     CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:7896/startup-events')" || exit 1
 

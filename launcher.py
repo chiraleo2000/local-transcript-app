@@ -5,6 +5,7 @@ Modes
   python launcher.py            — auto-detect: direct venv by default
   python launcher.py --docker   — force Docker Compose (GPU) mode (dev only)
   python launcher.py --direct   — force direct venv / Python mode
+  LocalTranscriptApp.exe --app-server  — internal Gradio backend (PyInstaller)
 
 When bundled by PyInstaller into LocalTranscriptApp.exe the launcher ALWAYS
 uses direct mode — Docker is treated as a developer-only convenience and is
@@ -24,16 +25,51 @@ import time
 import urllib.request
 import webbrowser
 
-HERE = os.path.dirname(
-    os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__)
-)
+
+def _early_app_root() -> str:
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _bootstrap_sys_path() -> str:
+    root = _early_app_root()
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass and meipass not in sys.path:
+            sys.path.insert(0, meipass)
+        internal = os.path.join(root, "_internal")
+        if os.path.isdir(internal) and internal not in sys.path:
+            sys.path.insert(0, internal)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    return root
+
+
+# PyInstaller: run Gradio backend when invoked with --app-server.
+if "--app-server" in sys.argv:
+    _root = _bootstrap_sys_path()
+    os.chdir(_root)
+    from dotenv import load_dotenv
+
+    load_dotenv(os.path.join(_root, ".env"))
+    load_dotenv(os.path.join(_root, ".env.production"), override=False)
+    import app as _app_module
+
+    _app_module.main()
+    raise SystemExit(0)
+
+from backend.paths import app_root
+
+HERE = str(app_root())
 VENV_PYTHON_WIN = os.path.join(HERE, "venv", "Scripts", "python.exe")
 VENV_PYTHON_NIX = os.path.join(HERE, "venv", "bin", "python")
 APP_PY = os.path.join(HERE, "app.py")
 COMPOSE_GPU = os.path.join(HERE, "docker-compose.gpu.yml")
+COMPOSE_OPENVINO = os.path.join(HERE, "docker-compose.openvino.yml")
 COMPOSE_CPU = os.path.join(HERE, "docker-compose.yml")
-APP_URL = "http://localhost:7896"
-READY_URL = f"{APP_URL}/gradio_api/startup-events"
+APP_URL = "http://127.0.0.1:7896"
+READY_URL = f"{APP_URL}/startup-events"
 
 _SPLASH_HTML = """<!DOCTYPE html>
 <html><head><meta charset="utf-8">
@@ -58,10 +94,6 @@ _SPLASH_HTML = """<!DOCTYPE html>
   <span class="dot"></span><span class="dot"></span><span class="dot"></span>
 </div></body></html>"""
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 def _find_python() -> str:
     for path in (VENV_PYTHON_WIN, VENV_PYTHON_NIX):
@@ -106,11 +138,7 @@ def _wait_for_server(timeout: float = 180.0) -> bool:
 
 
 def _open_native_window() -> None:
-    """Show the app in a native pywebview desktop window.
-
-    Degrades to system browser when pywebview is unavailable (CI / headless).
-    Shows a loading splash first, then navigates to the live app URL.
-    """
+    """Show the app in a native pywebview desktop window."""
     try:
         webview = importlib.import_module("webview")
         window = webview.create_window(
@@ -141,12 +169,17 @@ def _open_native_window() -> None:
         webbrowser.open(APP_URL)
 
 
-# ---------------------------------------------------------------------------
-# Start modes
-# ---------------------------------------------------------------------------
+def _select_compose_file() -> str:
+    """Pick Docker compose file: NVIDIA GPU, OpenVINO/CPU AI, or generic CPU."""
+    if _gpu_in_docker():
+        return COMPOSE_GPU
+    if os.path.isfile(COMPOSE_OPENVINO):
+        return COMPOSE_OPENVINO
+    return COMPOSE_CPU
+
 
 def _start_docker() -> subprocess.Popen | None:
-    compose_file = COMPOSE_GPU if _gpu_in_docker() else COMPOSE_CPU
+    compose_file = _select_compose_file()
     print(f"[launcher] Docker mode: {os.path.basename(compose_file)}")
     try:
         proc = subprocess.Popen(
@@ -154,30 +187,48 @@ def _start_docker() -> subprocess.Popen | None:
             cwd=HERE,
         )
         proc.wait()
-        return None  # Docker manages the server process; nothing to terminate
+        return None
     except OSError as exc:
         print(f"[launcher] docker compose failed: {exc}")
         return None
 
 
+def _app_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env.setdefault("APP_FORCE_DIRECT", "1")
+    env.setdefault("GRADIO_SERVER_NAME", "127.0.0.1")
+    pp = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = f"{HERE}{os.pathsep}{pp}" if pp else HERE
+    # When bundled, prepend a local `bin/` directory so bundled native
+    # executables (ffmpeg, etc.) are discoverable by subprocesses.
+    bin_dir = os.path.join(HERE, "bin")
+    if os.path.isdir(bin_dir):
+        path = env.get("PATH", "")
+        env["PATH"] = f"{bin_dir}{os.pathsep}{path}" if path else bin_dir
+    return env
+
+
 def _start_direct() -> subprocess.Popen:
+    env = _app_env()
+    is_frozen = bool(getattr(sys, "frozen", False))
+
+    if is_frozen:
+        print("[launcher] Direct mode: bundled Gradio backend")
+        return subprocess.Popen(
+            [sys.executable, "--app-server"],
+            cwd=HERE,
+            env=env,
+        )
+
     python = _find_python()
     if not os.path.isfile(APP_PY):
         print(f"[launcher] ERROR: app.py not found at {APP_PY}")
         input("Press Enter to exit...")
         sys.exit(1)
 
-    env = os.environ.copy()
-    pp = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = f"{HERE}{os.pathsep}{pp}" if pp else HERE
-
     print(f"[launcher] Direct mode: {python} app.py")
     return subprocess.Popen([python, APP_PY], cwd=HERE, env=env)
 
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 
 def main() -> None:
     """Parse CLI flags and start the chosen backend, then open the desktop window."""
@@ -190,14 +241,9 @@ def main() -> None:
     print("  Local Transcript App")
     print("=" * 56)
 
-    # Packaged installer builds (PyInstaller) and APP_FORCE_DIRECT always
-    # take the direct venv path — Docker is never invoked from the GUI exe.
     is_frozen = bool(getattr(sys, "frozen", False))
     force_direct = is_frozen or os.getenv("APP_FORCE_DIRECT", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
+        "1", "true", "yes", "on",
     }
 
     backend_proc: subprocess.Popen | None = None
@@ -213,7 +259,6 @@ def main() -> None:
 
     _open_native_window()
 
-    # Shut down the direct backend when the window closes.
     if backend_proc is not None:
         backend_proc.terminate()
         try:

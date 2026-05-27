@@ -10,21 +10,33 @@ import os
 import re
 import sys
 import threading
+import time
 import types
 import warnings
 
 from dotenv import load_dotenv
 
+from backend.paths import app_root, ensure_bundle_on_path, resolve_path
+
+ensure_bundle_on_path()
+os.chdir(app_root())
+
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-_MODEL_ROOT = os.getenv("APP_MODEL_ROOT") or os.path.join(os.getcwd(), "models")
-_HF_HOME = os.path.join(_MODEL_ROOT, "hf_cache")
-os.environ.setdefault("APP_MODEL_ROOT", _MODEL_ROOT)
+_install_root = app_root()
+load_dotenv(_install_root / ".env")
+load_dotenv(_install_root / ".env.production", override=False)
+
+_model_root = os.getenv("APP_MODEL_ROOT") or str(_install_root / "models")
+if not os.path.isabs(_model_root):
+    _model_root = str(resolve_path(_model_root))
+_HF_HOME = os.path.join(_model_root, "hf_cache")
+os.environ.setdefault("APP_MODEL_ROOT", _model_root)
 os.environ.setdefault("HF_HOME", _HF_HOME)
 os.environ.setdefault("HF_HUB_CACHE", os.path.join(_HF_HOME, "hub"))
 os.environ.setdefault("HUGGINGFACE_HUB_CACHE", os.path.join(_HF_HOME, "hub"))
-os.environ.setdefault("TORCH_HOME", os.path.join(_MODEL_ROOT, "torch"))
-os.environ.setdefault("OV_CACHE_DIR", os.path.join(_MODEL_ROOT, "ov_cache"))
+os.environ.setdefault("TORCH_HOME", os.path.join(_model_root, "torch"))
+os.environ.setdefault("OV_CACHE_DIR", os.path.join(_model_root, "ov_cache"))
 
 for _cache_dir in [
     os.environ["APP_MODEL_ROOT"],
@@ -65,8 +77,6 @@ warnings.filterwarnings(
 )
 warnings.filterwarnings("ignore", message=r".*TensorFloat-32.*|.*TF32.*")
 
-load_dotenv()
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
@@ -79,7 +89,33 @@ logging.captureWarnings(True)
 import gradio as gr
 from gradio.themes import Soft as _SoftTheme
 
+
+def _patch_gradio_schema_parser() -> None:
+    """Prevent gradio_client crash on bool JSON-schema additionalProperties."""
+    try:
+        import gradio_client.utils as _gcu
+    except (ImportError, RuntimeError):
+        return
+
+    original = getattr(_gcu, "_json_schema_to_python_type", None)
+    if not callable(original) or getattr(_gcu, "_local_transcript_schema_patch", False):
+        return
+
+    def _safe_json_schema_to_python_type(schema, defs=None):
+        if isinstance(schema, bool):
+            return "Any" if schema else "None"
+        if schema is None:
+            return "Any"
+        return original(schema, defs)
+
+    _gcu._json_schema_to_python_type = _safe_json_schema_to_python_type
+    _gcu._local_transcript_schema_patch = True
+
+
+_patch_gradio_schema_parser()
+
 from backend.pipeline import run_transcription_job
+from backend.progress import get_job_progress
 from backend.services.asr_local import (
     ALL_ENGINES,
     ENGINE_PATHUMMA,
@@ -117,6 +153,7 @@ APP_CSS = """
     font-size: 16px;
     margin: 8px 0;
     border: 1px solid transparent;
+    min-height: 52px;
 }
 .live-status.idle    { background: #f4f4f5; color: #52525b; border-color: #e4e4e7; }
 .live-status.running { background: #fef3c7; color: #92400e; border-color: #fde68a;
@@ -124,6 +161,47 @@ APP_CSS = """
 .live-status.done    { background: #dcfce7; color: #166534; border-color: #bbf7d0; }
 .live-status.error   { background: #fee2e2; color: #991b1b; border-color: #fecaca; }
 .live-status .spinner { display: inline-block; margin-right: 8px; }
+.job-progress-panel {
+    padding: 14px 18px;
+    border-radius: 10px;
+    background: #fafafa;
+    border: 1px solid #e4e4e7;
+    margin: 8px 0 12px 0;
+    min-height: 96px;
+}
+.job-progress-panel.active { border-color: #fde68a; background: #fffbeb; }
+.job-progress-panel.done { border-color: #bbf7d0; background: #f0fdf4; }
+.job-progress-panel.error { border-color: #fecaca; background: #fef2f2; }
+.job-progress-panel.idle { opacity: 0.85; }
+.progress-label { font-weight: 600; font-size: 14px; margin-bottom: 8px; color: #3f3f46; }
+.progress-track {
+    height: 14px;
+    border-radius: 999px;
+    background: #e4e4e7;
+    overflow: hidden;
+    margin-bottom: 10px;
+}
+.progress-fill {
+    height: 100%;
+    border-radius: 999px;
+    background: linear-gradient(90deg, #2563eb, #3b82f6);
+    transition: width 0.35s ease;
+    min-width: 2%;
+}
+.job-progress-panel.done .progress-fill {
+    background: linear-gradient(90deg, #16a34a, #22c55e);
+}
+.progress-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px 24px;
+    font-size: 14px;
+    color: #52525b;
+    margin-bottom: 6px;
+}
+.progress-meta strong { color: #18181b; font-variant-numeric: tabular-nums; }
+.progress-pct { margin-left: auto; font-weight: 700; color: #2563eb; }
+.progress-message { font-size: 13px; color: #71717a; }
 @keyframes live-pulse {
     0%, 100% { opacity: 1.0; }
     50%      { opacity: 0.65; }
@@ -136,6 +214,8 @@ APP_CSS = """
 _models_ready = threading.Event()
 _cancel_event = threading.Event()
 _load_status = dict.fromkeys(ALL_ENGINES, "pending")
+_last_load_status_text: str | None = None
+_last_ready_state: bool | None = None
 
 
 def _preload_models() -> None:
@@ -227,15 +307,64 @@ def _status_html(state: str, message: str) -> str:
 STATUS_IDLE = _status_html("idle", "Idle. Upload media and click Transcribe.")
 
 
+def _progress_html(snapshot: dict | None = None) -> str:
+    """Render progress bar + elapsed / remaining timer for the active job."""
+    snap = snapshot if snapshot is not None else get_job_progress().snapshot()
+    phase = snap.get("phase", "idle")
+    pct = float(snap.get("percent", 0))
+    elapsed = float(snap.get("elapsed_s", 0))
+    remaining = snap.get("remaining_s")
+    remaining_txt = "\u2014" if remaining is None else f"{float(remaining):.0f}s"
+    active_cls = "active" if snap.get("active") else phase
+    return (
+        f'<div class="job-progress-panel {active_cls}" data-phase="{phase}" '
+        f'data-percent="{pct:.1f}">'
+        f'<div class="progress-label">Processing Progress</div>'
+        f'<div class="progress-track">'
+        f'<div class="progress-fill" style="width:{pct:.1f}%" data-progress="{pct:.1f}">'
+        f"</div></div>"
+        f'<div class="progress-meta">'
+        f'<span class="progress-elapsed">Time elapsed: <strong>{elapsed:.1f}s</strong></span>'
+        f'<span class="progress-remaining">Est. remaining: <strong>{remaining_txt}</strong></span>'
+        f'<span class="progress-pct">{pct:.0f}%</span>'
+        f"</div>"
+        f'<div class="progress-message">{snap.get("message", "")}</div>'
+        f"</div>"
+    )
+
+
+PROGRESS_IDLE = _progress_html({
+    "phase": "idle",
+    "percent": 0,
+    "active": False,
+    "elapsed_s": 0,
+    "remaining_s": None,
+    "message": "Waiting for a transcription job.",
+    "job_id": "",
+    "audio_duration_s": 0,
+})
+
+
 def _empty_outputs(message: str, status_state: str = "idle",
                    status_message: str = "Idle.") -> tuple:
     no_download = gr.update(value=None, interactive=False)
     no_correction = gr.update(interactive=False)
+    progress = _progress_html({
+        "phase": status_state if status_state in {"error"} else "idle",
+        "percent": 0 if status_state != "error" else get_job_progress().snapshot()["percent"],
+        "active": False,
+        "elapsed_s": get_job_progress().snapshot()["elapsed_s"],
+        "remaining_s": None,
+        "message": status_message,
+        "job_id": "",
+        "audio_duration_s": 0,
+    })
     return (
         message, "", no_download, no_correction,
         message, "", no_download, no_correction,
         "",
         _status_html(status_state, status_message),
+        progress,
     )
 
 
@@ -303,6 +432,7 @@ def _build_outputs(job_result: dict, selected_engines: list[str]) -> tuple:
     else:
         perf_text = f"Done in {total_elapsed:.1f}s."
     outputs.append(_status_html("done", perf_text))
+    outputs.append(_progress_html(get_job_progress().snapshot()))
     return tuple(outputs)
 
 
@@ -310,6 +440,7 @@ def _reset_ui_outputs() -> tuple:
     """Signal cancellation and return a blank UI state for all transcript outputs."""
     _cancel_event.set()
     clear_accelerator_cache()  # immediately release GPU VRAM held by in-flight inference
+    get_job_progress().reset()
     no_dl = gr.update(value=None, interactive=False)
     no_btn = gr.update(interactive=False)
     return (
@@ -317,6 +448,7 @@ def _reset_ui_outputs() -> tuple:
         _CANCELLED, "", no_dl, no_btn,
         "Cancelled by user.",
         _status_html("error", "Cancelled by user."),
+        PROGRESS_IDLE,
     )
 
 
@@ -334,19 +466,11 @@ def transcribe(
     diar_clust_min_size,
     _progress=gr.Progress(track_tqdm=True),
 ):
-    """Gradio callback — generator so the UI clears immediately, then blocks.
-
-    Gradio 6.x uses WebSockets with a server-side heartbeat that keeps the
-    connection alive regardless of how long the function blocks between yields.
-    We do NOT need manual keepalive yields; two yields are sufficient:
-      1. Clear the outputs and show a loading state immediately.
-      2. Yield the real result when the pipeline finishes.
-    gr.Progress(track_tqdm=True) surfaces pyannote diarization stage progress
-    (segmentation / embeddings / discrete_diarization) in the Gradio progress
-    bar natively, without touching the output components.
-    """
+    """Gradio callback — generator yielding live progress bar + timer updates."""
     _cancel_event.clear()
+    tracker = get_job_progress()
     if not media_path:
+        tracker.reset()
         yield _empty_outputs("(no media provided)", "error", "No media uploaded.")
         return
     if not _models_ready.is_set():
@@ -362,21 +486,6 @@ def transcribe(
     else:
         selected = list(selected_engines or default_asr_engines())[:1]
 
-    # Yield 1 \u2014 clear transcript boxes; show progress banner above the tabs.
-    no_dl = gr.update(value=None, interactive=False)
-    no_btn = gr.update(interactive=False)
-    engines_label = selected[0]
-    yield (
-        "", "", no_dl, no_btn,
-        "", "", no_dl, no_btn,
-        "Processing \u2014 see container logs for progress.",
-        _status_html(
-            "running",
-            f"Transcribing with {engines_label}\u2026 GPU is running; "
-            f"check `docker compose logs -f` for per-window progress.",
-        ),
-    )
-
     diarize_kwargs: dict | None = None
     if diarization and diar_override_defaults:
         diarize_kwargs = {
@@ -386,33 +495,82 @@ def transcribe(
             "clust_min_size":       int(diar_clust_min_size),
         }
 
-    try:
-        # Blocking call — Gradio 6.x WS heartbeat keeps the browser connection alive.
-        result = run_transcription_job(
-            media_path=media_path,
-            selected_engines=selected,
-            language=language,
-            diarization=diarization,
-            max_speakers=int(max_speakers),
-            enhance=enhance,
-            local_correction=False,
-            diarize_kwargs=diarize_kwargs,
-            cancel_event=_cancel_event,
+    no_dl = gr.update(value=None, interactive=False)
+    no_btn = gr.update(interactive=False)
+    engines_label = selected[0]
+    holder: dict = {}
+    error_holder: dict = {}
+
+    def _run_job() -> None:
+        try:
+            holder["result"] = run_transcription_job(
+                media_path=media_path,
+                selected_engines=selected,
+                language=language,
+                diarization=diarization,
+                max_speakers=int(max_speakers),
+                enhance=enhance,
+                local_correction=False,
+                diarize_kwargs=diarize_kwargs,
+                cancel_event=_cancel_event,
+                progress=tracker,
+            )
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            error_holder["error"] = exc
+
+    tracker.reset()
+    tracker.start()
+    worker = threading.Thread(target=_run_job, daemon=True)
+    worker.start()
+
+    def _running_outputs(snap: dict) -> tuple:
+        return (
+            "", "", no_dl, no_btn,
+            "", "", no_dl, no_btn,
+            "Transcription in progress\u2026",
+            _status_html("running", snap.get("message", f"Transcribing with {engines_label}\u2026")),
+            _progress_html(snap),
         )
+
+    def _progress_signature(snap: dict) -> tuple:
+        return (
+            snap.get("phase"),
+            round(float(snap.get("percent", 0)), 1),
+            int(float(snap.get("elapsed_s", 0))),
+            snap.get("message"),
+        )
+
+    last_sig = None
+    snap = tracker.snapshot()
+    last_sig = _progress_signature(snap)
+    yield _running_outputs(snap)
+
+    while worker.is_alive():
         if _cancel_event.is_set():
+            tracker.fail("Cancelled.")
             yield _empty_outputs(_CANCELLED, "error", "Cancelled.")
             return
-        # Yield 2 \u2014 push the completed result to the browser.
-        yield _build_outputs(result, selected)
-    except RuntimeError as exc:
-        if "cancelled" in str(exc).lower():
+        snap = tracker.snapshot()
+        sig = _progress_signature(snap)
+        if sig != last_sig:
+            last_sig = sig
+            yield _running_outputs(snap)
+        time.sleep(0.25)
+
+    worker.join()
+
+    if error_holder.get("error"):
+        exc = error_holder["error"]
+        if isinstance(exc, RuntimeError) and "cancelled" in str(exc).lower():
+            tracker.fail("Cancelled.")
             yield _empty_outputs(_CANCELLED, "error", "Cancelled.")
             return
         logger.exception("Transcription job failed: %s", exc)
+        tracker.fail(str(exc))
         yield _empty_outputs(f"ERROR: {exc}", "error", f"Error: {exc}")
-    except Exception as exc:  # pylint: disable=broad-exception-caught
-        logger.exception("Transcription job failed: %s", exc)
-        yield _empty_outputs(f"ERROR: {exc}", "error", f"Error: {exc}")
+        return
+
+    yield _build_outputs(holder["result"], selected)
 
 
 def _job_id_from_info(job_info: str) -> str | None:
@@ -445,8 +603,9 @@ def correct_transcript(engine_name: str, text: str, elapsed: str, job_info: str)
 def build_ui() -> gr.Blocks:
     """Build and wire the Gradio application UI."""
     hw_md = hardware_summary()
+    models_ready = _models_ready.is_set()
 
-    with gr.Blocks(title="Local Transcript App") as demo:
+    with gr.Blocks(title="Local Transcript App", theme=_SoftTheme(), css=APP_CSS) as demo:
         gr.Markdown("# Local Transcript App")
         gr.Markdown("Upload audio or video, then transcribe locally with open-source models.")
 
@@ -456,7 +615,8 @@ def build_ui() -> gr.Blocks:
             label="Audio or Video File",
             file_types=["audio", "video"],
             type="filepath",
-            interactive=False,
+            interactive=models_ready,
+            elem_id="media-input",
         )
 
         with gr.Row(elem_classes=["config-landscape"]):
@@ -476,12 +636,19 @@ def build_ui() -> gr.Blocks:
                 enhance = gr.Checkbox(
                     label="Audio Enhancement",
                     value=_env_bool("AUDIO_ENHANCE_DEFAULT", True),
+                    elem_id="enhance-checkbox",
                 )
-                diarization = gr.Checkbox(label="Speaker Diarization", value=False)
+                diarization = gr.Checkbox(
+                    label="Speaker Diarization",
+                    value=False,
+                    elem_id="diarization-checkbox",
+                )
             with gr.Column(scale=1, min_width=180, visible=False) as speakers_row:
                 max_speakers = gr.Slider(1, 10, step=1, value=3, label="Max Speakers")
             with gr.Column(scale=1, min_width=180):
-                transcribe_btn = gr.Button("Transcribe", variant="primary", interactive=False)
+                transcribe_btn = gr.Button(
+                    "Transcribe", variant="primary", interactive=models_ready, elem_id="transcribe-btn",
+                )
                 cancel_btn = gr.Button("Cancel & Reset", variant="stop", interactive=True)
 
         # Diarization advanced config — shown when Speaker Diarization is enabled.
@@ -592,6 +759,11 @@ def build_ui() -> gr.Blocks:
             elem_id="live-status",
             label="Status",
         )
+        job_progress = gr.HTML(
+            value=PROGRESS_IDLE,
+            elem_id="job-progress",
+            label="Progress",
+        )
 
         with gr.Tabs():
             with gr.TabItem(ENGINE_TYPHOON):
@@ -599,8 +771,8 @@ def build_ui() -> gr.Blocks:
                     label="Transcript",
                     lines=20,
                     max_lines=200,
-                    buttons=["copy"],
                     interactive=False,
+                    elem_id="typhoon-transcript",
                 )
                 with gr.Row():
                     typhoon_time = gr.Textbox(
@@ -608,6 +780,7 @@ def build_ui() -> gr.Blocks:
                         interactive=False,
                         max_lines=1,
                         scale=3,
+                        elem_id="typhoon-elapsed",
                     )
                     typhoon_dl = gr.DownloadButton(
                         label=LABEL_DOWNLOAD,
@@ -626,7 +799,6 @@ def build_ui() -> gr.Blocks:
                     label="Transcript",
                     lines=20,
                     max_lines=200,
-                    buttons=["copy"],
                     interactive=False,
                 )
                 with gr.Row():
@@ -648,7 +820,7 @@ def build_ui() -> gr.Blocks:
                     elem_classes=["correction-button"],
                 )
 
-        job_info = gr.Textbox(label="Job Info", lines=3, interactive=False)
+        job_info = gr.Textbox(label="Job Info", lines=3, interactive=False, elem_id="job-info")
 
         gr.Markdown(hw_md)
 
@@ -672,6 +844,7 @@ def build_ui() -> gr.Blocks:
                 pathumma_text, pathumma_time, pathumma_dl, pathumma_correct,
                 job_info,
                 live_status,
+                job_progress,
             ],
         )
 
@@ -682,6 +855,7 @@ def build_ui() -> gr.Blocks:
                 pathumma_text, pathumma_time, pathumma_dl, pathumma_correct,
                 job_info,
                 live_status,
+                job_progress,
             ],
             cancels=[transcribe_event],
         )
@@ -702,15 +876,38 @@ def build_ui() -> gr.Blocks:
             outputs=[pathumma_text, pathumma_time, pathumma_dl, job_info],
         )
 
-        timer = gr.Timer(value=2)
+        def apply_ready_state():
+            """Only update the page when readiness or load text actually changes.
 
-        def check_ready():
-            """Refresh model readiness and enable upload controls when ready."""
+            This avoids continuous DOM replacements and layout jank by returning
+            no-op updates when nothing has changed.
+            """
+            global _last_load_status_text, _last_ready_state
             ready = _models_ready.is_set()
-            return _get_load_status(), gr.update(interactive=ready), gr.update(interactive=ready)
 
-        timer.tick(  # pylint: disable=no-member
-            fn=check_ready,
+            # Compute current status text only when needed.
+            current_text = _get_load_status()
+
+            # Decide whether to update the Markdown text.
+            if _last_load_status_text is None or current_text != _last_load_status_text:
+                load_update = current_text
+                _last_load_status_text = current_text
+            else:
+                load_update = gr.update()
+
+            # Decide whether to update interactive state for inputs/buttons.
+            if _last_ready_state is None or ready != _last_ready_state:
+                media_update = gr.update(interactive=ready)
+                btn_update = gr.update(interactive=ready)
+                _last_ready_state = ready
+            else:
+                media_update = gr.update()
+                btn_update = gr.update()
+
+            return load_update, media_update, btn_update
+
+        demo.load(  # pylint: disable=no-member
+            fn=apply_ready_state,
             outputs=[load_status, media_input, transcribe_btn],
         )
         demo.queue(default_concurrency_limit=4)
@@ -718,16 +915,43 @@ def build_ui() -> gr.Blocks:
     return demo
 
 
-if __name__ == "__main__":
+def _register_progress_api(demo: gr.Blocks) -> None:
+    """Expose GET /job/progress for frontend polling (avoid Gradio /api POST namespace)."""
+    from starlette.responses import JSONResponse
+    from starlette.routing import Route
+
+    async def progress_api(_request):
+        return JSONResponse(get_job_progress().snapshot())
+
+    demo.app.routes.insert(0, Route("/job/progress", progress_api, methods=["GET"]))
+
+
+def main() -> None:
+    """Start the Gradio server (CLI, launcher subprocess, or PyInstaller --app-server)."""
     ensure_app_dirs()
     hardware = detect_hardware()
     logger.info("Selected backend: %s / %s", hardware["backend"], hardware["selected_device"])
     _preload_models()
     application = build_ui()
-    application.launch(
-        server_name="0.0.0.0",
-        server_port=7896,
-        max_threads=40,
-        theme=_SoftTheme(),
-        css=APP_CSS,
-    )
+    _register_progress_api(application)
+    server_name = os.getenv("GRADIO_SERVER_NAME", "127.0.0.1")
+    server_port = int(os.getenv("GRADIO_SERVER_PORT", "7896"))
+    launch_kwargs = {
+        "server_name": server_name,
+        "server_port": server_port,
+        "max_threads": 40,
+        "show_error": True,
+        "share": _env_bool("GRADIO_SHARE", False),
+    }
+    try:
+        application.launch(**launch_kwargs)
+    except ValueError as exc:
+        if "localhost is not accessible" not in str(exc).lower():
+            raise
+        logger.warning("Localhost probe failed; retrying Gradio launch with share=True.")
+        launch_kwargs["share"] = True
+        application.launch(**launch_kwargs)
+
+
+if __name__ == "__main__":
+    main()

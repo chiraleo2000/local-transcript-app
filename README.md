@@ -169,9 +169,11 @@ local-transcript-app/
 ├── run.bat                       # Windows: run.bat | run.bat gui | run.bat docker
 ├── run.sh                        # Linux/Mac: ./run.sh | ./run.sh gui | ./run.sh docker
 ├── setup.bat / setup.sh          # First-time dependency install
-├── docker-compose.gpu.yml        # Docker + NVIDIA GPU (recommended)
-├── docker-compose.yml            # Docker CPU/OpenVINO fallback
-├── Dockerfile                    # CUDA 13 image, PyTorch, all dependencies
+├── docker-compose.gpu.yml        # Docker + NVIDIA GPU (CUDA)
+├── docker-compose.openvino.yml   # Docker + OpenVINO (Intel/AMD AI CPU, ARM)
+├── docker-compose.yml            # Docker generic CPU PyTorch fallback
+├── Dockerfile                    # CUDA 13 image (GPU compose)
+├── Dockerfile.openvino           # OpenVINO / CPU AI image
 ├── .env                          # Runtime configuration (copy from .env.example)
 ├── .env.example                  # Documented configuration template
 ├── backend/
