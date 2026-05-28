@@ -38,6 +38,8 @@ COPY app.py .
 COPY sitecustomize.py .
 COPY .env* ./
 
+RUN python3 -c "import sys; sys.path.insert(0,'/app'); import torchcodec; assert hasattr(torchcodec,'decoders'); print('torchcodec stub OK')"
+
 ENV PYTHONPATH=/app \
     APP_MODEL_ROOT=/app/models \
     HF_HOME=/app/models/hf_cache \

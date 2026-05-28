@@ -1,7 +1,8 @@
-# CPU + OpenVINO stack for docker-compose.openvino.yml (Intel Core Ultra, AMD AI CPU, ARM)
-torch==2.11.0
-torchvision==0.26.0
-torchaudio==2.11.0
+# CPU-only PyTorch (no NVIDIA CUDA wheels) + OpenVINO for Intel/AMD AI CPU / ARM Docker hosts.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.11.0+cpu
+torchvision==0.26.0+cpu
+torchaudio==2.11.0+cpu
 accelerate>=1.0
 openvino==2026.1.0
 optimum[openvino]>=1.17.0
