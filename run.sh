@@ -5,7 +5,7 @@ echo "============================================================"
 echo " Transcription Service - Run (Linux / Mac)"
 echo " Usage:  ./run.sh          <-- run app directly (default)"
 echo "         ./run.sh gui      <-- native desktop window (pywebview)"
-echo "         ./run.sh docker   <-- run via Docker on port 7896"
+echo "         ./run.sh docker   <-- run via Docker on port 7987"
 echo "============================================================"
 echo
 
@@ -50,7 +50,7 @@ if [ "${1:-}" = "docker" ]; then
         echo "      To enable NVIDIA GPU: install nvidia-container-toolkit and restart Docker."
     fi
 
-    echo "[3/3] Starting Docker container on http://localhost:7896 ..."
+    echo "[3/3] Docker Test Deployment running at http://localhost:7987 ..."
     echo
     docker compose $COMPOSE_FILES up --build -d
     docker logs -f transcription-service

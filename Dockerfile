@@ -49,7 +49,7 @@ ENV PYTHONPATH=/app \
     OV_CACHE_DIR=/app/models/ov_cache \
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# Gradio listens on 7896
+# Gradio listens on 7896 inside the container (host maps 7987:7896 in compose)
 EXPOSE 7896
 
 # Health check — Gradio exposes startup-events at /startup-events (not /gradio_api/...)

@@ -11,6 +11,14 @@ ov_cache/
 storage/
 config/
 
+# Release binaries
+release/**/*.exe
+release/**/*.zip
+debug-*.log
+
+# Large local test media (optional — copy into tests/ for E2E)
+tests/*.m4a
+
 # Python cache
 __pycache__/
 *.py[cod]

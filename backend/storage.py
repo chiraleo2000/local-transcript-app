@@ -91,14 +91,117 @@ def safe_name(value: str) -> str:
     return value.strip("._") or "transcript"
 
 
-def save_transcript(job_id: str, engine_name: str, text: str) -> str | None:
+def save_transcript(
+    job_id: str,
+    engine_name: str,
+    text: str,
+    output_name: str | None = None,
+) -> str | None:
     """Write *text* to a transcript file and return its path, or None if skipped."""
     if not text or text.startswith(("(", "ERROR")):
         return None
     ensure_app_dirs()
-    path = TRANSCRIPT_DIR / f"{job_id}_{safe_name(engine_name)}.txt"
+    if output_name:
+        path = TRANSCRIPT_DIR / f"{safe_name(output_name)}.txt"
+    else:
+        path = TRANSCRIPT_DIR / f"{job_id}_{safe_name(engine_name)}.txt"
     path.write_text(text, encoding="utf-8")
     return str(path)
+
+
+def write_job_record(job_id: str, patch: dict[str, Any]) -> str:
+    """Create or merge-update a per-job manifest JSON file."""
+    ensure_app_dirs()
+    path = JOB_DIR / f"{job_id}.json"
+    existing: dict[str, Any] = {}
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            existing = {}
+    preserved_created = existing.get("created_at")
+    existing.update(patch)
+    if not existing.get("job_id"):
+        existing["job_id"] = job_id
+    if not existing.get("created_at"):
+        existing["created_at"] = preserved_created or now_iso()
+    existing["updated_at"] = now_iso()
+    path.write_text(
+        json.dumps(existing, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return str(path)
+
+
+def load_job(job_id: str) -> dict[str, Any] | None:
+    """Load a full job manifest dict, or None if missing/invalid."""
+    ensure_app_dirs()
+    path = JOB_DIR / f"{job_id}.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _job_timestamp(value: Any) -> str:
+    """Normalize manifest timestamps; JSON null must not reach sort comparisons."""
+    return value if isinstance(value, str) and value else ""
+
+
+def _job_row_from_path(path: Path) -> dict[str, Any] | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    job_id = data.get("job_id") or path.stem
+    engines = data.get("selected_engines") or []
+    if isinstance(engines, str):
+        engines = [engines]
+    return {
+        "job_id": job_id,
+        "created_at": _job_timestamp(data.get("created_at")),
+        "updated_at": _job_timestamp(data.get("updated_at")),
+        "status": data.get("status", "unknown"),
+        "display_name": data.get("display_name") or "",
+        "source_filename": data.get("source_filename") or "",
+        "selected_engines": engines,
+        "audio_duration_s": float(data.get("audio_duration_s") or 0.0),
+        "total_elapsed_s": float(data.get("total_elapsed_s") or 0.0),
+        "tab_id": data.get("tab_id") or "",
+        "progress": data.get("progress") or {},
+        "results": data.get("results") or {},
+    }
+
+
+def list_jobs(limit: int = 50) -> list[dict[str, Any]]:
+    """Return job summary rows sorted by created_at descending."""
+    ensure_app_dirs()
+    rows: list[dict[str, Any]] = []
+    for path in JOB_DIR.glob("*.json"):
+        row = _job_row_from_path(path)
+        if row is not None:
+            rows.append(row)
+    rows.sort(key=lambda row: row["created_at"], reverse=True)
+    return rows[: max(1, limit)]
+
+
+def copy_input_file(source_path: str, job_id: str, filename: str) -> str | None:
+    """Best-effort copy of uploaded media into storage/input for job history."""
+    import shutil
+
+    ensure_app_dirs()
+    src = Path(source_path)
+    if not src.is_file():
+        return None
+    safe = safe_name(filename or src.name)
+    dest = INPUT_DIR / f"{job_id}_{safe}"
+    try:
+        shutil.copy2(src, dest)
+        return str(dest)
+    except OSError:
+        return None
 
 
 def save_job_manifest(job_id: str, manifest: dict[str, Any]) -> str:
@@ -114,3 +217,4 @@ def save_job_manifest(job_id: str, manifest: dict[str, Any]) -> str:
 
 def now_iso() -> str:
     """Return the current UTC time as an ISO-8601 string."""
+    return datetime.now(timezone.utc).isoformat()

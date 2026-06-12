@@ -5,12 +5,14 @@ services:
       dockerfile: Dockerfile
     container_name: transcription-service
     restart: unless-stopped
+    shm_size: "4gb"
     ports:
-      - "7896:7896"
+      - "7987:7896"
     env_file:
       - .env
     environment:
       - GRADIO_SERVER_NAME=0.0.0.0
+      - GRADIO_SERVER_PORT=7896
       - PYTHONPATH=/app
       - APP_MODEL_ROOT=/app/models
       - HF_HOME=/app/models/hf_cache
@@ -34,14 +36,14 @@ services:
       - ASR_8GB_CLASS_MAX_MB=9000
       - ASR_CLEAR_VRAM_AFTER_JOB=false
       - ASR_CLEAR_VRAM_BETWEEN_ENGINES=false
-      - ASR_DEFAULT_ENGINES=Typhoon Whisper
+      - ASR_DEFAULT_ENGINES=Pathumma Whisper
       - ASR_CUDA_BATCH_SIZE=8
       - ASR_8GB_BATCH_SIZE=8
       - ASR_8GB_MAX_BATCH_SIZE=8
       - ASR_CUDA_MEMORY_FRACTION=0.92
-      - ASR_CHUNK_LENGTH_S=30
+      - ASR_CHUNK_LENGTH_S=180
       - ASR_8GB_CHUNK_LENGTH_S=30
-      - ASR_8GB_MAX_CHUNK_LENGTH_S=30
+      - ASR_8GB_MAX_CHUNK_LENGTH_S=20
       - ASR_8GB_RETRY_CHUNK_LENGTH_S=10
       - ASR_WORD_TIMESTAMPS_WITH_DIARIZATION=true
       - TYPHOON_WORD_TIMESTAMPS_ON_8GB=false

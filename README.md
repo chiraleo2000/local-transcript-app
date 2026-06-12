@@ -16,6 +16,16 @@ No cloud APIs. No telemetry. All processing stays on your machine.
 - **Native desktop window** — pywebview wraps the Gradio UI; no browser required when using `launcher.py` or `LocalTranscriptApp.exe`
 - **Docker GPU mode** — NVIDIA CUDA 13 + PyTorch; models cached in `./models/`
 - **Strict 8 GB VRAM policy** — safe on RTX 4060 Laptop (8 GB); one model at a time, sequential engines, capped chunk size
+- **OOM-safe long jobs** — disk-window ASR streaming (one slice in RAM), iterative CUDA chunk halving, UI transcript line/char caps, co-resident GPU preload with phase teardown
+
+---
+
+## Networking
+
+| Mode | URL | Notes |
+| --- | --- | --- |
+| Direct Python / GUI (`run.bat`, `launcher.py`) | `http://localhost:7896` | `GRADIO_SERVER_PORT=7896` |
+| Docker test deployment | `http://localhost:7987` | Host port maps to container `7896` |
 
 ---
 
@@ -43,7 +53,7 @@ run.bat gui
 ./run.sh gui
 ```
 
-Or open manually: **<http://localhost:7896>**
+Or open manually: **Docker** → <http://localhost:7987> · **Direct/GUI** → <http://localhost:7896>
 
 ---
 
@@ -126,17 +136,20 @@ Supported: `.mp3`, `.wav`, `.m4a`, `.flac`, `.ogg`, `.mp4`, `.mov`, `.mkv`, `.av
 | --- | --- | --- |
 | **Language** | Thai | Dropdown — choose the spoken language |
 | **Local ASR Engines** | Typhoon Whisper | Tick one or both; dual-engine runs sequentially on 8 GB GPUs |
-| **Audio Enhancement** | Off | Noise gate → spectral NR → compressor → limiter chain |
+| **Audio Enhancement** | Off | Bandpass + loudnorm → spectral NR → gate/compress/limit (stronger defaults in Docker GPU profile) |
 | **Speaker Diarization** | Off | Identify and label individual speakers |
 | **Max Speakers** | 3 | Appears when Diarization is enabled; pyannote auto-detects from 1 up to this limit |
-| **Advanced Diarization Settings** | (accordion) | Fine-tune pyannote accuracy per run — see below |
+| **Advanced Diarization Settings** | (accordion) | Short-clip adaptive tuning (automatic) or manual overrides — see below |
 
 ### 3. Advanced Diarization Settings (accordion)
 
 Visible only when **Speaker Diarization** is checked.
 
-| Slider | What it does | Tune when… |
+**Automatic (recommended):** Clips under 90 seconds use adaptive pyannote params (lower `min_cluster_size`, looser clustering) and a single retry if only one speaker is detected. No manual setup required.
+
+| Slider | Default (manual override) | Tune when… |
 | --- | --- | --- |
+| **Short clip / multi-speaker preset** | Off | One-click aggressive settings for &lt; 90 s clips with 2–3 speakers |
 | **Segmentation Threshold** (0.42) | Activity threshold; lower = catches quieter / shorter turns | Speakers are missed or turns are cut short |
 | **Min Silence Gap** (0.10 s) | Minimum gap before splitting a turn | Too many spurious splits — raise it |
 | **Clustering Threshold** (0.60) | Speaker embedding distance; lower = more speakers separated | Different speakers are merged into one — lower it |
@@ -153,10 +166,12 @@ Each engine tab shows:
 
 - **Transcript** — full text with speaker labels and timestamps when diarization is on
 - **Elapsed Time** — wall time for that engine
+- **Output name** — custom download filename (defaults to uploaded file stem)
 - **Download .txt** — save the transcript
-- **Run Local LLM Correction** — optional post-processing (requires a running llama.cpp / Ollama server)
 
-Job metadata is saved to `storage/jobs/` as JSON.
+The **Previous transcripts** panel lists past jobs from `storage/jobs/` — load into the editor or download without re-running ASR. Refresh the page during a long job to recover live progress (same browser tab).
+
+Job metadata is saved to `storage/jobs/` as JSON (status: running → completed/cancelled/failed).
 
 ---
 
@@ -212,51 +227,85 @@ HF_TOKEN=hf_your_token_here     # Required for gated models (Typhoon Whisper, py
 
 ### ASR
 
+**Default engine:** Pathumma Whisper (Thai Large v3). Typhoon Whisper remains available in the UI.
+
 ```dotenv
-ASR_DEFAULT_ENGINES=Pathumma Whisper,Typhoon Whisper  # Default engines shown checked in UI
-ASR_PRELOAD_MODE=eager                # load the configured default ASR model at startup
-MIN_NVIDIA_VRAM_MB=6000               # Minimum NVIDIA VRAM for CUDA mode
-ASR_HARD_MEMORY_SAFE=true             # One model at a time on low-VRAM GPUs
-ASR_8GB_CLASS_MAX_MB=9000             # GPUs up to this VRAM use strict policy
-ASR_CHUNK_LENGTH_S=30                 # Audio chunk size (larger GPUs)
-ASR_8GB_CHUNK_LENGTH_S=40             # Chunk size for 6-8 GB GPUs
-ASR_LONG_FORM_WINDOW_S=360            # Long-file ASR window size
-ASR_LONG_FORM_OVERLAP_S=30            # Overlap to protect window boundaries
-ASR_CUDA_MEMORY_FRACTION=0.90         # Leave headroom for CUDA allocator
-TYPHOON_WORD_TIMESTAMPS_ON_8GB=false  # Disable word timestamps on 8 GB (saves VRAM)
+ASR_DEFAULT_ENGINES=Pathumma Whisper
+ASR_QUALITY_PROFILE=high               # high (default) | balanced — emergency low-VRAM only
+ASR_PRELOAD_MODE=eager
+MIN_NVIDIA_VRAM_MB=6000
+ASR_HARD_MEMORY_SAFE=true
+ASR_8GB_CLASS_MAX_MB=9000
+PATHUMMA_MODEL_ID=nectec/Pathumma-whisper-th-large-v3
+TYPHOON_MODEL_ID=typhoon-ai/typhoon-whisper-large-v3
 ```
+
+### Quality profiles (accuracy-first default)
+
+Profiles apply defaults **only when a variable is not already set** in `.env` or Docker `environment:`.
+
+| Profile | Use case | ASR window | Diarization | VRAM / speed |
+|---------|----------|------------|-------------|--------------|
+| `high` (default) | Best speaker separation & continuity | 300s | Full multi-sample grid, 44.1 kHz preprocess, enhance always-on | Slow diarization by design |
+| `balanced` | Emergency low-VRAM / OOM recovery only | 60s | Single-pass, faster | Lower accuracy |
+
+Diarization with `DIARIZATION_ACCURACY_MODE=true` may take 2–5× longer than legacy fast paths — that is intentional.
+
+```dotenv
+ASR_QUALITY_PROFILE=high
+ASR_LONG_FORM_WINDOW_S=300
+ASR_LONG_FORM_OVERLAP_S=45
+DIARIZATION_ACCURACY_MODE=true
+DIARIZATION_MULTI_SAMPLE=true
+DIARIZATION_MULTI_SAMPLE_PASSES=0        # 0 = full parameter grid
+DIARIZATION_PREPROCESS_SR=44100
+AUDIO_ENHANCE_WHEN_DIARIZATION=true
+DIARIZATION_TRANSCRIPT_MERGE_GAP_S=1.0
+PATHUMMA_WORD_TIMESTAMPS_ON_8GB=true
+```
+
+For OOM on 8 GB only: switch to `ASR_QUALITY_PROFILE=balanced` temporarily.
+
+```dotenv
+ASR_CHUNK_LENGTH_S=300
+ASR_8GB_MAX_CHUNK_LENGTH_S=120
+ASR_LONG_FORM_WINDOW_S=300
+ASR_LONG_FORM_OVERLAP_S=45
+ASR_CUDA_MEMORY_FRACTION=0.90
+TYPHOON_WORD_TIMESTAMPS_ON_8GB=false
+```
+
+### Job history & refresh recovery
+
+Completed and in-progress jobs write manifests to `storage/jobs/`. The **Previous transcripts** panel lists past jobs; refresh the browser during a long run to reattach progress (same tab id in sessionStorage).
 
 ### Audio Enhancement
 
 ```dotenv
-AUDIO_ENHANCE_DEFAULT=false           # Enhancement unchecked on startup
-AUDIO_ENHANCE_TARGET_PEAK_DB=-3.0     # Target loudness after gain
-AUDIO_ENHANCE_MAX_GAIN_DB=10.0        # Cap gain so noise doesn't explode
-AUDIO_ENHANCE_NOISE_REDUCTION=0.65    # Spectral gating strength (0–1)
+AUDIO_ENHANCE_DEFAULT=true
+AUDIO_ENHANCE_WHEN_DIARIZATION=true
+AUDIO_ENHANCE_TARGET_PEAK_DB=-1.5
+AUDIO_ENHANCE_MAX_GAIN_DB=18
+AUDIO_ENHANCE_NOISE_REDUCTION=0.92
+AUDIO_ENHANCE_ATEMPO=0.92
 ```
 
 ### Speaker Diarization
 
 ```dotenv
 DIARIZATION_MODEL_ID=pyannote/speaker-diarization-community-1
-DIARIZATION_DEVICE=cpu                 # keep diarization off 8 GB GPU VRAM by default
-DIARIZATION_PREPROCESS_SR=16000       # community-1 ingests 16 kHz mono directly
-DIARIZATION_NOISE_REDUCTION=0.0       # NR off by default (degrades speaker embeddings)
+DIARIZATION_DEVICE=cuda
+DIARIZATION_PREPROCESS_SR=44100
+DIARIZATION_NOISE_REDUCTION=0.0
+DIARIZATION_SEGMENT_S=300
+DIARIZATION_SEGMENT_OVERLAP_S=60
+DIARIZATION_MAX_ASR_WINDOW_S=300
 
 # Pyannote accuracy tuning (also editable live in the UI)
 DIARIZATION_SEGMENTATION_THRESHOLD=0.42
 DIARIZATION_MIN_DURATION_OFF=0.1
 DIARIZATION_CLUSTERING_THRESHOLD=0.60
 DIARIZATION_MIN_CLUSTER_SIZE=6
-```
-
-### Local LLM Correction (optional)
-
-```dotenv
-LOCAL_LLM_PROVIDER=llamacpp
-LLAMACPP_ENDPOINT=http://127.0.0.1:8080/v1/chat/completions
-LOCAL_LLM_MODEL=typhoon2-8b-instruct-q4
-LOCAL_LLM_MAX_TOKENS=4096
 ```
 
 ---
@@ -322,7 +371,25 @@ storage/logs/                 — optional log files
 | Speaker diarization misses a speaker | Raise **Max Speakers**, lower **Clustering Threshold**, and lower **Min Cluster Size** in the UI |
 | Speakers merged into one | Raise **Max Speakers** and lower **Clustering Threshold** (try 0.45–0.55) |
 | Desktop window shows blank / loading forever | Check `docker ps` or `venv/Scripts/python app.py` in a terminal |
-| CUDA out of memory | Already handled by strict 8 GB mode; if it still occurs, reduce `ASR_8GB_CHUNK_LENGTH_S` |
+| CUDA out of memory | Strict 8 GB mode halves batch then chunk length (min 8s). Reduce `ASR_8GB_CHUNK_LENGTH_S` / `ASR_8GB_MAX_CHUNK_LENGTH_S`. Set `ASR_CLEAR_VRAM_ON_MEDIA_CHANGE=true` to free GPU when switching files. |
+| Gradio tab freezes on long transcript | UI shows last `UI_TRANSCRIPT_MAX_LINES` (default 500) — use **Download .txt** for the full file |
+| Back-to-back 3h jobs OOM | Check logs for `VRAM [phase]` lines; cancel unloads all models; co-resident mode keeps weights but runs phase teardown between stages |
+| Whisper repeats words at end of segments | Enabled by default: `ASR_SUPPRESS_HALLUCINATIONS=true` plus post-processing in `engines/text_cleanup.py` |
+| Want better diarization than community-1 | See **Speaker diarization models** below — fully open-source options are limited; community-1 is the best local HF pipeline today |
+
+### Speaker diarization models
+
+The app uses **`pyannote/speaker-diarization-community-1`** (Sep 2025), which is the strongest **fully open, local** speaker-diarization pipeline on Hugging Face today. It beats the older `speaker-diarization-3.1` pipeline on most benchmarks and runs entirely on your machine with `HF_TOKEN`.
+
+**What is *not* included (and why):**
+
+| Model | Status |
+| --- | --- |
+| `pyannote/speaker-diarization-precision-2` | Commercial / pyannoteAI cloud API — not a drop-in local OSS replacement |
+| NVIDIA NeMo Sortformer | Heavy separate stack; not integrated in this app |
+| Legacy `speaker-diarization-3.1` | Still works via `DIARIZATION_MODEL_ID` but is generally weaker than community-1 |
+
+For short clips with several speakers, enable **Short clip / multi-speaker preset** in the UI or tune segmentation/clustering sliders (defaults: 0.42 / 0.10 / 0.60 / 6). Adaptive logic also retries with lower clustering when too few speakers are detected.
 
 ---
 
@@ -436,7 +503,7 @@ run.bat
 Then open your browser at:
 
 ```text
-http://localhost:7896
+http://localhost:7987
 ```
 
 ---
@@ -464,7 +531,7 @@ python app.py
 Then open:
 
 ```text
-http://localhost:7896
+http://localhost:7987
 ```
 
 ---
@@ -473,7 +540,7 @@ http://localhost:7896
 
 1. Hardware is detected — NVIDIA CUDA (>=8 GB VRAM) is preferred; falls back to OpenVINO CPU or CPU.
 2. The configured default ASR engine preloads from `models/hf_cache/hub` at startup before the UI is served; other engines load on demand.
-3. Gradio UI starts after preload; the terminal shows `Running on local URL: http://0.0.0.0:7896`.
+3. Gradio UI starts after preload; the terminal shows `Running on local URL: http://0.0.0.0:7987`.
 4. Upload an audio or video file, choose engine and language, click **Transcribe**.
 
 Keep Hugging Face model snapshots under the canonical hub cache: `models/hf_cache/hub/models--...`. Legacy duplicate folders directly under `models/hf_cache/models--...` are not used by this app and should be moved out of the active cache root.
@@ -496,21 +563,39 @@ ASR_PARALLEL_MODE=auto                    # forced parallel is ignored in strict
 ASR_PARALLEL_MIN_VRAM_MB=12288            # auto-parallel threshold for larger GPUs
 ASR_CLEAR_VRAM_BETWEEN_ENGINES=false      # keep preloaded ASR models resident between engines
 ASR_CLEAR_VRAM_AFTER_JOB=false            # keep ASR models in VRAM for the next transcript round
-ASR_DEFAULT_ENGINES=Pathumma Whisper,Typhoon Whisper  # preload both local ASR engines at startup
+ASR_DEFAULT_ENGINES=Pathumma Whisper
+ASR_QUALITY_PROFILE=high                  # default; use balanced only for OOM emergencies
+ASR_8GB_ALLOW_LARGE_CHUNKS=false          # high profile: set true for full 180s on 8 GB
 ASR_ALLOW_8GB_PARALLEL=false             # run selected ASR engines sequentially on 8 GB GPUs
-ASR_CUDA_BATCH_SIZE=1                     # strict 8 GB safe default
-ASR_8GB_MAX_BATCH_SIZE=1
+ASR_CUDA_BATCH_SIZE=4                     # GPU compose default; capped by ASR_8GB_MAX_BATCH_SIZE
+ASR_8GB_MAX_BATCH_SIZE=4
+ASR_BATCH_DURATION_CAP=true               # allow batch>1 for 60–120s audio when max batch>1
+ASR_MAX_CONCURRENT_INFERENCE=1            # one shared Whisper pipeline on 8 GB
+ASR_UNLOAD_ON_CANCEL=true                 # Cancel & Reset frees VRAM before next job
+UI_MAX_CONCURRENT_JOBS=4                  # pipeline slots; restart app after changing
+UI_CANCEL_JOIN_TIMEOUT_S=120              # max wait for worker after cancel
+UI_GRADIO_TRANSCRIBE_CONCURRENCY=8        # Gradio streams (tabs); does not add GPU load
 ASR_CUDA_MEMORY_FRACTION=0.90             # leave headroom for CUDA/runtime allocations
-ASR_CHUNK_LENGTH_S=30                     # larger GPUs can use this value
-ASR_8GB_CHUNK_LENGTH_S=20                 # strict 8 GB load default
-ASR_8GB_MAX_CHUNK_LENGTH_S=20             # cap long chunks on 8 GB GPUs
+ASR_CHUNK_LENGTH_S=30                     # balanced profile default
+ASR_8GB_CHUNK_LENGTH_S=90
+ASR_8GB_MAX_CHUNK_LENGTH_S=90             # cap on 8 GB (raise with ASR_8GB_ALLOW_LARGE_CHUNKS)
 ASR_8GB_RETRY_CHUNK_LENGTH_S=10           # final retry after CUDA OOM
+ASR_8GB_ALLOW_LARGE_CHUNKS=true           # high profile: larger chunks on 8 GB
+ASR_MIN_CHUNKED_DURATION_S=120
+DIARIZATION_TRANSCRIPT_MERGE_GAP_S=1.25
+PATHUMMA_MODEL_ID=nectec/Pathumma-whisper-th-large-v3
+TYPHOON_MODEL_ID=typhoon-ai/typhoon-whisper-large-v3
 ASR_WORD_TIMESTAMPS_WITH_DIARIZATION=true # better ASR-to-speaker alignment
 TYPHOON_WORD_TIMESTAMPS_ON_8GB=false      # Typhoon uses chunk timestamps on 8 GB to avoid OOM
 ASR_ATTENTION_IMPLEMENTATION=sdpa         # prefer memory-efficient torch attention
 ASR_PRELOAD_MODE=eager                    # preload the configured ASR engines from models/ at startup
 
-AUDIO_ENHANCE_DEFAULT=false               # keep enhancement unchecked on startup
+AUDIO_ENHANCE_DEFAULT=false               # keep enhancement unchecked on startup (Docker GPU: true)
+AUDIO_ENHANCE_TARGET_PEAK_DB=-3.0
+AUDIO_ENHANCE_MAX_GAIN_DB=15.0           # max lift for quiet speech
+AUDIO_ENHANCE_NOISE_REDUCTION=0.80      # spectral NR strength (0–1)
+AUDIO_ENHANCE_LOUDNORM_I=-16.0            # FFmpeg loudnorm integrated loudness (LUFS)
+AUDIO_ENHANCE_NOISE_PROFILE=leading       # leading | adaptive — noise sample from first 0.75 s
 AUDIO_ENHANCE_TARGET_PEAK_DB=-3.0         # make quiet speech louder without clipping
 AUDIO_ENHANCE_MAX_GAIN_DB=10.0            # cap boost so noise does not explode
 AUDIO_ENHANCE_NOISE_REDUCTION=0.65        # less destructive than heavy gating
@@ -580,31 +665,6 @@ Manual offline install example:
 ```powershell
 venv\Scripts\python.exe -m pip install .\vendor\pyannote_audio-4.0.4-py3-none-any.whl
 ```
-
-## Optional Local LLM Correction
-
-Correction is local-only and now runs only after a transcript is generated and the user clicks **Run Local LLM Correction** in an engine tab. This keeps transcription fast and avoids loading an LLM during ASR.
-
-The default adapter targets a local `llama.cpp` OpenAI-compatible server. In strict 8 GB transcription mode, keep the LLM unloaded during ASR or run it on CPU; then click correction after the transcript is generated. If you use GPU LLM correction on the same 8 GB card, start it after ASR finishes so it does not compete with Whisper for VRAM.
-
-Optional `.env` values:
-
-```text
-LOCAL_LLM_PROVIDER=llamacpp
-LLAMACPP_ENDPOINT=http://127.0.0.1:8080/v1/chat/completions
-LOCAL_LLM_MODEL=typhoon2-8b-instruct-q4
-LOCAL_LLM_MAX_TOKENS=4096
-```
-
-Ollama is still supported:
-
-```text
-LOCAL_LLM_PROVIDER=ollama
-OLLAMA_ENDPOINT=http://127.0.0.1:11434/api/generate
-LOCAL_LLM_MODEL=llama3.1:8b
-```
-
-If the local LLM server or model is unavailable, the app keeps the original transcript and reports that correction was skipped.
 
 ## Privacy Statement
 

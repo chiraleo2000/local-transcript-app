@@ -1,10 +1,10 @@
 import { defineConfig, devices } from "@playwright/test";
 
-const baseURL = process.env.E2E_BASE_URL ?? "http://localhost:7896";
+const baseURL = process.env.E2E_BASE_URL ?? "http://localhost:7987";
 
 export default defineConfig({
   testDir: ".",
-  testMatch: "transcription.spec.ts",
+  testMatch: ["transcription.spec.ts", "real_audio.spec.ts"],
   globalSetup: "./global-setup.ts",
   fullyParallel: false,
   forbidOnly: !!process.env.CI,

@@ -3,7 +3,7 @@ echo ============================================================
 echo  Transcription Service - Run (Windows)
 echo  Usage:  run.bat          ^<-- run app directly (default)
 echo          run.bat gui      ^<-- native desktop window (pywebview)
-echo          run.bat docker   ^<-- run via Docker on port 7896
+echo          run.bat docker   ^<-- run via Docker on port 7987
 echo ============================================================
 echo.
 
@@ -89,7 +89,7 @@ if errorlevel 1 (
     set COMPOSE_FILES=-f docker-compose.gpu.yml
 )
 
-echo [3/3] Starting Docker container on http://localhost:7896 ...
+echo [3/3] Docker Test Deployment running at http://localhost:7987 ...
 echo.
 docker compose %COMPOSE_FILES% up --build -d
 docker logs -f transcription-service

@@ -12,12 +12,14 @@ services:
       dockerfile: Dockerfile.openvino
     container_name: transcription-service-openvino
     restart: unless-stopped
+    shm_size: "4gb"
     ports:
-      - "7896:7896"
+      - "7987:7896"
     env_file:
       - .env
     environment:
       - GRADIO_SERVER_NAME=0.0.0.0
+      - GRADIO_SERVER_PORT=7896
       - PYTHONPATH=/app
       - APP_MODEL_ROOT=/app/models
       - HF_HOME=/app/models/hf_cache
@@ -34,9 +36,9 @@ services:
       - PYTHONUNBUFFERED=1
       - ASR_PARALLEL_MODE=sequential
       - ASR_HARD_MEMORY_SAFE=true
-      - ASR_DEFAULT_ENGINES=Typhoon Whisper
+      - ASR_DEFAULT_ENGINES=Pathumma Whisper
       - ASR_CUDA_BATCH_SIZE=1
-      - ASR_CHUNK_LENGTH_S=30
+      - ASR_CHUNK_LENGTH_S=180
       - ASR_ATTENTION_IMPLEMENTATION=sdpa
       - ASR_PRELOAD_MODE=eager
       - DIARIZATION_MODEL_ID=pyannote/speaker-diarization-community-1

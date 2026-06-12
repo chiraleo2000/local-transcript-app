@@ -54,6 +54,9 @@ if "--app-server" in sys.argv:
 
     load_dotenv(os.path.join(_root, ".env"))
     load_dotenv(os.path.join(_root, ".env.production"), override=False)
+    from backend.asr_quality import apply_quality_profile
+
+    apply_quality_profile()
     import app as _app_module
 
     _app_module.main()

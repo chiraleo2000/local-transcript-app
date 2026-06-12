@@ -4,10 +4,11 @@
 
 from __future__ import annotations
 
-import gc
 import logging
 import os
+import threading
 import time
+from contextlib import contextmanager
 
 
 logger = logging.getLogger(__name__)
@@ -16,8 +17,8 @@ logger = logging.getLogger(__name__)
 ENGINE_TYPHOON = "Typhoon Whisper"
 ENGINE_PATHUMMA = "Pathumma Whisper"
 _LEGACY_ENGINE_NAMES: dict[str, str] = {}
-ALL_ENGINES = [ENGINE_TYPHOON, ENGINE_PATHUMMA]
-FAST_8GB_ENGINES = [ENGINE_TYPHOON]
+ALL_ENGINES = [ENGINE_PATHUMMA, ENGINE_TYPHOON]
+FAST_8GB_ENGINES = [ENGINE_PATHUMMA]
 
 LANGUAGES = {
     "Thai": "thai",
@@ -71,6 +72,11 @@ def strict_memory_mode_active() -> bool:
     return _env_bool("ASR_HARD_MEMORY_SAFE", True) and _is_8gb_class_cuda()
 
 
+def requires_sequential_gpu_models() -> bool:
+    """8 GB GPUs cannot keep ASR + diarization resident on CUDA together."""
+    return strict_memory_mode_active()
+
+
 def should_clear_model_between_engines() -> bool:
     """Return whether a model should be unloaded immediately after each engine.
 
@@ -102,19 +108,48 @@ def default_asr_engines() -> list[str]:
 
 def clear_accelerator_cache() -> None:
     """Release unused Python and CUDA memory back to the driver."""
-    gc.collect()
-    try:
-        import torch
+    from backend import vram_state
 
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
+    vram_state.teardown(aggressive=True)
+
+
+def max_concurrent_asr_inference() -> int:
+    """How many CUDA ASR inferences may run at once (shared Whisper pipeline)."""
+    return max(1, _env_int("ASR_MAX_CONCURRENT_INFERENCE", 1))
+
+
+_inference_semaphore = threading.Semaphore(max_concurrent_asr_inference())
+
+
+@contextmanager
+def asr_inference_slot():
+    """Serialize CUDA ASR when multiple job threads share one pipeline."""
+    _inference_semaphore.acquire()
+    try:
+        yield
+    finally:
+        _inference_semaphore.release()
+
+
+def should_unload_on_cancel() -> bool:
+    """Unload models on cancel (off by default — models stay ready for the next job)."""
+    return _env_bool("ASR_UNLOAD_ON_CANCEL", False)
+
+
+def switch_asr_engine(selected_engine: str) -> None:
+    """Unload other engines and load the selected one (UI engine change only)."""
+    selected_engine = _LEGACY_ENGINE_NAMES.get(selected_engine, selected_engine)
+    if selected_engine not in ALL_ENGINES:
+        raise ValueError(f"Unknown ASR engine: {selected_engine}")
+    for engine in ALL_ENGINES:
+        if engine != selected_engine:
             try:
-                torch.cuda.ipc_collect()
-            except (RuntimeError, AttributeError):
+                unload_model(engine)
+            except ValueError:
                 pass
-    except (ImportError, RuntimeError, OSError, AttributeError) as exc:
-        logger.debug("CUDA cache cleanup skipped: %s", exc)
+    if not model_is_loaded(selected_engine):
+        load_model(selected_engine)
+    logger.info("ASR engine active: %s (others unloaded).", selected_engine)
 
 
 def asr_worker_count(selected_count: int) -> int:
@@ -153,7 +188,55 @@ def asr_worker_count(selected_count: int) -> int:
 
 def should_clear_models_after_job() -> bool:
     """Return whether ASR models should be unloaded after each job."""
+    if models_resident_on_gpu():
+        return False
     return _env_bool("ASR_CLEAR_VRAM_AFTER_JOB", False)
+
+
+def diarization_inference_uses_cuda() -> bool:
+    """True when pyannote diarization will run on CUDA (not CPU)."""
+    try:
+        import torch
+
+        from engines.diarization import _select_diarization_device
+
+        return str(_select_diarization_device(torch)).startswith("cuda")
+    except (ImportError, RuntimeError, OSError, AttributeError):
+        return False
+
+
+def models_resident_on_gpu() -> bool:
+    """Keep ASR on GPU between jobs when preloaded (independent of diarization device)."""
+    if not _env_bool("ASR_KEEP_PRELOADED", False):
+        return False
+    if _env_bool("ASR_CLEAR_VRAM_AFTER_JOB", False):
+        return False
+    return True
+
+
+def should_unload_asr_for_diarization() -> bool:
+    """Never unload ASR for diarization when GPU co-resident policy is enabled."""
+    if _env_bool("DIARIZATION_GPU_CO_RESIDENT", True):
+        return False
+    if not diarization_inference_uses_cuda():
+        return False
+    if models_resident_on_gpu():
+        return _env_bool("ASR_UNLOAD_FOR_DIARIZATION", False)
+    return _env_bool("ASR_UNLOAD_FOR_DIARIZATION", True)
+
+
+def model_is_loaded(engine_name: str) -> bool:
+    """Return True when an ASR engine pipeline is already cached in memory."""
+    engine_name = _LEGACY_ENGINE_NAMES.get(engine_name, engine_name)
+    if engine_name == ENGINE_TYPHOON:
+        from engines import typhoon_asr
+
+        return bool(typhoon_asr._pipeline_cache)  # noqa: SLF001
+    if engine_name == ENGINE_PATHUMMA:
+        from engines import pathumma_asr
+
+        return bool(pathumma_asr._pipeline_cache)  # noqa: SLF001
+    return False
 
 
 def load_model(engine_name: str) -> None:
@@ -195,6 +278,7 @@ def transcribe_engine(
     diarization_segments: list[dict] | None = None,
     cancel_event=None,
     window_progress=None,
+    max_speakers: int = 0,
 ) -> tuple[str, float]:
     """Run one ASR engine and return transcript text plus elapsed seconds."""
     engine_name = _LEGACY_ENGINE_NAMES.get(engine_name, engine_name)
@@ -206,22 +290,25 @@ def transcribe_engine(
         whisper_language,
         len(diarization_segments or []),
     )
-    if engine_name == ENGINE_TYPHOON:
-        from engines.typhoon_asr import transcribe_typhoon
+    with asr_inference_slot():
+        if engine_name == ENGINE_TYPHOON:
+            from engines.typhoon_asr import transcribe_typhoon
 
-        text = transcribe_typhoon(
-            audio_path, whisper_language, diarization_segments,
-            cancel_event=cancel_event, window_progress=window_progress,
-        )
-    elif engine_name == ENGINE_PATHUMMA:
-        from engines.pathumma_asr import transcribe_pathumma
+            text = transcribe_typhoon(
+                audio_path, whisper_language, diarization_segments,
+                cancel_event=cancel_event, window_progress=window_progress,
+                max_speakers=max_speakers,
+            )
+        elif engine_name == ENGINE_PATHUMMA:
+            from engines.pathumma_asr import transcribe_pathumma
 
-        text = transcribe_pathumma(
-            audio_path, whisper_language, diarization_segments,
-            cancel_event=cancel_event, window_progress=window_progress,
-        )
-    else:
-        raise ValueError(f"Unknown ASR engine: {engine_name}")
+            text = transcribe_pathumma(
+                audio_path, whisper_language, diarization_segments,
+                cancel_event=cancel_event, window_progress=window_progress,
+                max_speakers=max_speakers,
+            )
+        else:
+            raise ValueError(f"Unknown ASR engine: {engine_name}")
     elapsed = time.perf_counter() - started
     logger.info(
         "ASR engine finished: engine=%s elapsed=%.2fs transcript_chars=%d",

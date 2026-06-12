@@ -6,6 +6,7 @@ import logging
 import os
 
 from engines.model_cache import allow_online_download_if_missing, pretrained_local_files_only
+from engines.whisper_utils import whisper_generate_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +97,9 @@ def _clear_cuda_cache() -> None:
         pass
 
 
-def _asr_batch_size() -> int:
+def _asr_batch_size(audio_duration_s: float | None = None) -> int:
+    from engines.whisper_utils import effective_asr_batch_size
+
     default = _env_int("ASR_8GB_BATCH_SIZE", 1) if _strict_8gb_mode() else 4
     batch_size = max(1, _env_int("ASR_CUDA_BATCH_SIZE", default))
     if _strict_8gb_mode():
@@ -107,7 +110,9 @@ def _asr_batch_size() -> int:
                 batch_size,
                 max_batch_size,
             )
-            return max_batch_size
+            batch_size = max_batch_size
+    if audio_duration_s is not None:
+        return effective_asr_batch_size(batch_size, audio_duration_s)
     return batch_size
 
 
@@ -134,9 +139,20 @@ def _long_form_min_duration_s() -> int:
     return max(0, _env_int("ASR_LONG_FORM_MIN_DURATION_S", 300))
 
 
-def _long_form_window_s() -> int:
-    default = 180 if _strict_8gb_mode() else 600
-    return max(30, _env_int("ASR_LONG_FORM_WINDOW_S", default))
+def _long_form_window_s(audio_duration_s: float = 0.0) -> int:
+    from backend.asr_quality import is_high_quality_profile
+
+    default = 60 if _strict_8gb_mode() else 600
+    window = max(30, _env_int("ASR_LONG_FORM_WINDOW_S", default))
+    if is_high_quality_profile():
+        return window
+    if audio_duration_s >= 7200:
+        return min(window, 45)
+    if audio_duration_s >= 3600:
+        return min(window, 60)
+    if audio_duration_s >= 1800:
+        return min(window, 90)
+    return window
 
 
 def _long_form_overlap_s() -> int:
@@ -166,30 +182,6 @@ def _model_load_kwargs(hf_token: str | None, dtype) -> dict:
     return kwargs
 
 
-def _is_cuda_oom(exc: Exception) -> bool:
-    """Return True for any CUDA memory-pressure failure, including:
-      * allocator OOM (`torch.cuda.OutOfMemoryError`, "CUDA out of memory")
-      * driver OOM ("CUDA driver error: out of memory")
-      * allocator corruption that follows a peer-thread OOM
-        ("CUDACachingAllocator", "handles_.at", "INTERNAL ASSERT FAILED").
-    The retry path will halve the batch and finally drop to batch=1.
-    """
-    try:
-        import torch
-
-        if isinstance(exc, torch.cuda.OutOfMemoryError):
-            return True
-    except (ImportError, OSError, AttributeError):
-        pass
-    msg = str(exc)
-    needles = (
-        "out of memory",
-        "CUDACachingAllocator",
-        "handles_.at",
-    )
-    return any(n in msg for n in needles)
-
-
 def _fmt_ts(seconds: float) -> str:
     """Format seconds as HH:MM:SS."""
     if seconds is None or seconds < 0:
@@ -198,6 +190,40 @@ def _fmt_ts(seconds: float) -> str:
     m = int((seconds % 3600) // 60)
     s = int(seconds % 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def _load_cuda_pipeline_with_retry(hf_token: str | None):
+    """Build CUDA pipeline; recover and retry once on cudaErrorUnknown."""
+    from backend.vram_state import recover_cuda
+    from engines.whisper_runtime import is_cuda_recoverable
+
+    for attempt in range(2):
+        try:
+            return _load_cuda_pipeline(hf_token)
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            if attempt == 0 and is_cuda_recoverable(exc):
+                logger.warning(
+                    "Typhoon CUDA load failed (%s); recovering and retrying.",
+                    exc,
+                )
+                recover_cuda()
+                continue
+            raise
+    raise RuntimeError("Typhoon CUDA load failed after retry")
+
+
+def _reload_cuda_pipeline():
+    """Drop cached CUDA pipeline and rebuild after driver/allocator errors."""
+    from backend.vram_state import recover_cuda
+
+    _pipeline_cache.clear()
+    _clear_cuda_cache()
+    recover_cuda()
+    hf_token = os.getenv("HF_TOKEN")
+    pipe = _load_cuda_pipeline_with_retry(hf_token)
+    _pipeline_cache.append(pipe)
+    logger.info("Typhoon Whisper CUDA pipeline reloaded.")
+    return pipe
 
 
 def _load_cuda_pipeline(hf_token: str | None):
@@ -324,18 +350,21 @@ def _load_ov_pipeline(device: str, hf_token: str | None):
 
 def _format_chunks(chunks):
     """Format timestamped chunks into readable lines."""
+    from engines.text_cleanup import clean_transcript_lines, clean_transcript_text
+
     lines = []
     for chunk in chunks:
         ts = chunk.get("timestamp", (None, None))
         c_start, c_end = (ts if ts else (None, None))
-        text = chunk.get("text", "").strip()
+        text = clean_transcript_text(chunk.get("text", "").strip())
         if not text:
             continue
         if c_start is not None:
             lines.append(f"[{_fmt_ts(c_start)} \u2192 {_fmt_ts(c_end)}] {text}")
         else:
             lines.append(text)
-    return "\n".join(lines) if lines else "(no speech detected)"
+    body = "\n".join(lines) if lines else "(no speech detected)"
+    return clean_transcript_lines(body) if lines else body
 
 
 def _get_pipeline():
@@ -353,7 +382,7 @@ def _get_pipeline():
     allow_online_download_if_missing(MODEL_ID, logger)
     logger.info("Loading Typhoon Whisper (%s) on device=%s ...", MODEL_ID, device)
     if uses_pytorch_cuda_pipeline(hw):
-        pipe = _load_cuda_pipeline(hf_token)
+        pipe = _load_cuda_pipeline_with_retry(hf_token)
     elif uses_openvino_pipeline(hw):
         pipe = _load_ov_pipeline(device, hf_token)
     else:
@@ -393,7 +422,7 @@ def _run_pipe(
     pipeline_input = dict(audio_input) if isinstance(audio_input, dict) else audio_input
     kwargs = {
         "batch_size": batch_size,
-        "generate_kwargs": {"language": language, "task": "transcribe", "num_beams": 1},
+        "generate_kwargs": whisper_generate_kwargs(language),
         "return_timestamps": timestamp_mode,
     }
     if chunk_length_s is not None:
@@ -417,117 +446,25 @@ def _run_pipe(
     return result
 
 
-def _run_long_form_asr(
-    pipe,
-    audio_input: dict,
-    language: str,
-    timestamp_mode,
-    engine_name: str,
-    cancel_event=None,
-    window_progress=None,
-) -> dict:
-    """Run ASR in bounded windows and assemble timestamps into the full timeline."""
-    from engines.timestamps import (
-        audio_windows,
-        merge_window_results,
-        normalize_window_chunks,
-        offset_result_timestamps,
-        subdivide_large_chunks,
-    )
+def _whisper_runtime() -> "WhisperRuntime":
+    from engines.whisper_runtime import WhisperRuntime
 
-    window_s = _long_form_window_s()
-    overlap_s = min(_long_form_overlap_s(), max(0, window_s // 3))
-    windows = audio_windows(audio_input, window_s, overlap_s)
-    max_chars_per_subchunk = max(40, _env_int("ASR_MAX_CHARS_PER_SUBCHUNK", 200))
-    logger.info(
-        "%s long-form windowing: windows=%d window=%ds overlap=%ds timestamp_mode=%s",
-        engine_name,
-        len(windows),
-        window_s,
-        overlap_s,
-        timestamp_mode,
-    )
-    results: list[dict] = []
-    total_windows = len(windows)
-    if window_progress:
-        window_progress(0, total_windows)
-    for index, (offset_s, window_input) in enumerate(windows, start=1):
-        if cancel_event and cancel_event.is_set():
-            raise RuntimeError("Job cancelled by user.")
-        window_duration_s = len(window_input["raw"]) / window_input["sampling_rate"]
-        logger.info(
-            "%s ASR window %d/%d started: offset=%.1fs duration=%.1fs",
-            engine_name,
-            index,
-            len(windows),
-            offset_s,
-            window_duration_s,
-        )
-        def _post_process(window_result):
-            normalised = normalize_window_chunks(window_result, window_duration_s)
-            subdivided = subdivide_large_chunks(normalised, max_chars_per_subchunk)
-            return offset_result_timestamps(subdivided, offset_s)
-        try:
-            window_result = _run_pipe(
-                pipe, window_input, language, timestamp_mode, _asr_batch_size()
-            )
-        except Exception as exc:  # pylint: disable=broad-exception-caught
-            if not _is_cuda_oom(exc):
-                raise
-            # Step 1: halve batch (parallel-mode friendly), keeping chunk size.
-            cur_batch = _asr_batch_size()
-            if cur_batch > 1:
-                halved = max(1, cur_batch // 2)
-                logger.warning(
-                    "%s CUDA OOM on window %d/%d at batch=%d; retrying batch=%d.",
-                    engine_name, index, len(windows), cur_batch, halved,
-                )
-                _clear_cuda_cache()
-                try:
-                    window_result = _run_pipe(
-                        pipe, window_input, language, timestamp_mode, halved,
-                    )
-                except Exception as exc2:  # pylint: disable=broad-exception-caught
-                    if not _is_cuda_oom(exc2):
-                        raise
-                    exc = exc2
-                else:
-                    shifted = _post_process(window_result)
-                    logger.info(
-                        "%s ASR window %d/%d finished (recovered batch=%d): chars=%d chunks=%d",
-                        engine_name, index, len(windows), halved,
-                        len(shifted.get("text", "")),
-                        len(shifted.get("chunks") or []),
-                    )
-                    results.append(shifted)
-                    _clear_cuda_cache()
-                    if window_progress:
-                        window_progress(index, total_windows)
-                    continue
-            # Step 2: drop to batch=1 with a smaller chunk and chunk timestamps.
-            retry_chunk_s = _retry_chunk_length_s()
-            logger.warning(
-                "%s CUDA OOM persists on window %d/%d; retrying batch=1 chunk=%ds "
-                "with chunk timestamps.",
-                engine_name, index, len(windows), retry_chunk_s,
-            )
-            _clear_cuda_cache()
-            window_result = _run_pipe(pipe, window_input, language, True, 1, retry_chunk_s)
+    from engines.runtime_backend import uses_pytorch_cuda_pipeline
+    from engines.hardware import detect_hardware
 
-        shifted = _post_process(window_result)
-        logger.info(
-            "%s ASR window %d/%d finished: chars=%d chunks=%d",
-            engine_name,
-            index,
-            len(windows),
-            len(shifted.get("text", "")),
-            len(shifted.get("chunks") or []),
-        )
-        results.append(shifted)
-        _clear_cuda_cache()
-        if window_progress:
-            window_progress(index, total_windows)
-    return merge_window_results(results)
+    reload_fn = _reload_cuda_pipeline if uses_pytorch_cuda_pipeline(detect_hardware()) else None
+    return WhisperRuntime(
+        engine_name="Typhoon",
+        batch_size=_asr_batch_size,
+        chunk_length_s=_chunk_length_s,
+        retry_chunk_length_s=_retry_chunk_length_s,
+        long_form_min_duration_s=_long_form_min_duration_s,
+        long_form_window_s=_long_form_window_s,
+        long_form_overlap_s=_long_form_overlap_s,
+        clear_cuda_cache=_clear_cuda_cache,
+        max_chars_per_subchunk=lambda: max(40, _env_int("ASR_MAX_CHARS_PER_SUBCHUNK", 200)),
+        reload_pipeline=reload_fn,
+    )
 
 
 def transcribe_typhoon(
@@ -535,76 +472,22 @@ def transcribe_typhoon(
     diarization_segments: list | None = None,
     cancel_event=None,
     window_progress=None,
+    max_speakers: int = 0,
 ) -> str:
-    """Transcribe audio using Typhoon Whisper Large v3.
+    """Transcribe audio using Typhoon Whisper Large v3."""
+    from engines.whisper_runtime import transcribe_whisper_audio
 
-    If diarization_segments is provided (pre-computed by the caller),
-    each Whisper chunk is labelled with the overlapping speaker.
-    """
-    pipe = _get_pipeline()
-    audio_input = _load_audio(audio_path)
-    from engines.timestamps import audio_duration_from_input, repair_asr_result
-
-    audio_duration_s = audio_duration_from_input(audio_input)
-    timestamp_mode = _timestamp_mode(diarization_segments)
-    logger.info(
-        "Typhoon transcription started: audio=%.1fs language=%s diarization=%s "
-        "timestamp_mode=%s batch=%d chunk=%ds",
-        audio_duration_s,
+    return transcribe_whisper_audio(
+        audio_path,
         language,
-        bool(diarization_segments),
-        timestamp_mode,
-        _asr_batch_size(),
-        _chunk_length_s(),
+        diarization_segments,
+        _get_pipeline(),
+        _load_audio,
+        _run_pipe,
+        _whisper_runtime(),
+        _timestamp_mode(diarization_segments),
+        _format_chunks,
+        cancel_event=cancel_event,
+        window_progress=window_progress,
+        max_speakers=max_speakers,
     )
-    if audio_duration_s >= _long_form_min_duration_s():
-        result = _run_long_form_asr(
-            pipe, audio_input, language, timestamp_mode, "Typhoon", cancel_event,
-            window_progress=window_progress,
-        )
-    else:
-        if window_progress:
-            window_progress(0, 1)
-        if cancel_event and cancel_event.is_set():
-            raise RuntimeError("Job cancelled by user.")
-        try:
-            result = _run_pipe(pipe, audio_input, language, timestamp_mode, _asr_batch_size())
-        except Exception as exc:  # pylint: disable=broad-exception-caught
-            if not _is_cuda_oom(exc):
-                raise
-            cur_batch = _asr_batch_size()
-            recovered = False
-            if cur_batch > 1:
-                halved = max(1, cur_batch // 2)
-                logger.warning(
-                    "Typhoon CUDA OOM at batch=%d; retrying batch=%d.",
-                    cur_batch, halved,
-                )
-                _clear_cuda_cache()
-                try:
-                    result = _run_pipe(pipe, audio_input, language, timestamp_mode, halved)
-                    recovered = True
-                except Exception as exc2:  # pylint: disable=broad-exception-caught
-                    if not _is_cuda_oom(exc2):
-                        raise
-            if not recovered:
-                retry_chunk_s = _retry_chunk_length_s()
-                logger.warning(
-                    "Typhoon CUDA OOM persists; retrying batch=1, chunk=%ds, chunk timestamps.",
-                    retry_chunk_s,
-                )
-                _clear_cuda_cache()
-                result = _run_pipe(pipe, audio_input, language, True, 1, retry_chunk_s)
-        if window_progress:
-            window_progress(1, 1)
-    result = repair_asr_result(result, audio_duration_s, "Typhoon", logger)
-
-    if diarization_segments:
-        from engines.diarization import assign_speakers
-        return assign_speakers(result, diarization_segments)
-
-    chunks = result.get("chunks", [])
-    if chunks:
-        return _format_chunks(chunks)
-
-    return result.get("text", "").strip() or "(no speech detected)"

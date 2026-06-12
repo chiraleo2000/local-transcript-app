@@ -203,8 +203,25 @@ def _chunk_sort_key(chunk: dict) -> tuple[float, float]:
     )
 
 
+def _strip_prefix_overlap(new_text: str, previous_text: str) -> str:
+    """Remove cumulative prefix when overlapped windows repeat earlier transcript."""
+    new_text = new_text.strip()
+    previous_text = previous_text.strip()
+    if not new_text or not previous_text:
+        return new_text
+    if new_text == previous_text:
+        return ""
+    if new_text.startswith(previous_text):
+        return new_text[len(previous_text) :].strip()
+    new_words = new_text.split()
+    prev_words = previous_text.split()
+    if len(new_words) >= len(prev_words) and new_words[: len(prev_words)] == prev_words:
+        return " ".join(new_words[len(prev_words) :]).strip()
+    return new_text
+
+
 def _dedupe_overlapped_chunks(chunks: list[dict]) -> list[dict]:
-    """Drop chunks fully covered by an earlier overlapped window."""
+    """Drop or trim chunks duplicated by overlapped long-form ASR windows."""
     ordered = sorted(chunks, key=_chunk_sort_key)
     kept: list[dict] = []
     last_end = -1.0
@@ -213,9 +230,21 @@ def _dedupe_overlapped_chunks(chunks: list[dict]) -> list[dict]:
         text = chunk.get("text", "").strip()
         if not text:
             continue
-        if start is not None and end is not None:
+        if start is not None and end is not None and kept:
             if float(end) <= last_end + 0.25 and _is_recent_duplicate_text(text, kept):
                 continue
+            if float(start) < last_end + 1.0:
+                prev_text = kept[-1].get("text", "").strip()
+                trimmed = _strip_prefix_overlap(text, prev_text)
+                if not trimmed:
+                    last_end = max(last_end, float(end))
+                    continue
+                if trimmed != text:
+                    chunk = dict(chunk)
+                    chunk["text"] = trimmed
+                    text = trimmed
+            last_end = max(last_end, float(end))
+        elif start is not None and end is not None:
             last_end = max(last_end, float(end))
         kept.append(chunk)
     return kept

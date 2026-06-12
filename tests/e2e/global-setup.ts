@@ -1,6 +1,6 @@
 import { request } from "@playwright/test";
 
-const baseURL = process.env.E2E_BASE_URL ?? "http://localhost:7896";
+const baseURL = process.env.E2E_BASE_URL ?? "http://localhost:7987";
 
 export default async function globalSetup(): Promise<void> {
   const client = await request.newContext();

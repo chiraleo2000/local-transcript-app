@@ -1,15 +1,13 @@
 """Three-stage audio preprocessing for improved ASR accuracy.
 
 Stage 1 — FFmpeg:
-  highpass/lowpass bandpass → 16 kHz mono WAV (format conversion only)
+  bandpass → loudnorm → 16 kHz mono WAV
 
 Stage 2 — noisereduce (spectral gating):
-  Non-stationary spectral gating for adaptive noise reduction.
-  Much better than ffmpeg afftdn for speech with varying background noise.
+  Non-stationary spectral gating; optional leading-noise profile.
 
 Stage 3 — pedalboard (Spotify):
-  NoiseGate (silence background) → Compressor (gentle) → Limiter →
-    controlled peak gain for clearer, louder speech
+  Highpass → NoiseGate → Compressor → Limiter → controlled peak gain
 """
 
 import glob
@@ -124,35 +122,40 @@ def _db_to_amp(db_value: float) -> float:
     return float(10 ** (db_value / 20.0))
 
 
-# ---------------------------------------------------------------------------
-# Stage 1: FFmpeg — format conversion + bandpass only
-# ---------------------------------------------------------------------------
-# Only strip rumble (<80 Hz) and hiss (>8 kHz), convert to 16 kHz mono WAV.
-# Actual noise reduction is handled by noisereduce in Stage 2.
-
-_FILTERS = ",".join([
-    "highpass=f=80",
-    "lowpass=f=8000",
-])
+def _ffmpeg_filter_chain() -> str:
+    """Bandpass + optional atempo + EBU loudnorm for consistent speech level before NR/DSP."""
+    loudnorm_i = _env_float("AUDIO_ENHANCE_LOUDNORM_I", -14.0)
+    filters = [
+        "highpass=f=80",
+        "lowpass=f=8000",
+    ]
+    atempo = _env_float("AUDIO_ENHANCE_ATEMPO", 1.0)
+    if 0.5 <= atempo <= 2.0 and abs(atempo - 1.0) > 0.01:
+        filters.append(f"atempo={atempo:.3f}")
+    filters.append(f"loudnorm=I={loudnorm_i}:TP=-1.0:LRA=9")
+    return ",".join(filters)
 
 
 def _ffmpeg_stage(audio_path: str, out_path: str) -> bool:
-    """Run FFmpeg bandpass + format conversion. Returns True on success."""
+    """Run FFmpeg bandpass + loudnorm + format conversion. Returns True on success."""
     if not _FFMPEG_EXE:
         logger.error("ffmpeg not found — cannot run Stage 1.")
         return False
 
+    filters = _ffmpeg_filter_chain()
+    threads = max(1, int(os.getenv("APP_CPU_THREADS", "16") or "16"))
     cmd = [
         _FFMPEG_EXE, "-y",
+        "-threads", str(threads),
         "-i", audio_path,
-        "-af", _FILTERS,
+        "-af", filters,
         "-ar", "16000",
         "-ac", "1",
         "-sample_fmt", "s16",
         "-f", "wav",
         out_path,
     ]
-    logger.debug("ffmpeg stage: %s", " ".join(cmd))
+    logger.info("Preprocessing [Stage 1 — FFmpeg]: %s", filters)
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=False)
         if result.returncode != 0:
@@ -162,14 +165,18 @@ def _ffmpeg_stage(audio_path: str, out_path: str) -> bool:
     except subprocess.TimeoutExpired:
         logger.error("ffmpeg stage timed out.")
         return False
-    except (subprocess.SubprocessError, OSError) as exc:
-        logger.error("ffmpeg stage error: %s", exc)
+    except (subprocess.SubprocessError, OSError):
+        logger.exception("ffmpeg stage error")
         return False
 
 
 # ---------------------------------------------------------------------------
 # Stage 2: noisereduce — spectral gating
 # ---------------------------------------------------------------------------
+
+def _noise_profile_seconds() -> float:
+    return max(0.25, _env_float("AUDIO_ENHANCE_NOISE_PROFILE_SECONDS", 0.75))
+
 
 def _noisereduce_stage(wav_path: str, out_path: str) -> bool:
     """Apply non-stationary spectral gating noise reduction. Returns True on success."""
@@ -179,19 +186,36 @@ def _noisereduce_stage(wav_path: str, out_path: str) -> bool:
         import noisereduce as nr  # pylint: disable=import-outside-toplevel
 
         y, sr = librosa.load(wav_path, sr=16000, mono=True)
-        reduced = nr.reduce_noise(
-            y=y,
-            sr=sr,
-            stationary=False,   # adaptive — tracks changing noise
-            prop_decrease=_env_float("AUDIO_ENHANCE_NOISE_REDUCTION", 0.65),
-            n_fft=2048,
-            freq_mask_smooth_hz=500,
-            time_mask_smooth_ms=50,
-        )
+        prop_decrease = _env_float("AUDIO_ENHANCE_NOISE_REDUCTION", 0.92)
+        profile_mode = os.getenv("AUDIO_ENHANCE_NOISE_PROFILE", "leading").strip().lower()
+        nr_kwargs: dict = {
+            "y": y,
+            "sr": sr,
+            "prop_decrease": prop_decrease,
+            "n_fft": 2048,
+            "freq_mask_smooth_hz": 500,
+            "time_mask_smooth_ms": 50,
+        }
+        if profile_mode == "leading":
+            profile_samples = int(_noise_profile_seconds() * sr)
+            if profile_samples > 0 and len(y) > profile_samples * 2:
+                nr_kwargs["y_noise"] = y[:profile_samples]
+                nr_kwargs["stationary"] = True
+                logger.info(
+                    "noisereduce leading-noise profile: first %.2fs, prop=%.2f",
+                    profile_samples / sr,
+                    prop_decrease,
+                )
+            else:
+                nr_kwargs["stationary"] = False
+        else:
+            nr_kwargs["stationary"] = False
+
+        reduced = nr.reduce_noise(**nr_kwargs)
         sf.write(out_path, reduced, sr, subtype="PCM_16")
         return True
-    except (OSError, ValueError, RuntimeError) as exc:
-        logger.error("noisereduce stage error: %s", exc)
+    except (OSError, ValueError, RuntimeError):
+        logger.exception("noisereduce stage error")
         return False
 
 
@@ -200,18 +224,21 @@ def _noisereduce_stage(wav_path: str, out_path: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def _pedalboard_stage(wav_path: str, out_path: str) -> bool:
-    """Apply NoiseGate → Compressor → Limiter, then controlled peak gain."""
+    """Apply highpass → gate → compress → limit, then controlled peak gain."""
     try:
-        from pedalboard import Pedalboard, NoiseGate, Compressor, Limiter  # pylint: disable=import-outside-toplevel
+        from pedalboard import (  # pylint: disable=import-outside-toplevel
+            Pedalboard,
+            NoiseGate,
+            Compressor,
+            Limiter,
+            HighpassFilter,
+        )
         from pedalboard.io import AudioFile  # pylint: disable=import-outside-toplevel
 
         board = Pedalboard([
-            # Very soft gate — only kills true silence below -50dB.
-            # -30dB was cutting soft speech (e.g. quieter speakers, pauses mid-sentence).
+            HighpassFilter(cutoff_frequency_hz=80),
             NoiseGate(threshold_db=-50, ratio=4.0, attack_ms=5.0, release_ms=200.0),
-            # Gentle compression only
-            Compressor(threshold_db=-18, ratio=2.5, attack_ms=10.0, release_ms=200.0),
-            # Hard limit — no clipping
+            Compressor(threshold_db=-24, ratio=3.0, attack_ms=8.0, release_ms=180.0),
             Limiter(threshold_db=-1.0, release_ms=50.0),
         ])
 
@@ -224,8 +251,8 @@ def _pedalboard_stage(wav_path: str, out_path: str) -> bool:
         # Lift quiet speech to a clearer level, but cap gain so background noise
         # does not explode on very noisy or almost-silent recordings.
         peak = np.max(np.abs(processed))
-        target_peak = _db_to_amp(_env_float("AUDIO_ENHANCE_TARGET_PEAK_DB", -3.0))
-        max_gain = _db_to_amp(_env_float("AUDIO_ENHANCE_MAX_GAIN_DB", 10.0))
+        target_peak = _db_to_amp(_env_float("AUDIO_ENHANCE_TARGET_PEAK_DB", -1.5))
+        max_gain = _db_to_amp(_env_float("AUDIO_ENHANCE_MAX_GAIN_DB", 18.0))
         if peak > 0.001:
             gain = min(max_gain, target_peak / peak)
             if gain > 1.0:
@@ -238,17 +265,17 @@ def _pedalboard_stage(wav_path: str, out_path: str) -> bool:
             f.write(processed)
 
         return True
-    except (OSError, ValueError, RuntimeError) as exc:
-        logger.error("pedalboard stage error: %s", exc)
+    except (OSError, ValueError, RuntimeError):
+        logger.exception("pedalboard stage error")
         return False
 
 
 def preprocess_audio(audio_path: str) -> str:
     """Three-stage audio enhancement for ASR.
 
-    Stage 1 (FFmpeg): bandpass → 16 kHz mono WAV.
-    Stage 2 (noisereduce): non-stationary spectral gating.
-    Stage 3 (pedalboard): noise gate → compressor → limiter → capped speech gain.
+    Stage 1 (FFmpeg): bandpass + loudnorm → 16 kHz mono WAV.
+    Stage 2 (noisereduce): spectral gating (optional leading-noise profile).
+    Stage 3 (pedalboard): highpass → gate → compress → limit → capped speech gain.
 
     Returns path to enhanced WAV, or original path on failure.
     """
@@ -263,7 +290,7 @@ def preprocess_audio(audio_path: str) -> str:
     final_path  = os.path.join(work_dir, f"{stem}_enhanced.wav")
 
     t0 = time.perf_counter()
-    logger.info("Preprocessing [Stage 1 — FFmpeg bandpass]: %s", audio_path)
+    logger.info("Preprocessing [Stage 1 — FFmpeg bandpass + loudnorm]: %s", audio_path)
 
     if not _ffmpeg_stage(audio_path, stage1_path):
         logger.warning("Stage 1 failed — using original audio.")

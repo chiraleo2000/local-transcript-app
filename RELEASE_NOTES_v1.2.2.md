@@ -45,3 +45,25 @@ docker compose -f docker-compose.openvino.yml up -d --build
 - `backend/services/hardware_policy.py` — ARM arch detection
 - `engines/typhoon_asr.py`, `engines/pathumma_asr.py` — ROCm/OpenVINO/CPU routing
 - `launcher.py`, `run.sh`, `installer/install.sh`, `installer/LocalTranscriptApp.iss`
+
+---
+
+## v1.2.2 GPU Docker stability (8 GB class)
+
+### 16-core CPU for enhancement and diarization preprocessing
+
+- `docker-compose.gpu.yml`: `cpus: "16"`, `APP_CPU_THREADS=16`, OMP/MKL/OpenBLAS thread caps
+- `backend/cpu_limits.py` — applied at app startup
+- FFmpeg `-threads` in `engines/preprocess.py`
+
+### CUDA stability (`cudaErrorUnknown`)
+
+- `backend/vram_state.py` — `cuda_device_healthy()` probe and `recover_cuda()`
+- Diarization double-guard: 8 GB class and unhealthy CUDA force CPU inference
+- ASR stays loaded when `ASR_KEEP_PRELOADED=true` (no diarization `release_after_job` eviction)
+- ASR reload skip when model resident and CUDA healthy
+- CUDA load retry in Typhoon/Pathumma on `cudaErrorUnknown`
+
+### Image tags
+
+- `local-transcript-app:1.2.2`, `APP_VERSION=1.2.2`

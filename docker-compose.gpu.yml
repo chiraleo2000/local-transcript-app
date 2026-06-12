@@ -5,23 +5,37 @@
 #   Windows: Docker Desktop → Settings → Resources → GPU → Enable GPU → Apply & Restart
 #   Linux:   sudo apt install nvidia-container-toolkit && sudo systemctl restart docker
 #
-# Usage:
-#   docker compose -f docker-compose.gpu.yml up -d --build   (first run, builds image)
-#   docker compose -f docker-compose.gpu.yml up -d           (subsequent runs)
-#   docker compose -f docker-compose.gpu.yml down            (stop)
+# Default GPU compose points at v1.2.3 (local-transcript-app-123).
+# Run both versions side by side:
+#   docker compose -p transcript-122 -f docker-compose.gpu.v122.yml up -d --build   # :7988
+#   docker compose -p transcript-123 -f docker-compose.gpu.v123.yml up -d --build   # :7987
 services:
   transcription:
+    image: local-transcript-app-123
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: transcription-service
+      tags:
+        - local-transcript-app-123
+        - local-transcript-app:latest
+    container_name: transcription-service-123
     restart: unless-stopped
+    shm_size: "4gb"
     ports:
-      - "7896:7896"
+      - "7987:7896"
     env_file:
       - .env
+    # environment: values below override .env (prevents stale local .env breaking GPU deploy)
     environment:
+      - APP_VERSION=1.2.3
+      - GRADIO_SERVER_PORT=7896
       - GRADIO_SERVER_NAME=0.0.0.0
+      - APP_CPU_THREADS=16
+      - OMP_NUM_THREADS=16
+      - MKL_NUM_THREADS=16
+      - OPENBLAS_NUM_THREADS=16
+      - NUMEXPR_NUM_THREADS=16
+      - TOKENIZERS_PARALLELISM=false
       - PYTHONPATH=/app
       - APP_MODEL_ROOT=/app/models
       - HF_HOME=/app/models/hf_cache
@@ -51,36 +65,86 @@ services:
       - ASR_8GB_CLASS_MAX_MB=9000
       - ASR_CLEAR_VRAM_AFTER_JOB=false
       - ASR_CLEAR_VRAM_BETWEEN_ENGINES=false
-      - ASR_DEFAULT_ENGINES=Typhoon Whisper
-      - ASR_CUDA_BATCH_SIZE=8
-      - ASR_8GB_BATCH_SIZE=8
-      - ASR_8GB_MAX_BATCH_SIZE=8
-      - ASR_CUDA_MEMORY_FRACTION=0.92
-      - ASR_CHUNK_LENGTH_S=30
-      - ASR_8GB_CHUNK_LENGTH_S=30
-      - ASR_8GB_MAX_CHUNK_LENGTH_S=30
-      - ASR_8GB_RETRY_CHUNK_LENGTH_S=10
+      - ASR_UNLOAD_FOR_DIARIZATION=false
+      - ASR_SUPPRESS_HALLUCINATIONS=true
+      - ASR_CONDITION_ON_PREVIOUS_TEXT=false
+      - ASR_TEMPERATURE=0.0
+      - ASR_COMPRESSION_RATIO_THRESHOLD=1.8
+      - ASR_LOGPROB_THRESHOLD=-0.8
+      - ASR_NO_SPEECH_THRESHOLD=0.5
+      - ASR_DEFAULT_ENGINES=Pathumma Whisper
+      - ASR_QUALITY_PROFILE=high
+      - ASR_CUDA_BATCH_SIZE=4
+      - ASR_BATCH_MIN_FREE_MB=2500
+      - ASR_WINDOW_CLEAR_MIN_FREE_MB=1800
+      - ASR_8GB_BATCH_SIZE=4
+      - ASR_8GB_MAX_BATCH_SIZE=4
+      - ASR_CUDA_MEMORY_FRACTION=0.80
+      - ASR_CHUNK_LENGTH_S=300
+      - ASR_8GB_CHUNK_LENGTH_S=90
+      - ASR_8GB_MAX_CHUNK_LENGTH_S=90
+      - ASR_8GB_RETRY_CHUNK_LENGTH_S=15
+      - ASR_MIN_CHUNKED_DURATION_S=120
+      - ASR_8GB_ALLOW_LARGE_CHUNKS=true
+      - ASR_MAX_CONCURRENT_INFERENCE=1
+      - ASR_UNLOAD_ON_CANCEL=false
+      - UI_CANCEL_JOIN_TIMEOUT_S=120
+      - DIARIZATION_TRANSCRIPT_MERGE_GAP_S=2.0
+      - DIARIZATION_ASSIGN_TURN_MERGE_GAP_S=8.0
       - ASR_WORD_TIMESTAMPS_WITH_DIARIZATION=true
       - TYPHOON_WORD_TIMESTAMPS_ON_8GB=false
       - PATHUMMA_WORD_TIMESTAMPS_ON_8GB=false
       - ASR_LONG_FORM_MIN_DURATION_S=300
-      - ASR_LONG_FORM_WINDOW_S=360
-      - ASR_LONG_FORM_OVERLAP_S=30
+      - ASR_LONG_FORM_WINDOW_S=300
+      - ASR_LONG_FORM_OVERLAP_S=45
       - ASR_SUSPICIOUS_FIRST_TS_S=60
       - ASR_TIMESTAMP_AUDIO_END_TOLERANCE_S=30
       - ASR_MAX_CHUNK_CHARS_PER_SECOND=35
       - ASR_ATTENTION_IMPLEMENTATION=sdpa
       - ASR_PRELOAD_MODE=eager
-      - AUDIO_ENHANCE_DEFAULT=false
-      - AUDIO_ENHANCE_TARGET_PEAK_DB=-3.0
-      - AUDIO_ENHANCE_MAX_GAIN_DB=10.0
-      - AUDIO_ENHANCE_NOISE_REDUCTION=0.65
+      - ASR_KEEP_PRELOADED=true
+      - ASR_CLEAR_VRAM_ON_MEDIA_CHANGE=false
+      - UI_PREVIEW_MAX_MB=32
+      - UI_PREVIEW_MAX_DURATION_S=300
+      - UI_TRANSCRIPT_MAX_CHARS=100000
+      - UI_TRANSCRIPT_MAX_LINES=500
+      # GPU pipeline slots (queued when busy). Gradio tab concurrency is separate.
+      # Restart container after changing this value (semaphore is fixed at startup).
+      - UI_MAX_CONCURRENT_JOBS=4
+      - UI_GRADIO_TRANSCRIBE_CONCURRENCY=8
+      - AUDIO_ENHANCE_DEFAULT=true
+      - AUDIO_ENHANCE_WHEN_DIARIZATION=true
+      - AUDIO_ENHANCE_TARGET_PEAK_DB=-1.5
+      - AUDIO_ENHANCE_MAX_GAIN_DB=18
+      - AUDIO_ENHANCE_NOISE_REDUCTION=0.92
+      - AUDIO_ENHANCE_LOUDNORM_I=-14
+      - AUDIO_ENHANCE_ATEMPO=0.92
+      - AUDIO_ENHANCE_NOISE_PROFILE=leading
+      - AUDIO_ENHANCE_NOISE_PROFILE_SECONDS=0.75
       - DIARIZATION_MODEL_ID=pyannote/speaker-diarization-community-1
-      - DIARIZATION_DEVICE=cuda
+      # Auto: CUDA diarization when free VRAM allows ASR co-resident; else CPU.
+      - DIARIZATION_DEVICE=auto
+      - DIARIZATION_GPU_CO_RESIDENT=true
+      - DIARIZATION_KEEP_PRELOADED=true
       - DIARIZATION_PRELOAD_MODE=eager
+      - DIARIZATION_PRELOAD_DEVICE=cpu
       - DIARIZATION_CUDA_MIN_VRAM_MB=6000
-      - DIARIZATION_CUDA_MIN_FREE_MB=0
-      - DIARIZATION_ALLOW_8GB_CUDA=true
+      - DIARIZATION_CUDA_MIN_FREE_MB=3072
+      - DIARIZATION_ALLOW_8GB_CUDA=false
+      - DIARIZATION_ACCURACY_MODE=true
+      # PASSES=0 = one adaptive diarization pass (fast). Set FULL_GRID=true or PASSES>0 to sweep.
+      - DIARIZATION_MULTI_SAMPLE=true
+      - DIARIZATION_MULTI_SAMPLE_PASSES=6
+      - DIARIZATION_MULTI_SAMPLE_FULL_GRID=false
+      - DIARIZATION_REFINE_AFTER_SEGMENTED=true
+      - DIARIZATION_MEGA_TURN_MAX_REFINES=10
+      - DIARIZATION_MEGA_TURN_RETRY_S=90
+      - DIARIZATION_CHUNK_ALIGN_MIN_OVERLAP_S=1.5
+      - DIARIZATION_ASSIGN_TURN_MERGE_GAP_S=2.5
+      - DIARIZATION_PREPROCESS_SR=44100
+      - DIARIZATION_SEGMENT_S=360
+      - DIARIZATION_SEGMENT_OVERLAP_S=90
+      - DIARIZATION_MAX_ASR_WINDOW_S=300
       # Hyperparameter overrides intentionally omitted: community-1 ships with
       # training-tuned defaults that out-perform manual overrides for most audio.
       # Uncomment and set values >= 0 only if you have characterised your domain.
@@ -96,7 +160,10 @@ services:
       - ./storage:/app/storage
     deploy:
       resources:
+        limits:
+          cpus: "16"
         reservations:
+          cpus: "4"
           devices:
             - driver: nvidia
               count: all

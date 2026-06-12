@@ -1,4 +1,4 @@
-import { expect, test, type Page, type APIRequestContext } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 
 import fs from "fs";
 
@@ -124,124 +124,18 @@ function statusBanner(page: Page) {
 
 
 
-function progressPanel(page: Page) {
-
-  return page.locator("#job-progress .job-progress-panel");
-
+function elapsedTimer(page: Page) {
+  return page.locator("#elapsed-timer");
 }
 
-
-
-function progressFill(page: Page) {
-
-  return page.locator("#job-progress .progress-fill");
-
-}
-
-
-
-async function readProgressApi(request: APIRequestContext): Promise<{
-
-  active: boolean;
-
-  percent: number;
-
-  elapsed_s: number;
-
-  remaining_s: number | null;
-
-  phase: string;
-
-}> {
-
-  const response = await request.get("/job/progress");
-
-  expect(response.ok(), "/job/progress should return 2xx").toBeTruthy();
-
-  return response.json();
-
-}
-
-
-
-async function assertProgressDuringJob(page: Page): Promise<void> {
-
-  const panel = progressPanel(page);
-
-  await expect(panel).toBeVisible({ timeout: 60_000 });
-
-
-
-  const elapsed = page.locator("#job-progress .progress-elapsed strong");
-
-  const remaining = page.locator("#job-progress .progress-remaining strong");
-
-  await expect(elapsed).toBeVisible();
-
-  await expect(remaining).toBeVisible();
-
-
-
-  const fill = progressFill(page);
-
-  await expect(fill).toBeVisible();
-
-
-
-  let firstPct = -1;
-
-  let lastPct = -1;
-
-  let lastElapsed = -1;
-
-
-
-  for (let i = 0; i < 20; i += 1) {
-
-    const api = await readProgressApi(page.request);
-
-    const attr = await fill.getAttribute("data-progress");
-
-    const pct = attr ? Number.parseFloat(attr) : api.percent;
-
-    const elapsedVal = api.elapsed_s;
-
-
-
-    if (firstPct < 0 && pct > 0) {
-
-      firstPct = pct;
-
-    }
-
-    lastPct = Math.max(lastPct, pct);
-
-    if (elapsedVal >= lastElapsed) {
-
-      lastElapsed = elapsedVal;
-
-    }
-
-
-
-    if (api.phase === "done" || pct >= 100) {
-
-      break;
-
-    }
-
-    await page.waitForTimeout(400);
-
-  }
-
-
-
-  expect(firstPct, "progress bar should move above 0% during job").toBeGreaterThan(0);
-
-  expect(lastElapsed, "elapsed timer should increment").toBeGreaterThanOrEqual(0);
-
-  expect(lastPct, "progress should advance during job").toBeGreaterThan(0);
-
+async function assertStopwatchDuringJob(page: Page): Promise<void> {
+  const timer = elapsedTimer(page);
+  await expect(timer).toBeVisible({ timeout: 60_000 });
+  const first = (await timer.textContent()) ?? "";
+  expect(first).toMatch(/Elapsed Time:/);
+  await page.waitForTimeout(1200);
+  const second = (await timer.textContent()) ?? "";
+  expect(second).not.toBe(first);
 }
 
 
@@ -255,14 +149,6 @@ async function waitForTranscriptionDone(page: Page, timeoutMs: number): Promise<
   await expect(status).toHaveClass(/done/, { timeout: timeoutMs });
 
   await expect(status).not.toHaveClass(/error/);
-
-
-
-  const panel = progressPanel(page);
-
-  await expect(panel).toHaveAttribute("data-phase", "done", { timeout: 30_000 });
-
-  await expect(progressFill(page)).toHaveAttribute("data-progress", /100(\.0)?/);
 
 }
 
@@ -278,7 +164,7 @@ async function readTranscript(page: Page): Promise<string> {
 
   }
 
-  const transcript = page.locator("#typhoon-transcript textarea");
+  const transcript = page.locator("#output-transcript textarea");
 
   await expect(transcript).toBeVisible();
 
@@ -336,21 +222,15 @@ test.describe("Local Transcript App — container UI", () => {
 
     await expect(statusBanner(page)).toHaveClass(/idle|done/);
 
-    await expect(progressPanel(page)).toHaveAttribute("data-phase", "idle");
-
-
-
-    const idleApi = await readProgressApi(page.request);
-
-    expect(idleApi.phase).toBe("idle");
-
-    expect(idleApi.percent).toBe(0);
-
+    const idleApi = await page.request.get("/job/progress");
+    expect(idleApi.ok()).toBeTruthy();
+    const idleBody = await idleApi.json();
+    expect(idleBody.phase).toBe("idle");
   });
 
 
 
-  test("small audio: upload, transcribe, progress bar and timer", async ({ page }) => {
+  test("small audio: upload, transcribe, stopwatch", async ({ page }) => {
 
     test.setTimeout(SMALL_TRANSCRIBE_MS + MODEL_READY_MS);
 
@@ -374,7 +254,7 @@ test.describe("Local Transcript App — container UI", () => {
 
     await waitForJobStarted(page, 60_000);
 
-    await assertProgressDuringJob(page);
+    await assertStopwatchDuringJob(page);
 
     await waitForTranscriptionDone(page, SMALL_TRANSCRIBE_MS);
 
@@ -386,7 +266,7 @@ test.describe("Local Transcript App — container UI", () => {
 
 
 
-    const elapsed = page.locator("#typhoon-elapsed textarea, #typhoon-elapsed input");
+    const elapsed = page.locator("#output-elapsed textarea, #output-elapsed input");
 
     await expect(elapsed.first()).toBeVisible();
 
@@ -406,7 +286,7 @@ test.describe("Local Transcript App — container UI", () => {
 
 
 
-  test("large audio: upload, transcribe, sustained progress UI", async ({ page }) => {
+  test("large audio: upload, transcribe, sustained stopwatch UI", async ({ page }) => {
 
     test.setTimeout(LARGE_TRANSCRIBE_MS + MODEL_READY_MS);
 
@@ -436,7 +316,7 @@ test.describe("Local Transcript App — container UI", () => {
 
     await waitForJobStarted(page, 120_000);
 
-    await assertProgressDuringJob(page);
+    await assertStopwatchDuringJob(page);
 
     await waitForTranscriptionDone(page, LARGE_TRANSCRIBE_MS);
 
@@ -452,13 +332,10 @@ test.describe("Local Transcript App — container UI", () => {
 
     await expect(page.getByRole("heading", { name: "Local Transcript App" })).toBeVisible();
 
-
-
-    const doneApi = await readProgressApi(page.request);
-
-    expect(doneApi.phase).toBe("done");
-
-    expect(doneApi.percent).toBe(100);
+    const doneApi = await page.request.get("/job/progress");
+    expect(doneApi.ok()).toBeTruthy();
+    const doneBody = await doneApi.json();
+    expect(doneBody.phase).toBe("done");
 
 
 

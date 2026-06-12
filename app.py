@@ -7,12 +7,12 @@ from __future__ import annotations
 import importlib.machinery
 import logging
 import os
-import re
 import sys
 import threading
 import time
 import types
 import warnings
+from dataclasses import dataclass
 
 from dotenv import load_dotenv
 
@@ -26,6 +26,10 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 _install_root = app_root()
 load_dotenv(_install_root / ".env")
 load_dotenv(_install_root / ".env.production", override=False)
+
+from backend.cpu_limits import apply_cpu_thread_limits
+
+apply_cpu_thread_limits()
 
 _model_root = os.getenv("APP_MODEL_ROOT") or str(_install_root / "models")
 if not os.path.isabs(_model_root):
@@ -114,26 +118,40 @@ def _patch_gradio_schema_parser() -> None:
 
 _patch_gradio_schema_parser()
 
-from backend.pipeline import run_transcription_job
-from backend.progress import get_job_progress
+from backend.job_cancel import cancel_tab_job
+from backend.pipeline import JobMeta, active_job_count, run_transcription_job
+from backend.progress import JobProgress, get_job_progress
+from backend.ui_session import (
+    clear_active_job,
+    fresh_cancel_event,
+    init_tab_instance_id,
+    is_job_running,
+    resolve_runtime,
+    set_active_job,
+)
 from backend.services.asr_local import (
     ALL_ENGINES,
     ENGINE_PATHUMMA,
-    ENGINE_TYPHOON,
     LANGUAGES,
     clear_accelerator_cache,
     default_asr_engines,
     load_model,
+    switch_asr_engine,
 )
-from backend.services.correction_local import correct_with_local_llm
+from backend.storage import ensure_app_dirs, list_jobs, load_job
 from backend.services.hardware_policy import detect_hardware, hardware_summary
-from backend.services.media_pipeline import enhance_audio
-from backend.storage import ensure_app_dirs, save_transcript
+from backend.ui_limits import (
+    display_transcript_text as _display_transcript_text,
+    format_media_info as _format_media_info,
+    media_too_large_for_browser as _media_too_large_for_browser,
+)
+from backend.services.media_pipeline import clear_prejob_caches
 
 
 LABEL_ELAPSED = "Elapsed Time"
 LABEL_DOWNLOAD = "Download .txt"
 _CANCELLED = "(cancelled)"
+_MSG_CANCELLED = "Cancelled."
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv", ".wmv", ".m4v", ".ts"}
 
 APP_CSS = """
@@ -173,34 +191,14 @@ APP_CSS = """
 .job-progress-panel.done { border-color: #bbf7d0; background: #f0fdf4; }
 .job-progress-panel.error { border-color: #fecaca; background: #fef2f2; }
 .job-progress-panel.idle { opacity: 0.85; }
-.progress-label { font-weight: 600; font-size: 14px; margin-bottom: 8px; color: #3f3f46; }
-.progress-track {
-    height: 14px;
-    border-radius: 999px;
-    background: #e4e4e7;
-    overflow: hidden;
-    margin-bottom: 10px;
-}
-.progress-fill {
-    height: 100%;
-    border-radius: 999px;
-    background: linear-gradient(90deg, #2563eb, #3b82f6);
-    transition: width 0.35s ease;
-    min-width: 2%;
-}
-.job-progress-panel.done .progress-fill {
-    background: linear-gradient(90deg, #16a34a, #22c55e);
-}
-.progress-meta {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 12px 24px;
-    font-size: 14px;
-    color: #52525b;
+.job-status-label { font-weight: 600; font-size: 14px; margin-bottom: 8px; color: #3f3f46; }
+#elapsed-timer {
+    font-size: 20px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    color: #18181b;
     margin-bottom: 6px;
 }
-.progress-meta strong { color: #18181b; font-variant-numeric: tabular-nums; }
-.progress-pct { margin-left: auto; font-weight: 700; color: #2563eb; }
 .progress-message { font-size: 13px; color: #71717a; }
 @keyframes live-pulse {
     0%, 100% { opacity: 1.0; }
@@ -209,13 +207,61 @@ APP_CSS = """
 @media (max-width: 900px) {
     .config-landscape { flex-wrap: wrap; }
 }
+#tab-instance-id { display: none !important; }
+"""
+
+# sessionStorage is per browser tab — isolates cancel/progress from other tabs/users.
+TAB_INSTANCE_SCRIPT = """
+<script>
+(function initTabInstanceId() {
+  const KEY = 'lta_tab_instance_id';
+  function apply() {
+    const host = document.getElementById('tab-instance-id');
+    if (!host) return false;
+    const input = host.querySelector('textarea, input');
+    if (!input) return false;
+    let id = sessionStorage.getItem(KEY);
+    if (!id && input.value && input.value.trim()) {
+      id = input.value.trim();
+      sessionStorage.setItem(KEY, id);
+    }
+    if (!id) {
+      id = (typeof crypto !== 'undefined' && crypto.randomUUID)
+        ? crypto.randomUUID()
+        : ('tab_' + Date.now() + '_' + Math.random().toString(36).slice(2));
+      sessionStorage.setItem(KEY, id);
+    }
+    if (input.value !== id) {
+      input.value = id;
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    return true;
+  }
+  if (!apply()) {
+    const obs = new MutationObserver(function() { if (apply()) obs.disconnect(); });
+    obs.observe(document.body, { childList: true, subtree: true });
+    setTimeout(function() { obs.disconnect(); }, 15000);
+  }
+})();
+</script>
 """
 
 _models_ready = threading.Event()
-_cancel_event = threading.Event()
 _load_status = dict.fromkeys(ALL_ENGINES, "pending")
 _last_load_status_text: str | None = None
 _last_ready_state: bool | None = None
+
+
+def _gradio_transcribe_concurrency() -> int:
+    """How many transcribe streams may run at once (tabs/users); independent of GPU slots."""
+    raw = os.getenv("UI_GRADIO_TRANSCRIBE_CONCURRENCY")
+    if raw is None:
+        raw = os.getenv("UI_MAX_CONCURRENT_JOBS", "8")
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 8
 
 
 def _preload_models() -> None:
@@ -307,64 +353,99 @@ def _status_html(state: str, message: str) -> str:
 STATUS_IDLE = _status_html("idle", "Idle. Upload media and click Transcribe.")
 
 
-def _progress_html(snapshot: dict | None = None) -> str:
-    """Render progress bar + elapsed / remaining timer for the active job."""
-    snap = snapshot if snapshot is not None else get_job_progress().snapshot()
-    phase = snap.get("phase", "idle")
-    pct = float(snap.get("percent", 0))
-    elapsed = float(snap.get("elapsed_s", 0))
-    remaining = snap.get("remaining_s")
-    remaining_txt = "\u2014" if remaining is None else f"{float(remaining):.0f}s"
-    active_cls = "active" if snap.get("active") else phase
+def _format_elapsed_hms(elapsed_s: float) -> str:
+    elapsed = max(0.0, float(elapsed_s))
+    hours = int(elapsed // 3600)
+    minutes = int((elapsed % 3600) // 60)
+    seconds = int(elapsed % 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def _job_status_html(snapshot: dict) -> str:
+    """Render stopwatch + phase message for the active job."""
+    phase = snapshot.get("phase", "idle")
+    elapsed_txt = _format_elapsed_hms(snapshot.get("elapsed_s", 0))
+    active_cls = "active" if snapshot.get("active") else phase
     return (
-        f'<div class="job-progress-panel {active_cls}" data-phase="{phase}" '
-        f'data-percent="{pct:.1f}">'
-        f'<div class="progress-label">Processing Progress</div>'
-        f'<div class="progress-track">'
-        f'<div class="progress-fill" style="width:{pct:.1f}%" data-progress="{pct:.1f}">'
-        f"</div></div>"
-        f'<div class="progress-meta">'
-        f'<span class="progress-elapsed">Time elapsed: <strong>{elapsed:.1f}s</strong></span>'
-        f'<span class="progress-remaining">Est. remaining: <strong>{remaining_txt}</strong></span>'
-        f'<span class="progress-pct">{pct:.0f}%</span>'
-        f"</div>"
-        f'<div class="progress-message">{snap.get("message", "")}</div>'
+        f'<div class="job-progress-panel {active_cls}" data-phase="{phase}">'
+        f'<div class="job-status-label">Job Status</div>'
+        f'<div id="elapsed-timer">Elapsed Time: {elapsed_txt}</div>'
+        f'<div class="progress-message">{snapshot.get("message", "")}</div>'
         f"</div>"
     )
 
 
-PROGRESS_IDLE = _progress_html({
+PROGRESS_IDLE = _job_status_html({
     "phase": "idle",
-    "percent": 0,
     "active": False,
     "elapsed_s": 0,
-    "remaining_s": None,
     "message": "Waiting for a transcription job.",
-    "job_id": "",
-    "audio_duration_s": 0,
 })
 
 
-def _empty_outputs(message: str, status_state: str = "idle",
-                   status_message: str = "Idle.") -> tuple:
+def _history_dropdown_update():
+    choices = []
+    for row in list_jobs(50):
+        name = row.get("display_name") or row.get("source_filename") or row["job_id"]
+        engines = ", ".join(row.get("selected_engines") or [])
+        created = (row.get("created_at") or "")[:16]
+        label = f"{created} | {name} | {engines} | {row.get('status', '')}"
+        choices.append((label, row["job_id"]))
+    return gr.update(choices=choices)
+
+
+def _manifest_to_job_result(job: dict) -> dict:
+    job_id = job.get("job_id", "")
+    return {
+        "job_id": job_id,
+        "manifest_path": f"storage/jobs/{job_id}.json",
+        "audio_duration_s": job.get("audio_duration_s", 0.0),
+        "total_elapsed_s": job.get("total_elapsed_s", 0.0),
+        "target_elapsed_s": job.get("target_elapsed_s", 0.0),
+        "target_met": job.get("target_met", False),
+        "results": job.get("results") or {},
+    }
+
+
+def _default_output_names(media_path: str | None) -> str:
+    if not media_path:
+        return ""
+    return os.path.splitext(os.path.basename(media_path))[0]
+
+
+def _transcribe_btn_running() -> dict:
+    return gr.update(interactive=False)
+
+
+def _transcribe_btn_ready() -> dict:
+    return gr.update(interactive=_models_ready.is_set())
+
+
+def _empty_outputs(
+    message: str,
+    status_state: str = "idle",
+    status_message: str = "Idle.",
+    tracker: JobProgress | None = None,
+    *,
+    refresh_history: bool = True,
+) -> tuple:
     no_download = gr.update(value=None, interactive=False)
-    no_correction = gr.update(interactive=False)
-    progress = _progress_html({
+    snap = (tracker or JobProgress()).snapshot()
+    progress = _job_status_html({
         "phase": status_state if status_state in {"error"} else "idle",
-        "percent": 0 if status_state != "error" else get_job_progress().snapshot()["percent"],
-        "active": False,
-        "elapsed_s": get_job_progress().snapshot()["elapsed_s"],
-        "remaining_s": None,
+        "active": status_state == "running",
+        "elapsed_s": snap["elapsed_s"],
         "message": status_message,
-        "job_id": "",
-        "audio_duration_s": 0,
     })
+    history = _history_dropdown_update() if refresh_history else gr.update()
     return (
-        message, "", no_download, no_correction,
-        message, "", no_download, no_correction,
+        message, "", gr.update(), no_download,
         "",
         _status_html(status_state, status_message),
         progress,
+        _transcribe_btn_ready(),
+        history,
+        gr.update(value=None, interactive=False),
     )
 
 
@@ -375,34 +456,33 @@ def _env_bool(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _build_outputs(job_result: dict, selected_engines: list[str]) -> tuple:
-    outputs = []
-    for engine in ALL_ENGINES:
-        result = job_result["results"].get(engine)
-        if result:
-            path = result.get("download_path")
-            text = result.get("text", "")
-            can_correct = bool(text and not text.startswith(("(", "ERROR")))
-            outputs.extend([
-                text,
-                f"{result.get('elapsed', 0.0):.2f}s",
-                gr.update(value=path, interactive=path is not None),
-                gr.update(interactive=can_correct),
-            ])
-        elif engine in selected_engines:
-            outputs.extend([
-                "(failed)",
-                "",
-                gr.update(value=None, interactive=False),
-                gr.update(interactive=False),
-            ])
-        else:
-            outputs.extend([
-                "",
-                "(not selected)",
-                gr.update(value=None, interactive=False),
-                gr.update(interactive=False),
-            ])
+def _build_outputs(job_result: dict, selected_engines: list[str], tracker: JobProgress) -> tuple:
+    engine = selected_engines[0] if selected_engines else default_asr_engines()[0]
+    result = job_result["results"].get(engine)
+    if result:
+        path = result.get("download_path")
+        raw_text = result.get("text", "")
+        text = _display_transcript_text(raw_text)
+        outputs = [
+            text,
+            f"{result.get('elapsed', 0.0):.2f}s",
+            gr.update(),
+            gr.update(value=path, interactive=path is not None),
+        ]
+    elif engine in selected_engines:
+        outputs = [
+            "(failed)",
+            "",
+            gr.update(),
+            gr.update(value=None, interactive=False),
+        ]
+    else:
+        outputs = [
+            "",
+            "(not selected)",
+            gr.update(),
+            gr.update(value=None, interactive=False),
+        ]
     manifest = job_result.get("manifest_path", "")
     audio_duration = job_result.get("audio_duration_s", 0.0)
     total_elapsed = job_result.get("total_elapsed_s", 0.0)
@@ -432,172 +512,417 @@ def _build_outputs(job_result: dict, selected_engines: list[str]) -> tuple:
     else:
         perf_text = f"Done in {total_elapsed:.1f}s."
     outputs.append(_status_html("done", perf_text))
-    outputs.append(_progress_html(get_job_progress().snapshot()))
+    outputs.append(_job_status_html(tracker.snapshot()))
+    outputs.append(_transcribe_btn_ready())
+    outputs.append(_history_dropdown_update())
+    outputs.append(gr.update(value=None, interactive=False))
     return tuple(outputs)
 
 
-def _reset_ui_outputs() -> tuple:
-    """Signal cancellation and return a blank UI state for all transcript outputs."""
-    _cancel_event.set()
-    clear_accelerator_cache()  # immediately release GPU VRAM held by in-flight inference
-    get_job_progress().reset()
+def _reset_ui_outputs(tab_id: str) -> tuple:
+    """Signal cancellation for this browser tab only."""
+    runtime, _ = resolve_runtime(tab_id)
+    tracker = runtime["progress"]
+    cancel_tab_job(runtime, tracker=tracker, message=_MSG_CANCELLED)
     no_dl = gr.update(value=None, interactive=False)
-    no_btn = gr.update(interactive=False)
     return (
-        _CANCELLED, "", no_dl, no_btn,
-        _CANCELLED, "", no_dl, no_btn,
+        _CANCELLED, "", gr.update(), no_dl,
         "Cancelled by user.",
         _status_html("error", "Cancelled by user."),
         PROGRESS_IDLE,
+        _transcribe_btn_ready(),
+        _history_dropdown_update(),
+        gr.update(value=None, interactive=False),
     )
 
 
-def transcribe(
-    media_path,
-    selected_engines,
-    language,
-    diarization,
-    max_speakers,
-    enhance,
-    diar_override_defaults,
+def _selected_engines_for_job(selected_engines) -> list[str]:
+    if isinstance(selected_engines, str):
+        return [selected_engines]
+    return list(selected_engines or default_asr_engines())[:1]
+
+
+def _diarize_kwargs_for_job(
+    diarization: bool,
+    diar_override_defaults: bool,
+    diar_short_clip_preset: bool,
     diar_seg_threshold,
     diar_min_off,
     diar_clust_threshold,
     diar_clust_min_size,
-    _progress=gr.Progress(track_tqdm=True),
-):
-    """Gradio callback — generator yielding live progress bar + timer updates."""
-    _cancel_event.clear()
-    tracker = get_job_progress()
+) -> dict | None:
+    if not diarization or not (diar_override_defaults or diar_short_clip_preset):
+        return None
+    return {
+        "seg_threshold": float(diar_seg_threshold),
+        "seg_min_duration_off": float(diar_min_off),
+        "clust_threshold": float(diar_clust_threshold),
+        "clust_min_size": int(diar_clust_min_size),
+    }
+
+
+def _running_transcript_outputs(snap: dict, engines_label: str, no_dl) -> tuple:
+    return (
+        "", "", gr.update(), no_dl,
+        "",
+        _status_html("running", snap.get("message", f"Transcribing with {engines_label}\u2026")),
+        _job_status_html(snap),
+        _transcribe_btn_running(),
+        gr.update(),
+        gr.update(value=None, interactive=False),
+    )
+
+
+def _transcription_progress_signature(snap: dict) -> tuple:
+    return (
+        snap.get("phase"),
+        round(float(snap.get("percent", 0)), 1),
+        int(float(snap.get("elapsed_s", 0))),
+        snap.get("message"),
+    )
+
+
+def _cancelled_transcription_outputs(tracker: JobProgress) -> tuple:
+    tracker.fail(_MSG_CANCELLED)
+    return _empty_outputs(_CANCELLED, "error", _MSG_CANCELLED, tracker=tracker)
+
+
+def _transcription_error_outputs(tracker: JobProgress, exc: Exception) -> tuple:
+    if isinstance(exc, RuntimeError) and "cancelled" in str(exc).lower():
+        return _cancelled_transcription_outputs(tracker)
+    logger.exception("Transcription job failed: %s", exc)
+    tracker.fail(str(exc))
+    return _empty_outputs(f"ERROR: {exc}", "error", f"Error: {exc}", tracker=tracker)
+
+
+@dataclass
+class _TranscribeRequest:
+    media_path: str
+    selected_engines: list
+    language: str
+    diarization: bool
+    max_speakers: int
+    enhance: bool
+    diar_short_clip_preset: bool
+    diar_override_defaults: bool
+    diar_seg_threshold: float
+    diar_min_off: float
+    diar_clust_threshold: float
+    diar_clust_min_size: int
+    output_name: str
+    tab_id: str
+
+
+def _parse_transcribe_request(inputs: tuple) -> _TranscribeRequest:
+    return _TranscribeRequest(*inputs)
+
+
+def _progress_poll_interval() -> float:
+    try:
+        return max(0.25, float(os.getenv("UI_PROGRESS_POLL_S", "1.0")))
+    except ValueError:
+        return 1.0
+
+
+def _transcribe_blocked_output(runtime, tracker, media_path):
+    if is_job_running(runtime):
+        return _empty_outputs(
+            "Job still running — wait or click Cancel.",
+            "running",
+            "Job still running — wait or click Cancel.",
+            tracker=tracker,
+        )
     if not media_path:
         tracker.reset()
-        yield _empty_outputs("(no media provided)", "error", "No media uploaded.")
-        return
+        return _empty_outputs("(no media provided)", "error", "No media uploaded.", tracker=tracker)
     if not _models_ready.is_set():
-        yield _empty_outputs(
+        return _empty_outputs(
             "Models are still loading, please wait...",
             "running",
             "Models are still loading\u2026",
+            tracker=tracker,
+        )
+    return None
+
+
+def _resolve_job_names(
+    media_path: str,
+    output_name_field: str,
+) -> tuple[str, str, str]:
+    output_name = output_name_field.strip() if output_name_field and output_name_field.strip() else ""
+    source_filename = os.path.basename(media_path)
+    display_name = output_name or os.path.splitext(source_filename)[0]
+    return output_name, display_name, source_filename
+
+
+def _poll_transcription_worker(
+    worker: threading.Thread,
+    cancel_event: threading.Event,
+    tracker: JobProgress,
+    runtime: dict,
+    engines_label: str,
+    no_dl: dict,
+    poll_s: float,
+):
+    last_sig = None
+    while worker.is_alive():
+        if cancel_event.is_set():
+            cancel_tab_job(runtime)
+            yield _cancelled_transcription_outputs(tracker)
+            return
+        snap = tracker.snapshot()
+        if snap.get("job_id") and runtime.get("active_job_id") != snap["job_id"]:
+            set_active_job(runtime, snap["job_id"], worker)
+        sig = _transcription_progress_signature(snap)
+        if sig != last_sig or last_sig is None:
+            last_sig = sig
+        yield _running_transcript_outputs(snap, engines_label, no_dl)
+        time.sleep(poll_s)
+
+
+def _stream_worker_progress(
+    worker: threading.Thread,
+    tracker: JobProgress,
+    no_dl: dict,
+    poll_s: float,
+):
+    while worker.is_alive():
+        snap = tracker.snapshot()
+        yield _running_transcript_outputs(snap, "ASR", no_dl)
+        time.sleep(poll_s)
+
+
+def _recover_manifest_or_idle(tab_id: str, tracker: JobProgress, no_dl: dict):
+    for row in list_jobs(20):
+        if row.get("tab_id") != tab_id or row.get("status") != "running":
+            continue
+        job_id = row["job_id"]
+        while True:
+            job = load_job(job_id)
+            if not job or job.get("status") != "running":
+                break
+            prog = job.get("progress") or {}
+            snap = {
+                "phase": prog.get("phase", "running"),
+                "message": prog.get("message", "Finishing in background\u2026"),
+                "elapsed_s": prog.get("elapsed_s", 0),
+                "active": True,
+            }
+            yield _running_transcript_outputs(snap, "ASR", no_dl)
+            time.sleep(1.0)
+        yield _empty_outputs(
+            "",
+            "idle",
+            "Previous job finished — open Previous transcripts to load results.",
+            tracker=tracker,
         )
         return
+    yield _empty_outputs("", "idle", "Idle. Upload media and click Transcribe.", tracker=tracker)
 
-    if isinstance(selected_engines, str):
-        selected = [selected_engines]
-    else:
-        selected = list(selected_engines or default_asr_engines())[:1]
 
-    diarize_kwargs: dict | None = None
-    if diarization and diar_override_defaults:
-        diarize_kwargs = {
-            "seg_threshold":        float(diar_seg_threshold),
-            "seg_min_duration_off": float(diar_min_off),
-            "clust_threshold":      float(diar_clust_threshold),
-            "clust_min_size":       int(diar_clust_min_size),
-        }
+def transcribe(*inputs):
+    """Gradio callback — per browser-tab isolation; stopwatch via gr.Timer."""
+    req = _parse_transcribe_request(inputs)
+    runtime, tid = resolve_runtime(req.tab_id)
+    tracker = runtime["progress"]
+    blocked = _transcribe_blocked_output(runtime, tracker, req.media_path)
+    if blocked is not None:
+        yield blocked
+        return
+
+    worker = runtime.get("worker")
+    if worker is not None and worker.is_alive():
+        cancel_tab_job(runtime)
+
+    cancel_event = fresh_cancel_event(runtime, cancel_previous=False)
+    selected = _selected_engines_for_job(req.selected_engines)
+    diarize_kwargs = _diarize_kwargs_for_job(
+        req.diarization,
+        req.diar_override_defaults,
+        req.diar_short_clip_preset,
+        req.diar_seg_threshold,
+        req.diar_min_off,
+        req.diar_clust_threshold,
+        req.diar_clust_min_size,
+    )
 
     no_dl = gr.update(value=None, interactive=False)
-    no_btn = gr.update(interactive=False)
     engines_label = selected[0]
+    runtime["selected_asr_engine"] = engines_label
+    output_name, display_name, source_filename = _resolve_job_names(
+        req.media_path,
+        req.output_name,
+    )
+
     holder: dict = {}
     error_holder: dict = {}
 
     def _run_job() -> None:
         try:
             holder["result"] = run_transcription_job(
-                media_path=media_path,
+                media_path=req.media_path,
                 selected_engines=selected,
-                language=language,
-                diarization=diarization,
-                max_speakers=int(max_speakers),
-                enhance=enhance,
-                local_correction=False,
+                language=req.language,
+                diarization=req.diarization,
+                max_speakers=int(req.max_speakers),
+                enhance=req.enhance,
                 diarize_kwargs=diarize_kwargs,
-                cancel_event=_cancel_event,
+                cancel_event=cancel_event,
                 progress=tracker,
+                meta=JobMeta(
+                    tab_id=tid,
+                    display_name=display_name,
+                    source_filename=source_filename,
+                    output_name=output_name or None,
+                ),
             )
         except Exception as exc:  # pylint: disable=broad-exception-caught
             error_holder["error"] = exc
+        finally:
+            clear_active_job(runtime)
 
     tracker.reset()
     tracker.start()
     worker = threading.Thread(target=_run_job, daemon=True)
+    set_active_job(runtime, "", worker)
     worker.start()
 
-    def _running_outputs(snap: dict) -> tuple:
-        return (
-            "", "", no_dl, no_btn,
-            "", "", no_dl, no_btn,
-            "Transcription in progress\u2026",
-            _status_html("running", snap.get("message", f"Transcribing with {engines_label}\u2026")),
-            _progress_html(snap),
-        )
+    yield _running_transcript_outputs(tracker.snapshot(), engines_label, no_dl)
 
-    def _progress_signature(snap: dict) -> tuple:
-        return (
-            snap.get("phase"),
-            round(float(snap.get("percent", 0)), 1),
-            int(float(snap.get("elapsed_s", 0))),
-            snap.get("message"),
-        )
-
-    last_sig = None
-    snap = tracker.snapshot()
-    last_sig = _progress_signature(snap)
-    yield _running_outputs(snap)
-
-    while worker.is_alive():
-        if _cancel_event.is_set():
-            tracker.fail("Cancelled.")
-            yield _empty_outputs(_CANCELLED, "error", "Cancelled.")
-            return
-        snap = tracker.snapshot()
-        sig = _progress_signature(snap)
-        if sig != last_sig:
-            last_sig = sig
-            yield _running_outputs(snap)
-        time.sleep(0.25)
+    poll_s = _progress_poll_interval()
+    yield from _poll_transcription_worker(
+        worker, cancel_event, tracker, runtime, engines_label, no_dl, poll_s,
+    )
+    if cancel_event.is_set():
+        return
 
     worker.join()
 
     if error_holder.get("error"):
-        exc = error_holder["error"]
-        if isinstance(exc, RuntimeError) and "cancelled" in str(exc).lower():
-            tracker.fail("Cancelled.")
-            yield _empty_outputs(_CANCELLED, "error", "Cancelled.")
-            return
-        logger.exception("Transcription job failed: %s", exc)
-        tracker.fail(str(exc))
-        yield _empty_outputs(f"ERROR: {exc}", "error", f"Error: {exc}")
+        yield _transcription_error_outputs(tracker, error_holder["error"])
         return
 
-    yield _build_outputs(holder["result"], selected)
+    yield _build_outputs(holder["result"], selected, tracker)
 
 
-def _job_id_from_info(job_info: str) -> str | None:
-    match = re.search(r"^Job ID:\s*(\S+)", job_info or "", flags=re.MULTILINE)
-    return match.group(1) if match else None
+def load_history():
+    return _history_dropdown_update()
 
 
-def correct_transcript(engine_name: str, text: str, elapsed: str, job_info: str) -> tuple:
-    """Run optional local correction only after a transcript exists."""
-    if not text or text.startswith(("(", "ERROR")):
-        return text, elapsed, gr.update(), job_info
+def load_selected_job(job_id: str):
+    if not job_id:
+        return _empty_outputs("Select a job from Previous transcripts.", refresh_history=False)
+    job = load_job(job_id)
+    if not job:
+        return _empty_outputs(f"Job not found: {job_id}", "error", "Job not found.")
+    selected = job.get("selected_engines") or default_asr_engines()
+    return _build_outputs(_manifest_to_job_result(job), selected, JobProgress())
 
-    corrected, correction_elapsed, note = correct_with_local_llm(text)
-    job_id = _job_id_from_info(job_info) or "manual_correction"
-    transcript_path = save_transcript(job_id, f"{engine_name}_corrected", corrected)
-    elapsed_note = (
-        f"{elapsed} + LLM {correction_elapsed:.2f}s"
-        if elapsed
-        else f"LLM {correction_elapsed:.2f}s"
-    )
-    info = f"{job_info}\n{engine_name}: {note}".strip()
-    return (
-        corrected,
-        elapsed_note,
-        gr.update(value=transcript_path, interactive=transcript_path is not None),
-        info,
-    )
+
+def download_selected_job(job_id: str):
+    if not job_id:
+        return gr.update(value=None, interactive=False)
+    job = load_job(job_id)
+    if not job:
+        return gr.update(value=None, interactive=False)
+    for result in (job.get("results") or {}).values():
+        path = result.get("download_path")
+        if path:
+            return gr.update(value=path, interactive=True)
+    return gr.update(value=None, interactive=False)
+
+
+def recover_session(tab_id: str):
+    """On page load, reattach to an in-flight worker or poll a running manifest."""
+    runtime, tid = resolve_runtime(tab_id)
+    tracker = runtime["progress"]
+    worker = runtime.get("worker")
+    no_dl = gr.update(value=None, interactive=False)
+
+    if worker and worker.is_alive():
+        yield from _stream_worker_progress(worker, tracker, no_dl, _progress_poll_interval())
+        return
+
+    yield from _recover_manifest_or_idle(tid, tracker, no_dl)
+
+
+def _apply_short_clip_preset(enabled):
+    if not enabled:
+        return gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
+    return True, 0.42, 0.10, 0.60, 6
+
+
+def _on_engine_change(new_engine: str, tab_id: str):
+    """Swap ASR weights only when the user picks a different engine in the UI."""
+    runtime, _ = resolve_runtime(tab_id)
+    if is_job_running(runtime):
+        return gr.update()
+    prev = runtime.get("selected_asr_engine") or default_asr_engines()[0]
+    if new_engine == prev:
+        runtime["selected_asr_engine"] = new_engine
+        return gr.update()
+    try:
+        switch_asr_engine(new_engine)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        logger.exception("ASR engine switch failed: %s", exc)
+        return gr.update()
+    runtime["selected_asr_engine"] = new_engine
+    logger.info("User switched ASR engine: %s -> %s", prev, new_engine)
+    return gr.update()
+
+
+def _on_media_upload(path, tab_id):
+    """Update preview; cancel only this tab's in-flight job when the file changes."""
+    runtime, _ = resolve_runtime(tab_id)
+    path_changed = bool(path) and path != runtime.get("last_upload_path")
+    runtime["last_upload_path"] = path
+    if path_changed:
+        if runtime["progress"].snapshot().get("active"):
+            runtime["cancel_event"].set()
+            runtime["progress"].reset()
+        if active_job_count() == 0:
+            clear_prejob_caches()
+    if not path:
+        return (
+            gr.update(value=None, visible=False),
+            gr.update(value=None, visible=False),
+            "No file selected.",
+        )
+    too_large, _ = _media_too_large_for_browser(path)
+    info = _format_media_info(path)
+    if too_large:
+        return (
+            gr.update(value=None, visible=False),
+            gr.update(value=None, visible=False),
+            info,
+        )
+    ext = os.path.splitext(path)[1].lower()
+    if ext in VIDEO_EXTENSIONS:
+        return gr.update(value=path, visible=True), gr.update(value=None, visible=False), info
+    return gr.update(value=None, visible=False), gr.update(value=path, visible=True), info
+
+
+def _apply_ready_state():
+    """Update load status and input interactivity only when values change."""
+    global _last_load_status_text, _last_ready_state
+    ready = _models_ready.is_set()
+    current_text = _get_load_status()
+
+    if _last_load_status_text is None or current_text != _last_load_status_text:
+        load_update = current_text
+        _last_load_status_text = current_text
+    else:
+        load_update = gr.update()
+
+    if _last_ready_state is None or ready != _last_ready_state:
+        media_update = gr.update(interactive=ready)
+        btn_update = gr.update(interactive=ready)
+        _last_ready_state = ready
+    else:
+        media_update = gr.update()
+        btn_update = gr.update()
+
+    return load_update, media_update, btn_update
 
 
 def build_ui() -> gr.Blocks:
@@ -610,6 +935,14 @@ def build_ui() -> gr.Blocks:
         gr.Markdown("Upload audio or video, then transcribe locally with open-source models.")
 
         load_status = gr.Markdown(_get_load_status())
+        tab_instance_id = gr.Textbox(
+            value="",
+            visible=False,
+            elem_id="tab-instance-id",
+            label="",
+            interactive=True,
+        )
+        gr.HTML(TAB_INSTANCE_SCRIPT)
 
         media_input = gr.File(
             label="Audio or Video File",
@@ -637,6 +970,7 @@ def build_ui() -> gr.Blocks:
                     label="Audio Enhancement",
                     value=_env_bool("AUDIO_ENHANCE_DEFAULT", True),
                     elem_id="enhance-checkbox",
+                    info="Recommended for diarization — denoise and normalize loudness.",
                 )
                 diarization = gr.Checkbox(
                     label="Speaker Diarization",
@@ -655,41 +989,58 @@ def build_ui() -> gr.Blocks:
         with gr.Group(visible=False) as diarize_config_group:
             with gr.Accordion("Advanced Diarization Settings", open=False):
                 gr.Markdown(
-                    "Tune pyannote speaker detection. **Leave at defaults for best accuracy** — "
-                    "community-1 ships with training-tuned hyperparameters. "
-                    "Only adjust if you have characterised your specific audio domain."
+                    "Short clips (&lt; 90 s) with 2–3 speakers use **automatic adaptive tuning** "
+                    "when overrides are off. Enable the preset below only if you still get too "
+                    "few speakers after trying **Audio Enhancement** and raising **Max Speakers**."
+                )
+                diar_short_clip_preset = gr.Checkbox(
+                    value=False,
+                    label="Short clip / multi-speaker preset",
+                    info="Fills the sliders below for aggressive multi-speaker detection and enables overrides.",
                 )
                 diar_override_defaults = gr.Checkbox(  # noqa: F841  (wired via inputs= below)
                     value=False,
                     label="Override model-tuned defaults with the sliders below",
-                    info="Unchecked (recommended) = use community-1's own tuned hyperparameters.",
+                    info="Unchecked (recommended) = adaptive short-clip tuning + community-1 defaults.",
                 )
                 with gr.Row():
                     diar_seg_threshold = gr.Slider(
                         minimum=0.10, maximum=0.90, step=0.01,
-                        value=float(os.getenv("DIARIZATION_SEGMENTATION_THRESHOLD", "0.5")),
+                        value=float(os.getenv("DIARIZATION_SEGMENTATION_THRESHOLD", "0.42")),
                         label="Segmentation Threshold",
-                        info="Lower = catches quieter / shorter speaker turns (community-1 default ~0.5)",
+                        info="Lower = catches quieter / shorter speaker turns",
                     )
                     diar_min_off = gr.Slider(
                         minimum=0.0, maximum=1.0, step=0.01,
-                        value=float(os.getenv("DIARIZATION_MIN_DURATION_OFF", "0.0")),
+                        value=float(os.getenv("DIARIZATION_MIN_DURATION_OFF", "0.10")),
                         label="Min Silence Gap (s)",
-                        info="Min silence before splitting a turn (default 0.0)",
+                        info="Min silence before splitting a turn",
                     )
                 with gr.Row():
                     diar_clust_threshold = gr.Slider(
                         minimum=0.10, maximum=0.90, step=0.01,
-                        value=float(os.getenv("DIARIZATION_CLUSTERING_THRESHOLD", "0.7")),
+                        value=float(os.getenv("DIARIZATION_CLUSTERING_THRESHOLD", "0.60")),
                         label="Clustering Threshold",
-                        info="Lower = more speakers kept separate (community-1 default ~0.7)",
+                        info="Lower = more speakers kept separate",
                     )
                     diar_clust_min_size = gr.Slider(
                         minimum=1, maximum=30, step=1,
-                        value=int(os.getenv("DIARIZATION_MIN_CLUSTER_SIZE", "12")),
+                        value=int(os.getenv("DIARIZATION_MIN_CLUSTER_SIZE", "6")),
                         label="Min Cluster Size",
-                        info="Min segments to form a speaker cluster (default 12)",
+                        info="Min segments to form a speaker cluster",
                     )
+
+        diar_short_clip_preset.change(  # pylint: disable=no-member
+            fn=_apply_short_clip_preset,
+            inputs=[diar_short_clip_preset],
+            outputs=[
+                diar_override_defaults,
+                diar_seg_threshold,
+                diar_min_off,
+                diar_clust_threshold,
+                diar_clust_min_size,
+            ],
+        )
 
         diarization.change(  # pylint: disable=no-member
             fn=lambda enabled: (gr.update(visible=enabled), gr.update(visible=enabled)),
@@ -697,9 +1048,15 @@ def build_ui() -> gr.Blocks:
             outputs=[speakers_row, diarize_config_group],
         )
 
-        with gr.Row():
-            with gr.Column():
-                gr.Markdown("#### Original Media Preview")
+        engine_selector.change(  # pylint: disable=no-member
+            fn=_on_engine_change,
+            inputs=[engine_selector, tab_instance_id],
+            outputs=[load_status],
+        )
+
+        with gr.Accordion("Media preview (short files only)", open=False):
+            media_info = gr.Markdown("No file selected.")
+            with gr.Row():
                 original_video = gr.Video(
                     label="Video",
                     interactive=False,
@@ -713,45 +1070,11 @@ def build_ui() -> gr.Blocks:
                     type="filepath",
                     elem_classes=["tall-audio-preview"],
                 )
-            with gr.Column():
-                gr.Markdown("#### Enhanced Audio Preview")
-                enhanced_audio = gr.Audio(
-                    label="Enhanced",
-                    interactive=False,
-                    type="filepath",
-                    elem_classes=["tall-audio-preview"],
-                )
-
-        def _route_media_preview(path):
-            """Route uploaded media to the video or audio preview component."""
-            if not path:
-                return gr.update(value=None, visible=False), gr.update(value=None, visible=False)
-            ext = os.path.splitext(path)[1].lower()
-            if ext in VIDEO_EXTENSIONS:
-                return gr.update(value=path, visible=True), gr.update(value=None, visible=False)
-            return gr.update(value=None, visible=False), gr.update(value=path, visible=True)
 
         media_input.change(  # pylint: disable=no-member
-            fn=_route_media_preview,
-            inputs=[media_input],
-            outputs=[original_video, original_audio_preview],
-        )
-
-        def _run_enhance(media_path, do_enhance):
-            """Generate enhanced audio only when enhancement is enabled."""
-            if not media_path or not do_enhance:
-                return None
-            return enhance_audio(media_path)
-
-        enhance.change(  # pylint: disable=no-member
-            fn=_run_enhance,
-            inputs=[media_input, enhance],
-            outputs=[enhanced_audio],
-        )
-        media_input.change(  # pylint: disable=no-member
-            fn=lambda _path: None,
-            inputs=[media_input],
-            outputs=[enhanced_audio],
+            fn=_on_media_upload,
+            inputs=[media_input, tab_instance_id],
+            outputs=[original_video, original_audio_preview, media_info],
         )
 
         live_status = gr.HTML(
@@ -765,66 +1088,61 @@ def build_ui() -> gr.Blocks:
             label="Progress",
         )
 
-        with gr.Tabs():
-            with gr.TabItem(ENGINE_TYPHOON):
-                typhoon_text = gr.Textbox(
-                    label="Transcript",
-                    lines=20,
-                    max_lines=200,
+        with gr.TabItem("Output"):
+            output_text = gr.Textbox(
+                label="Transcript",
+                lines=20,
+                max_lines=200,
+                interactive=False,
+                elem_id="output-transcript",
+            )
+            with gr.Row():
+                output_time = gr.Textbox(
+                    label=LABEL_ELAPSED,
                     interactive=False,
-                    elem_id="typhoon-transcript",
+                    max_lines=1,
+                    scale=2,
+                    elem_id="output-elapsed",
                 )
-                with gr.Row():
-                    typhoon_time = gr.Textbox(
-                        label=LABEL_ELAPSED,
-                        interactive=False,
-                        max_lines=1,
-                        scale=3,
-                        elem_id="typhoon-elapsed",
-                    )
-                    typhoon_dl = gr.DownloadButton(
-                        label=LABEL_DOWNLOAD,
-                        value=None,
-                        scale=1,
-                        interactive=False,
-                    )
-                typhoon_correct = gr.Button(
-                    "Run Local LLM Correction",
+                output_name = gr.Textbox(
+                    label="Output name",
+                    interactive=True,
+                    scale=2,
+                    placeholder="Download filename (without .txt)",
+                )
+                output_dl = gr.DownloadButton(
+                    label=LABEL_DOWNLOAD,
+                    value=None,
+                    scale=1,
                     interactive=False,
-                    elem_classes=["correction-button"],
                 )
 
-            with gr.TabItem(ENGINE_PATHUMMA):
-                pathumma_text = gr.Textbox(
-                    label="Transcript",
-                    lines=20,
-                    max_lines=200,
-                    interactive=False,
-                )
-                with gr.Row():
-                    pathumma_time = gr.Textbox(
-                        label=LABEL_ELAPSED,
-                        interactive=False,
-                        max_lines=1,
-                        scale=3,
-                    )
-                    pathumma_dl = gr.DownloadButton(
-                        label=LABEL_DOWNLOAD,
-                        value=None,
-                        scale=1,
-                        interactive=False,
-                    )
-                pathumma_correct = gr.Button(
-                    "Run Local LLM Correction",
-                    interactive=False,
-                    elem_classes=["correction-button"],
-                )
+        with gr.Accordion("Job Info", open=False):
+            job_info = gr.Textbox(label="", lines=2, interactive=False, elem_id="job-info", show_label=False)
 
-        job_info = gr.Textbox(label="Job Info", lines=3, interactive=False, elem_id="job-info")
+        gr.Markdown("### Previous transcripts")
+        with gr.Row():
+            history_dropdown = gr.Dropdown(
+                label="Past jobs",
+                choices=[],
+                value=None,
+                interactive=True,
+                scale=4,
+            )
+            history_refresh_btn = gr.Button("Refresh list", scale=1)
+        with gr.Row():
+            history_load_btn = gr.Button("Load into editor", variant="secondary")
+            history_download_btn = gr.DownloadButton("Download selected", value=None, interactive=False)
 
         gr.Markdown(hw_md)
 
-        transcribe_event = transcribe_btn.click(  # pylint: disable=no-member
+        transcribe_outputs = [
+            output_text, output_time, output_name, output_dl,
+            job_info, live_status, job_progress, transcribe_btn,
+            history_dropdown, history_download_btn,
+        ]
+
+        transcribe_btn.click(  # pylint: disable=no-member
             fn=transcribe,
             inputs=[
                 media_input,
@@ -833,94 +1151,76 @@ def build_ui() -> gr.Blocks:
                 diarization,
                 max_speakers,
                 enhance,
+                diar_short_clip_preset,
                 diar_override_defaults,
                 diar_seg_threshold,
                 diar_min_off,
                 diar_clust_threshold,
                 diar_clust_min_size,
+                output_name,
+                tab_instance_id,
             ],
-            outputs=[
-                typhoon_text, typhoon_time, typhoon_dl, typhoon_correct,
-                pathumma_text, pathumma_time, pathumma_dl, pathumma_correct,
-                job_info,
-                live_status,
-                job_progress,
-            ],
+            outputs=transcribe_outputs,
+            concurrency_limit=_gradio_transcribe_concurrency(),
         )
 
         cancel_btn.click(  # pylint: disable=no-member
             fn=_reset_ui_outputs,
-            outputs=[
-                typhoon_text, typhoon_time, typhoon_dl, typhoon_correct,
-                pathumma_text, pathumma_time, pathumma_dl, pathumma_correct,
-                job_info,
-                live_status,
-                job_progress,
-            ],
-            cancels=[transcribe_event],
+            inputs=[tab_instance_id],
+            outputs=transcribe_outputs,
         )
 
-        typhoon_correct.click(  # pylint: disable=no-member
-            fn=lambda text, elapsed, info: correct_transcript(ENGINE_TYPHOON, text, elapsed, info),
-            inputs=[typhoon_text, typhoon_time, job_info],
-            outputs=[typhoon_text, typhoon_time, typhoon_dl, job_info],
+        history_refresh_btn.click(  # pylint: disable=no-member
+            fn=load_history,
+            outputs=[history_dropdown],
         )
-        pathumma_correct.click(  # pylint: disable=no-member
-            fn=lambda text, elapsed, info: correct_transcript(
-                ENGINE_PATHUMMA,
-                text,
-                elapsed,
-                info,
-            ),
-            inputs=[pathumma_text, pathumma_time, job_info],
-            outputs=[pathumma_text, pathumma_time, pathumma_dl, job_info],
+        history_load_btn.click(  # pylint: disable=no-member
+            fn=load_selected_job,
+            inputs=[history_dropdown],
+            outputs=transcribe_outputs,
+        )
+        history_download_btn.click(  # pylint: disable=no-member
+            fn=download_selected_job,
+            inputs=[history_dropdown],
+            outputs=[history_download_btn],
         )
 
-        def apply_ready_state():
-            """Only update the page when readiness or load text actually changes.
-
-            This avoids continuous DOM replacements and layout jank by returning
-            no-op updates when nothing has changed.
-            """
-            global _last_load_status_text, _last_ready_state
-            ready = _models_ready.is_set()
-
-            # Compute current status text only when needed.
-            current_text = _get_load_status()
-
-            # Decide whether to update the Markdown text.
-            if _last_load_status_text is None or current_text != _last_load_status_text:
-                load_update = current_text
-                _last_load_status_text = current_text
-            else:
-                load_update = gr.update()
-
-            # Decide whether to update interactive state for inputs/buttons.
-            if _last_ready_state is None or ready != _last_ready_state:
-                media_update = gr.update(interactive=ready)
-                btn_update = gr.update(interactive=ready)
-                _last_ready_state = ready
-            else:
-                media_update = gr.update()
-                btn_update = gr.update()
-
-            return load_update, media_update, btn_update
+        media_input.change(  # pylint: disable=no-member
+            fn=_default_output_names,
+            inputs=[media_input],
+            outputs=[output_name],
+        )
 
         demo.load(  # pylint: disable=no-member
-            fn=apply_ready_state,
+            fn=_apply_ready_state,
             outputs=[load_status, media_input, transcribe_btn],
         )
-        demo.queue(default_concurrency_limit=4)
+        demo.load(  # pylint: disable=no-member
+            fn=init_tab_instance_id,
+            inputs=[tab_instance_id],
+            outputs=[tab_instance_id],
+        )
+        demo.load(  # pylint: disable=no-member
+            fn=recover_session,
+            inputs=[tab_instance_id],
+            outputs=transcribe_outputs,
+        )
+        demo.queue(default_concurrency_limit=_gradio_transcribe_concurrency() + 4)
 
     return demo
 
 
 def _register_progress_api(demo: gr.Blocks) -> None:
     """Expose GET /job/progress for frontend polling (avoid Gradio /api POST namespace)."""
+    from starlette.requests import Request
     from starlette.responses import JSONResponse
     from starlette.routing import Route
 
-    async def progress_api(_request):
+    def progress_api(request: Request):
+        tab_id = request.query_params.get("tab_id")
+        if tab_id:
+            runtime, _ = resolve_runtime(tab_id)
+            return JSONResponse(runtime["progress"].snapshot())
         return JSONResponse(get_job_progress().snapshot())
 
     demo.app.routes.insert(0, Route("/job/progress", progress_api, methods=["GET"]))
@@ -928,7 +1228,11 @@ def _register_progress_api(demo: gr.Blocks) -> None:
 
 def main() -> None:
     """Start the Gradio server (CLI, launcher subprocess, or PyInstaller --app-server)."""
+    from backend.asr_quality import apply_quality_profile
+
     ensure_app_dirs()
+    apply_cpu_thread_limits()
+    apply_quality_profile()
     hardware = detect_hardware()
     logger.info("Selected backend: %s / %s", hardware["backend"], hardware["selected_device"])
     _preload_models()
@@ -939,7 +1243,7 @@ def main() -> None:
     launch_kwargs = {
         "server_name": server_name,
         "server_port": server_port,
-        "max_threads": 40,
+        "max_threads": 8,
         "show_error": True,
         "share": _env_bool("GRADIO_SHARE", False),
     }
