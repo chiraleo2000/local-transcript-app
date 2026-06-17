@@ -43,12 +43,27 @@ def _model_cache_dir(model_id: str) -> Path:
     return _hub_cache_dir() / f"models--{model_id.replace('/', '--')}"
 
 
-def has_cached_model_file(model_id: str, filename: str = "config.json") -> bool:
+def _snapshot_file_usable(path: Path) -> bool:
+    """Return whether a cached snapshot entry is readable (not a broken symlink)."""
+    try:
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def has_cached_model_file(model_id: str, filename: str | None = None) -> bool:
     """Return whether a Hugging Face snapshot contains a required model file."""
     snapshots_dir = _model_cache_dir(model_id) / "snapshots"
     if not snapshots_dir.is_dir():
         return False
-    return any(snapshot.joinpath(filename).exists() for snapshot in snapshots_dir.iterdir())
+    candidates = (filename,) if filename else ("config.json", "config.yaml")
+    for snapshot in snapshots_dir.iterdir():
+        if not snapshot.is_dir():
+            continue
+        for name in candidates:
+            if _snapshot_file_usable(snapshot / name):
+                return True
+    return False
 
 
 def allow_online_download_if_missing(model_id: str, logger) -> None:

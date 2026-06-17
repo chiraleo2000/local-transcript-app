@@ -158,13 +158,19 @@ def _cleanup_cancelled_job(temp_files: list[str]) -> None:
     _phase_teardown("cancel_cleanup", aggressive=should_unload_on_cancel())
 
 
-def _selected_engines(selected_engines: list[str] | str) -> list[str]:
+def _selected_engines(
+    selected_engines: list[str] | str,
+    language: str = "Thai",
+) -> list[str]:
+    from backend.services.asr_local import resolve_asr_engines
+
     if isinstance(selected_engines, str):
         candidates = [selected_engines]
     else:
         candidates = list(selected_engines or [])
-    selected = [engine for engine in candidates if engine in ALL_ENGINES]
-    return (selected or default_asr_engines())[:1]
+    if not candidates:
+        candidates = default_asr_engines()
+    return resolve_asr_engines(language, candidates)
 
 
 def _speaker_limit(diarization: bool, max_speakers: int) -> int:
@@ -504,7 +510,7 @@ def _unload_asr_for_diarization() -> None:
     if not should_unload_asr_for_diarization():
         logger.info("ASR stays loaded on GPU (diarization runs on CPU).")
         return
-    logger.info("Unloading ASR models to free GPU VRAM for diarization.")
+    logger.info("Staging ASR off GPU so speaker diarization can use CUDA.")
     for engine in ALL_ENGINES:
         try:
             unload_model(engine)
@@ -615,7 +621,7 @@ def _execute_transcription_stages(
     if ctx.progress is not None:
         ctx.progress.set_audio_duration(audio_duration_s)
     logger.info("Job %s audio duration: %.2fs", ctx.job_id, audio_duration_s)
-    selected = _selected_engines(ctx.selected_engines)
+    selected = _selected_engines(ctx.selected_engines, ctx.language)
     speaker_limit = _speaker_limit(ctx.diarization, ctx.max_speakers)
     logger.info("Job %s selected engines after policy: %s", ctx.job_id, selected)
 

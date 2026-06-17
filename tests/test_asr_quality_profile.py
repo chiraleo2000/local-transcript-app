@@ -31,7 +31,7 @@ def test_high_profile_applies_300s_defaults(monkeypatch):
     assert os.environ["ASR_LONG_FORM_WINDOW_S"] == "300"
     assert os.environ["PATHUMMA_WORD_TIMESTAMPS_ON_8GB"] == "true"
     assert os.environ["DIARIZATION_MULTI_SAMPLE"] == "true"
-    assert os.environ["DIARIZATION_MULTI_SAMPLE_PASSES"] == "6"
+    assert os.environ["DIARIZATION_MULTI_SAMPLE_PASSES"] == "3"
     assert os.environ["DIARIZATION_SEGMENT_S"] == "360"
     assert os.environ["DIARIZATION_SEGMENT_OVERLAP_S"] == "90"
     assert os.environ["DIARIZATION_REFINE_AFTER_SEGMENTED"] == "true"
@@ -47,6 +47,8 @@ def test_low_vram_co_resident_keeps_auto_diarization(monkeypatch):
     monkeypatch.setenv("ASR_HARD_MEMORY_SAFE", "true")
     apply_quality_profile()
     assert os.environ["DIARIZATION_DEVICE"] == "auto"
+    assert os.environ["DIARIZATION_ALLOW_8GB_CUDA"] == "true"
+    assert os.environ["DIARIZATION_CUDA_MIN_FREE_MB"] == "1536"
     assert os.environ["ASR_UNLOAD_FOR_DIARIZATION"] == "false"
 
 
@@ -63,8 +65,19 @@ def test_low_vram_overrides_on_8gb_class(monkeypatch):
     assert os.environ["DIARIZATION_DEVICE"] == "cpu"
     assert os.environ["DIARIZATION_ALLOW_8GB_CUDA"] == "false"
     assert os.environ["ASR_UNLOAD_FOR_DIARIZATION"] == "false"
-    assert os.environ["DIARIZATION_MULTI_SAMPLE_PASSES"] == "6"
+    assert os.environ["DIARIZATION_MULTI_SAMPLE_PASSES"] == "3"
     assert os.environ["DIARIZATION_REFINE_AFTER_SEGMENTED"] == "true"
+
+
+def test_low_vram_respects_explicit_multi_sample_overrides(monkeypatch):
+    monkeypatch.setenv("ASR_QUALITY_PROFILE", "high")
+    monkeypatch.setenv("DIARIZATION_MULTI_SAMPLE_EARLY_STOP", "false")
+    monkeypatch.setenv("DIARIZATION_MULTI_SAMPLE_PASSES_8GB", "6")
+    monkeypatch.setattr("backend.services.asr_local._cuda_vram_mb", lambda: 8192)
+    monkeypatch.setenv("ASR_HARD_MEMORY_SAFE", "true")
+    apply_quality_profile()
+    assert os.environ["DIARIZATION_MULTI_SAMPLE_EARLY_STOP"] == "false"
+    assert os.environ["DIARIZATION_MULTI_SAMPLE_PASSES_8GB"] == "6"
 
 
 def test_high_profile_large_chunks_override(monkeypatch):

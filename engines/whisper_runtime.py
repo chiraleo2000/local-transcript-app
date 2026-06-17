@@ -469,7 +469,10 @@ def _should_stream_windows(runtime: WhisperRuntime, audio_duration_s: float) -> 
     """Use disk window streaming for medium+ clips to avoid full-file RAM load."""
     if audio_duration_s >= runtime.long_form_min_duration_s():
         return True
-    return _strict_memory_mode() and audio_duration_s >= 60
+    if not _strict_memory_mode():
+        return False
+    min_stream_s = _env_int("ASR_8GB_STREAM_MIN_DURATION_S", 180)
+    return audio_duration_s >= min_stream_s
 
 
 def format_asr_result(
@@ -489,7 +492,12 @@ def format_asr_result(
     if diarization_segments:
         from engines.diarization import assign_speakers
 
-        text = assign_speakers(result, diarization_segments, max_speakers=max_speakers)
+        text = assign_speakers(
+            result,
+            diarization_segments,
+            max_speakers=max_speakers,
+            audio_duration_s=audio_duration_s,
+        )
         import re
 
         ts_re = re.compile(r"\[\d{2}:\d{2}:\d{2} → \d{2}:\d{2}:\d{2}\] \[SPEAKER_\d+\]:")

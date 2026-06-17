@@ -1,4 +1,5 @@
 @echo off
+cd /d "%~dp0"
 echo ============================================================
 echo  Transcription Service - Run (Windows)
 echo  Usage:  run.bat          ^<-- run app directly (default)
@@ -14,17 +15,19 @@ REM ============================================================
 REM  DIRECT RUN MODE
 REM ============================================================
 
+call :SET_MODEL_ENV
+
 if not exist "venv\Scripts\activate.bat" (
     echo [ERROR] Virtual environment not found. Run setup.bat first.
     pause
     exit /b 1
 )
 
-echo [1/4] Checking Python...
+echo [1/5] Checking Python...
 venv\Scripts\python.exe --version
 if errorlevel 1 ( echo [ERROR] Python missing in venv. && pause && exit /b 1 )
 
-echo [2/4] Checking GPU...
+echo [2/5] Checking GPU...
 where nvidia-smi >nul 2>&1
 if errorlevel 1 (
     echo       No NVIDIA GPU detected — app will use OpenVINO/CPU.
@@ -32,7 +35,7 @@ if errorlevel 1 (
     nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
 )
 
-echo [3/4] Checking FFmpeg...
+echo [3/5] Checking FFmpeg...
 where ffmpeg >nul 2>&1
 if errorlevel 1 (
     echo [WARNING] ffmpeg not found. Install: choco install ffmpeg
@@ -40,10 +43,18 @@ if errorlevel 1 (
     echo       FFmpeg OK
 )
 
-echo [4/4] Starting local transcript app on http://localhost:7896 ...
+echo [4/5] Verifying local model cache under .\models\hf_cache\hub ...
+call venv\Scripts\activate
+python scripts\ensure_model_cache.py
+if errorlevel 1 (
+    echo [ERROR] Local model cache is incomplete. Check HF_TOKEN in .env and retry.
+    pause
+    exit /b 1
+)
+
+echo [5/5] Starting local transcript app on http://localhost:7896 ...
 echo.
 set "PYTHONPATH=%CD%;%PYTHONPATH%"
-call venv\Scripts\activate
 python app.py
 goto END
 
@@ -51,15 +62,23 @@ REM ============================================================
 REM  GUI / DESKTOP WINDOW MODE
 REM ============================================================
 :GUI
+call :SET_MODEL_ENV
 if not exist "venv\Scripts\activate.bat" (
     echo [ERROR] Virtual environment not found. Run setup.bat first.
     pause
     exit /b 1
 )
-echo Starting Local Transcript App in native desktop window...
-echo.
+echo Verifying local model cache under .\models\hf_cache\hub ...
 set "PYTHONPATH=%CD%;%PYTHONPATH%"
 call venv\Scripts\activate
+python scripts\ensure_model_cache.py
+if errorlevel 1 (
+    echo [ERROR] Local model cache is incomplete. Check HF_TOKEN in .env and retry.
+    pause
+    exit /b 1
+)
+echo Starting Local Transcript App in native desktop window...
+echo.
 python launcher.py
 goto END
 
@@ -94,5 +113,26 @@ echo.
 docker compose %COMPOSE_FILES% up --build -d
 docker logs -f transcription-service
 goto END
+
+:SET_MODEL_ENV
+set "APP_MODEL_ROOT=%CD%\models"
+set "HF_HOME=%CD%\models\hf_cache"
+set "HF_HUB_CACHE=%CD%\models\hf_cache\hub"
+set "HUGGINGFACE_HUB_CACHE=%CD%\models\hf_cache\hub"
+set "TORCH_HOME=%CD%\models\torch"
+set "OV_CACHE_DIR=%CD%\models\ov_cache"
+set "HF_HUB_DISABLE_SYMLINKS_WARNING=1"
+set "TRANSFORMERS_OFFLINE=0"
+set "HF_HUB_OFFLINE=0"
+set "APP_AUTO_DOWNLOAD_MISSING_MODELS=1"
+set "DIARIZATION_GPU_CO_RESIDENT=1"
+set "DIARIZATION_DEVICE=auto"
+set "DIARIZATION_PRELOAD_DEVICE=cpu"
+set "DIARIZATION_ALLOW_8GB_CUDA=1"
+set "DIARIZATION_CUDA_MIN_FREE_MB=1536"
+set "DIARIZATION_CUDA_RUN_MIN_FREE_MB=1024"
+set "ASR_DEFAULT_ENGINES=Auto"
+set "ASR_AUTO_POLICY=quality"
+exit /b 0
 
 :END

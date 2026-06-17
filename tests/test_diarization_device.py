@@ -94,6 +94,31 @@ def test_select_diarization_device_cpu_on_8gb_class(monkeypatch):
     assert str(device) == "cpu"
 
 
+def test_select_diarization_device_cuda_when_asr_staged_off_gpu(monkeypatch):
+    class _Cuda:
+        class cuda:
+            @staticmethod
+            def is_available():
+                return True
+
+        @staticmethod
+        def device(name):
+            return name
+
+    monkeypatch.setenv("DIARIZATION_DEVICE", "auto")
+    monkeypatch.setenv("DIARIZATION_GPU_CO_RESIDENT", "true")
+    monkeypatch.setenv("DIARIZATION_CUDA_MIN_FREE_MB", "1536")
+    monkeypatch.setattr(diarization, "_cuda_vram_mb", lambda _t: 8192)
+    monkeypatch.setattr(diarization, "_cuda_free_mb", lambda _t: 5200)
+    monkeypatch.setattr(
+        "backend.services.asr_local.model_is_loaded",
+        lambda _e: False,
+    )
+
+    device = diarization._select_diarization_device(_Cuda)
+    assert str(device) == "cuda"
+
+
 def test_select_diarization_device_cuda_when_co_resident_vram_ok(monkeypatch):
     class _Cuda:
         class cuda:

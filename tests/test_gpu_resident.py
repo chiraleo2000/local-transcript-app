@@ -44,12 +44,19 @@ def test_models_not_resident_when_clear_after_job(monkeypatch):
     assert not models_resident_on_gpu()
 
 
-def test_co_resident_never_unloads_asr_for_diarization(monkeypatch):
+def test_co_resident_keeps_asr_on_8gb_when_unload_disabled(monkeypatch):
     monkeypatch.setenv("DIARIZATION_GPU_CO_RESIDENT", "true")
-    monkeypatch.setattr(
-        "backend.services.asr_local.diarization_inference_uses_cuda",
-        lambda: True,
-    )
+    monkeypatch.setenv("DIARIZATION_DEVICE", "auto")
+    monkeypatch.setenv("ASR_UNLOAD_FOR_DIARIZATION", "false")
+    monkeypatch.setenv("ASR_HARD_MEMORY_SAFE", "true")
+    monkeypatch.setattr("backend.services.asr_local._cuda_vram_mb", lambda: 8192)
+    assert not should_unload_asr_for_diarization()
+
+
+def test_co_resident_keeps_asr_on_large_gpu(monkeypatch):
+    monkeypatch.setenv("DIARIZATION_GPU_CO_RESIDENT", "true")
+    monkeypatch.setenv("DIARIZATION_DEVICE", "auto")
+    monkeypatch.setattr("backend.services.asr_local._cuda_vram_mb", lambda: 24 * 1024)
     assert not should_unload_asr_for_diarization()
 
 

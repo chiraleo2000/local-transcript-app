@@ -13,6 +13,35 @@ echo
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+set_model_env() {
+    export APP_MODEL_ROOT="$SCRIPT_DIR/models"
+    export HF_HOME="$SCRIPT_DIR/models/hf_cache"
+    export HF_HUB_CACHE="$SCRIPT_DIR/models/hf_cache/hub"
+    export HUGGINGFACE_HUB_CACHE="$SCRIPT_DIR/models/hf_cache/hub"
+    export TORCH_HOME="$SCRIPT_DIR/models/torch"
+    export OV_CACHE_DIR="$SCRIPT_DIR/models/ov_cache"
+    export HF_HUB_DISABLE_SYMLINKS_WARNING=1
+    export TRANSFORMERS_OFFLINE=0
+    export HF_HUB_OFFLINE=0
+    export APP_AUTO_DOWNLOAD_MISSING_MODELS=1
+    export DIARIZATION_GPU_CO_RESIDENT=1
+    export DIARIZATION_DEVICE=auto
+    export DIARIZATION_PRELOAD_DEVICE=cpu
+    export DIARIZATION_ALLOW_8GB_CUDA=1
+    export DIARIZATION_CUDA_MIN_FREE_MB=1536
+    export DIARIZATION_CUDA_RUN_MIN_FREE_MB=1024
+    export ASR_DEFAULT_ENGINES=Auto
+    export ASR_AUTO_POLICY=quality
+}
+
+ensure_model_cache() {
+    echo "[cache] Verifying local model cache under ./models/hf_cache/hub ..."
+    python scripts/ensure_model_cache.py || {
+        echo "[ERROR] Local model cache is incomplete. Check HF_TOKEN in .env and retry."
+        exit 1
+    }
+}
+
 # ============================================================
 #  GUI / DESKTOP WINDOW MODE
 # ============================================================
@@ -21,10 +50,12 @@ if [ "${1:-}" = "gui" ]; then
         echo "[ERROR] Virtual environment not found. Run ./setup.sh first."
         exit 1
     fi
-    echo "Starting Local Transcript App in native desktop window..."
-    echo
+    set_model_env
     export PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}"
     source venv/bin/activate
+    ensure_model_cache
+    echo "Starting Local Transcript App in native desktop window..."
+    echo
     python launcher.py
     exit 0
 fi
@@ -65,25 +96,29 @@ if [ ! -f "venv/bin/activate" ]; then
     exit 1
 fi
 
-echo "[1/4] Checking Python..."
+set_model_env
+
+echo "[1/5] Checking Python..."
 venv/bin/python --version
 
-echo "[2/4] Checking GPU..."
+echo "[2/5] Checking GPU..."
 if command -v nvidia-smi &>/dev/null; then
     nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
 else
     echo "      nvidia-smi not found — will use OpenVINO / CPU fallback."
 fi
 
-echo "[3/4] Checking FFmpeg..."
+echo "[3/5] Checking FFmpeg..."
 if command -v ffmpeg &>/dev/null; then
     echo "      FFmpeg OK"
 else
     echo "[WARNING] ffmpeg not found. Install: sudo apt install ffmpeg  (Mac: brew install ffmpeg)"
 fi
 
-echo "[4/4] Starting local transcript app on http://localhost:7896 ..."
-echo
 export PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}"
 source venv/bin/activate
+ensure_model_cache
+
+echo "[5/5] Starting local transcript app on http://localhost:7896 ..."
+echo
 python app.py

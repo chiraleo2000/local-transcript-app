@@ -277,6 +277,12 @@ def _move_pipeline_to_inference_device(pipe) -> None:
     """Move cached pipeline to the inference device (CUDA when VRAM allows, else CPU)."""
     import torch
 
+    try:
+        from backend import vram_state
+
+        vram_state.teardown(aggressive=False)
+    except ImportError:
+        pass
     device = _select_diarization_device(torch)
     if device.type == "cuda":
         try:
@@ -322,6 +328,23 @@ def _asr_model_loaded() -> bool:
         return False
 
 
+def _diarization_run_min_free_mb() -> int:
+    """Minimum free VRAM to keep diarization on CUDA during inference."""
+    if os.getenv("DIARIZATION_CUDA_RUN_MIN_FREE_MB", "").strip():
+        return _env_int("DIARIZATION_CUDA_RUN_MIN_FREE_MB", 1024)
+    low_vram_limit_mb = _env_int("ASR_8GB_CLASS_MAX_MB", 9000)
+    vram_mb = 0
+    try:
+        import torch
+
+        vram_mb = _cuda_vram_mb(torch)
+    except ImportError:
+        pass
+    if 0 < vram_mb <= low_vram_limit_mb:
+        return 1024
+    return _env_int("DIARIZATION_CUDA_MIN_FREE_MB", 3072)
+
+
 def _diarization_cuda_eligible(
     requested: str,
     *,
@@ -334,18 +357,25 @@ def _diarization_cuda_eligible(
     gpu_co_resident: bool,
 ) -> bool:
     free_ok = free_mb >= min_free_mb
-    co_resident_ok = gpu_co_resident and _asr_model_loaded() and free_ok
+    asr_loaded = _asr_model_loaded()
+    co_resident_ok = gpu_co_resident and asr_loaded and free_ok
+    staging_ok = (
+        low_vram_cuda
+        and not asr_loaded
+        and free_ok
+        and vram_mb >= min_cuda_vram_mb
+    )
     standard_ok = vram_mb >= min_cuda_vram_mb and free_ok
     large_gpu_ok = vram_mb >= 12 * 1024 and free_ok
 
     if requested in {"cuda", "gpu"}:
-        if low_vram_cuda and not allow_low_vram_cuda and not gpu_co_resident:
+        if low_vram_cuda and not allow_low_vram_cuda and not gpu_co_resident and asr_loaded:
             logger.info(
                 "Diarization uses CPU on %d MB CUDA GPU so ASR can keep GPU VRAM.",
                 vram_mb,
             )
             return False
-        if co_resident_ok or standard_ok:
+        if staging_ok or co_resident_ok or standard_ok:
             return True
         logger.warning(
             "DIARIZATION_DEVICE=%s unavailable (total=%d MB free=%d MB); using CPU.",
@@ -355,6 +385,12 @@ def _diarization_cuda_eligible(
         )
         return False
 
+    if staging_ok:
+        logger.info(
+            "Diarization inference on CUDA (free=%d MB, ASR staged off GPU).",
+            free_mb,
+        )
+        return True
     if co_resident_ok:
         logger.info(
             "Diarization inference on CUDA (free=%d MB, ASR co-resident).",
@@ -363,7 +399,7 @@ def _diarization_cuda_eligible(
         return True
     if large_gpu_ok or standard_ok:
         return True
-    logger.info("GPU co-resident unavailable; diarization on CPU, ASR unchanged.")
+    logger.info("GPU diarization unavailable; diarization on CPU, ASR unchanged.")
     return False
 
 
@@ -451,7 +487,7 @@ def unload_model() -> None:
     logger.info("Pyannote diarization model cache cleared.")
 
 
-def _prepare_audio_for_pyannote(audio_path: str) -> dict:
+def _prepare_audio_for_pyannote(audio_path: str, preprocess_sr: int | None = None) -> dict:
     """Load audio as an in-memory 16 kHz mono waveform for pyannote.
 
     Pipeline:
@@ -474,10 +510,12 @@ def _prepare_audio_for_pyannote(audio_path: str) -> dict:
     # skips a needless resample. Noise reduction defaults to OFF because
     # aggressive spectral gating degrades speaker embedding quality; the
     # ffmpeg loudness normalization below handles level/clipping issues.
-    preprocess_sr = _env_int("DIARIZATION_PREPROCESS_SR", 16000)
+    effective_sr = (
+        preprocess_sr if preprocess_sr is not None else _env_int("DIARIZATION_PREPROCESS_SR", 16000)
+    )
     noise_reduction = _env_float("DIARIZATION_NOISE_REDUCTION", 0.0)
     source_path, tmp_files = _build_diarization_source(
-        audio_path, preprocess_sr, noise_reduction
+        audio_path, effective_sr, noise_reduction
     )
 
     try:
@@ -491,7 +529,7 @@ def _prepare_audio_for_pyannote(audio_path: str) -> dict:
         "Prepared diarization audio: %.1fs at %d Hz (intermediate=%d Hz, nr=%.2f)",
         duration,
         sample_rate,
-        preprocess_sr,
+        effective_sr,
         noise_reduction,
     )
     return {"waveform": tensor, "sample_rate": 16000}
@@ -953,7 +991,7 @@ def _move_pipeline_to_cpu_if_cuda_memory_low(pipe) -> None:
 
         if not torch.cuda.is_available():
             return
-        min_free_mb = _env_int("DIARIZATION_CUDA_MIN_FREE_MB", 1024)
+        min_free_mb = _diarization_run_min_free_mb()
         free_bytes, _total_bytes = torch.cuda.mem_get_info()
         free_mb = int(free_bytes // (1024 * 1024))
         if free_mb >= min_free_mb:
@@ -1333,6 +1371,17 @@ def _remap_speakers(segments: list[dict]) -> dict:
     return speaker_map
 
 
+def _slice_audio_input(audio_input: dict, start_s: float, end_s: float) -> dict:
+    """Slice a preloaded waveform dict for tune-window multi-sample."""
+    waveform = audio_input["raw"]
+    sr = int(audio_input["sampling_rate"])
+    start_i = max(0, int(start_s * sr))
+    end_i = min(len(waveform), int(end_s * sr))
+    if end_i <= start_i:
+        end_i = min(len(waveform), start_i + sr)
+    return {"raw": waveform[start_i:end_i], "sampling_rate": sr}
+
+
 def _execute_pyannote_pass(pipe, audio_input: dict, kwargs: dict) -> list[dict]:
     """Run one pyannote pass and return raw segments."""
     diarization = _run_pyannote(pipe, audio_input, kwargs)
@@ -1401,12 +1450,20 @@ def _tune_segmented_diarization_params(
     if not multi_sample_sweep_enabled() or max_speakers < 2:
         return adaptive_params
 
-    tune_start = min(max(60.0, audio_duration_s * 0.08), max(0.0, audio_duration_s - 120.0))
-    tune_dur = min(float(segment_s), 180.0, max(60.0, audio_duration_s - tune_start))
+    from engines.diarization_sampling import tune_window_bounds
+
+    bounds = tune_window_bounds(audio_duration_s)
+    if bounds:
+        tune_start, tune_end = bounds
+        tune_dur = tune_end - tune_start
+    else:
+        tune_start = min(max(60.0, audio_duration_s * 0.08), max(0.0, audio_duration_s - 120.0))
+        tune_dur = min(float(segment_s), 180.0, max(60.0, audio_duration_s - tune_start))
+        tune_end = tune_start + tune_dur
     logger.info(
         "Tuning diarization params on sample window %.1fs-%.1fs (%.1fs) before segmented pass.",
         tune_start,
-        tune_start + tune_dur,
+        tune_end,
         tune_dur,
     )
 
@@ -1565,6 +1622,60 @@ def _configure_diarization_pipeline(
     return adaptive_params
 
 
+def _run_waveform_diarization_on_input(
+    pipe,
+    audio_input: dict,
+    kwargs: dict,
+    audio_duration_s: float,
+    max_speakers: int,
+    adaptive_params: dict | None,
+    ui_override: bool,
+    num_speakers: int,
+    use_multi_sample: bool,
+) -> list[dict]:
+    from engines.diarization_sampling import (
+        run_multi_sample_diarization,
+        select_best_diarization_params,
+        tune_window_bounds,
+    )
+
+    tune_bounds = tune_window_bounds(audio_duration_s) if use_multi_sample else None
+    if use_multi_sample and tune_bounds:
+        tune_start, tune_end = tune_bounds
+        tune_dur = tune_end - tune_start
+        tune_input = _slice_audio_input(audio_input, tune_start, tune_end)
+        tuned_params, winner, score = select_best_diarization_params(
+            lambda params, label: _instantiate_pipeline_params(pipe, params, label),
+            lambda: _execute_pyannote_pass(pipe, tune_input, kwargs),
+            tune_dur,
+            max_speakers,
+            adaptive_params,
+        )
+        if tuned_params:
+            _instantiate_pipeline_params(pipe, tuned_params, f"tune-window:{winner}")
+        logger.info(
+            "Long-audio tune window selected %s (score=%.3f); running full pass.",
+            winner,
+            score,
+        )
+        segments = _execute_pyannote_pass(pipe, audio_input, kwargs)
+    elif use_multi_sample:
+        segments, winner, score = run_multi_sample_diarization(
+            lambda params, label: _instantiate_pipeline_params(pipe, params, label),
+            lambda: _execute_pyannote_pass(pipe, audio_input, kwargs),
+            audio_duration_s,
+            max_speakers,
+            adaptive_params,
+        )
+        logger.info("Multi-sample diarization selected config %s (score=%.3f).", winner, score)
+    else:
+        segments = _execute_pyannote_pass(pipe, audio_input, kwargs)
+    return _maybe_retry_single_speaker(
+        pipe, audio_input, kwargs, segments, adaptive_params,
+        ui_override, num_speakers, max_speakers, audio_duration_s,
+    )
+
+
 def _run_waveform_diarization(
     pipe,
     audio_path: str,
@@ -1576,41 +1687,83 @@ def _run_waveform_diarization(
     num_speakers: int,
 ) -> list[dict]:
     from engines.diarization_sampling import (
+        multi_sample_preprocess_srs,
         multi_sample_sweep_enabled,
-        run_multi_sample_diarization,
+        score_segments,
     )
     from backend import vram_state
 
-    audio_input = _prepare_audio_for_pyannote(audio_path)
+    use_multi_sample = multi_sample_sweep_enabled() and not ui_override
+    preprocess_srs = multi_sample_preprocess_srs() if use_multi_sample else []
+    if not preprocess_srs:
+        preprocess_srs = [_env_int("DIARIZATION_PREPROCESS_SR", 16000)]
+
+    from engines.diarization_sampling import (
+        multi_sample_max_total_tries,
+        multi_sample_max_tries,
+    )
+
     logger.info(
-        "Running diarization on preloaded waveform duration=%.1fs kwargs=%s multi_sample=%s ...",
+        "Running diarization duration=%.1fs kwargs=%s multi_sample=%s preprocess_srs=%s "
+        "budget=%d total (%d per SR) ...",
         audio_duration_s,
         kwargs or "(auto)",
-        multi_sample_sweep_enabled() and not ui_override,
+        use_multi_sample,
+        preprocess_srs,
+        multi_sample_max_total_tries() if use_multi_sample else 0,
+        multi_sample_max_tries() if use_multi_sample else 0,
     )
-    try:
-        if multi_sample_sweep_enabled() and not ui_override:
-            segments, winner, score = run_multi_sample_diarization(
-                lambda params, label: _instantiate_pipeline_params(pipe, params, label),
-                lambda: _execute_pyannote_pass(pipe, audio_input, kwargs),
+
+    best_segments: list[dict] = []
+    best_score = -1.0
+    best_label = "none"
+
+    for sr in preprocess_srs:
+        audio_input = _prepare_audio_for_pyannote(audio_path, preprocess_sr=sr)
+        try:
+            segments = _run_waveform_diarization_on_input(
+                pipe,
+                audio_input,
+                kwargs,
                 audio_duration_s,
                 max_speakers,
                 adaptive_params,
+                ui_override,
+                num_speakers,
+                use_multi_sample,
             )
-            logger.info("Multi-sample diarization selected config %s (score=%.3f).", winner, score)
-        else:
-            segments = _execute_pyannote_pass(pipe, audio_input, kwargs)
-        segments = _maybe_retry_single_speaker(
-            pipe, audio_input, kwargs, segments, adaptive_params,
-            ui_override, num_speakers, max_speakers, audio_duration_s,
+            if len(preprocess_srs) > 1:
+                score = score_segments(segments, audio_duration_s, max_speakers)
+                n_spk = len({s["speaker"] for s in segments})
+                logger.info(
+                    "Diarization preprocess SR=%d Hz: segments=%d speakers=%d score=%.3f",
+                    sr,
+                    len(segments),
+                    n_spk,
+                    score,
+                )
+                if score > best_score:
+                    best_score = score
+                    best_segments = segments
+                    best_label = f"sr={sr}"
+            else:
+                best_segments = segments
+        finally:
+            del audio_input
+            vram_state.teardown(aggressive=False)
+
+    if len(preprocess_srs) > 1:
+        logger.info(
+            "Multi-SR diarization winner: %s (score=%.3f, segments=%d)",
+            best_label,
+            best_score,
+            len(best_segments),
         )
-        return _refine_long_diarization_spans(
-            pipe, audio_path, segments, kwargs, adaptive_params,
-            max_speakers, audio_duration_s,
-        )
-    finally:
-        del audio_input
-        vram_state.teardown(aggressive=False)
+
+    return _refine_long_diarization_spans(
+        pipe, audio_path, best_segments, kwargs, adaptive_params,
+        max_speakers, audio_duration_s,
+    )
 
 
 def _finalize_diarization_segments(
@@ -2143,6 +2296,27 @@ def _merge_transcript_lines(lines: list[str], max_gap_s: float | None = None) ->
     return merged
 
 
+def _text_unit_count(text: str) -> int:
+    """Count assignable units: whitespace tokens, or characters for unsegmented Thai."""
+    words = text.split()
+    if len(words) > 1:
+        return len(words)
+    return len(text.strip())
+
+
+def _slice_text_units(text: str, i0: int, i1: int) -> str:
+    """Return text slice for unit range [i0, i1)."""
+    words = text.split()
+    if len(words) > 1:
+        i0 = max(0, min(len(words), i0))
+        i1 = max(i0, min(len(words), i1))
+        return " ".join(words[i0:i1]).strip()
+    chars = list(text.strip())
+    i0 = max(0, min(len(chars), i0))
+    i1 = max(i0, min(len(chars), i1))
+    return "".join(chars[i0:i1]).strip()
+
+
 def _slice_text_for_interval(
     text: str,
     chunk_start: float,
@@ -2151,19 +2325,19 @@ def _slice_text_for_interval(
     interval_end: float,
 ) -> str:
     """Return the portion of *text* that falls inside one time interval."""
-    words = text.split()
-    if not words:
+    unit_count = _text_unit_count(text)
+    if unit_count == 0:
         return ""
     chunk_dur = max(0.001, chunk_end - chunk_start)
     start_frac = max(0.0, min(1.0, (interval_start - chunk_start) / chunk_dur))
     end_frac = max(start_frac, min(1.0, (interval_end - chunk_start) / chunk_dur))
     if end_frac <= start_frac:
         return ""
-    i0 = int(round(start_frac * len(words)))
-    i1 = int(round(end_frac * len(words)))
-    i0 = max(0, min(len(words) - 1, i0))
-    i1 = max(i0 + 1, min(len(words), i1))
-    return " ".join(words[i0:i1]).strip()
+    i0 = int(round(start_frac * unit_count))
+    i1 = int(round(end_frac * unit_count))
+    i0 = max(0, min(unit_count - 1, i0))
+    i1 = max(i0 + 1, min(unit_count, i1))
+    return _slice_text_units(text, i0, i1)
 
 
 def _build_asr_timeline(chunks: list[dict], total_dur: float) -> list[dict]:
@@ -2194,45 +2368,55 @@ def _build_asr_timeline(chunks: list[dict], total_dur: float) -> list[dict]:
     return timeline
 
 
-def _exclusive_words_for_overlap(
-    words: list[str],
-    consumed: dict[int, int],
-    ti: int,
-    i0: int,
-    i1: int,
-) -> str | None:
-    i0 = max(i0, consumed.get(ti, 0))
-    if i1 <= i0:
-        return None
-    consumed[ti] = i1
-    sliced = " ".join(words[i0:i1]).strip()
-    return sliced or None
-
-
 def _word_indices_for_overlap(
     cs: float,
     ce: float,
     overlap_start: float,
     overlap_end: float,
-    word_count: int,
+    unit_count: int,
 ) -> tuple[int, int]:
     chunk_dur = max(0.001, ce - cs)
     start_frac = max(0.0, min(1.0, (overlap_start - cs) / chunk_dur))
     end_frac = max(start_frac, min(1.0, (overlap_end - cs) / chunk_dur))
-    i0 = int(round(start_frac * word_count))
-    i1 = int(round(end_frac * word_count))
-    i0 = max(0, min(word_count - 1, i0))
-    i1 = max(i0 + 1, min(word_count, i1))
+    i0 = int(round(start_frac * unit_count))
+    i1 = int(round(end_frac * unit_count))
+    i0 = max(0, min(unit_count - 1, i0))
+    i1 = max(i0 + 1, min(unit_count, i1))
     return i0, i1
+
+
+def _exclusive_units_for_overlap(
+    text: str,
+    consumed: dict[int, set[int]],
+    ti: int,
+    i0: int,
+    i1: int,
+) -> str | None:
+    bucket = consumed.setdefault(ti, set())
+    taken = [idx for idx in range(i0, i1) if idx not in bucket]
+    if not taken:
+        return None
+    bucket.update(taken)
+    return _slice_text_units(text, taken[0], taken[-1] + 1)
+
+
+def _exclusive_words_for_overlap(
+    text: str,
+    consumed: dict[int, set[int]],
+    ti: int,
+    i0: int,
+    i1: int,
+) -> str | None:
+    return _exclusive_units_for_overlap(text, consumed, ti, i0, i1)
 
 
 def _collect_text_for_interval(
     timeline: list[dict],
     iv_start: float,
     iv_end: float,
-    consumed: dict[int, int] | None = None,
+    consumed: dict[int, set[int]] | None = None,
 ) -> str:
-    """Collect ASR text overlapping one diarization turn (exclusive word assignment)."""
+    """Collect ASR text overlapping one diarization turn (exclusive unit assignment)."""
     min_overlap_s = _env_float("DIARIZATION_MIN_OVERLAP_S", 0.08)
     parts: list[tuple[float, str]] = []
     for ti, item in enumerate(timeline):
@@ -2241,16 +2425,16 @@ def _collect_text_for_interval(
         overlap_end = min(ce, iv_end)
         if overlap_end - overlap_start < min_overlap_s:
             continue
-        words = text.split()
-        if not words:
+        unit_count = _text_unit_count(text)
+        if unit_count == 0:
             continue
-        i0, i1 = _word_indices_for_overlap(cs, ce, overlap_start, overlap_end, len(words))
+        i0, i1 = _word_indices_for_overlap(cs, ce, overlap_start, overlap_end, unit_count)
         if consumed is None:
             sliced = _slice_text_for_interval(text, cs, ce, overlap_start, overlap_end)
             if sliced:
                 parts.append((overlap_start, sliced))
             continue
-        sliced = _exclusive_words_for_overlap(words, consumed, ti, i0, i1)
+        sliced = _exclusive_words_for_overlap(text, consumed, ti, i0, i1)
         if sliced:
             parts.append((overlap_start, sliced))
     parts.sort(key=lambda pair: pair[0])
@@ -2276,21 +2460,26 @@ def _line_start_seconds(line: str) -> float:
     return _parse_hms(f"{h}:{m}:{s}")
 
 
+def _previous_same_speaker_line_text(lines: list[str], speaker: str) -> str:
+    """Return body text from the most recent output line for this speaker."""
+    for line in reversed(lines):
+        match = _LINE_TS_RE.match(line.strip())
+        if match and match.group(7) == speaker:
+            return match.group(8).strip()
+    return ""
+
+
 def _append_turn_line(
     lines: list[str],
-    last_text_by_speaker: dict[str, str],
     speaker: str,
     start: float,
     end: float,
     text: str,
 ) -> None:
     text = _dedup_repetitions(text)
-    text = _novel_turn_text(last_text_by_speaker.get(speaker, ""), text)
+    text = _novel_turn_text(_previous_same_speaker_line_text(lines, speaker), text)
     if not text:
         return
-    last_text_by_speaker[speaker] = _join_turn_texts(
-        last_text_by_speaker.get(speaker, ""), text,
-    )
     lines.append(
         f"[{_fmt_ts(start)} → {_fmt_ts(end)}] [{speaker}]: {text}"
     )
@@ -2303,11 +2492,34 @@ def _timeline_chunk_covered(cs: float, ce: float, turns: list[dict]) -> bool:
     )
 
 
-def _orphan_text_for_chunk(item: dict, consumed: dict[int, int], ti: int) -> str:
-    words = item["text"].split()
-    if words and consumed.get(ti, 0) < len(words):
-        return " ".join(words[consumed.get(ti, 0) :]).strip()
-    return item["text"].strip()
+def _orphan_text_for_chunk(item: dict, consumed: dict[int, set[int]], ti: int) -> str:
+    text = item["text"].strip()
+    unit_count = _text_unit_count(text)
+    assigned = consumed.get(ti, set())
+    remaining = [idx for idx in range(unit_count) if idx not in assigned]
+    if not remaining:
+        return ""
+    return _slice_text_units(text, remaining[0], remaining[-1] + 1)
+
+
+def _uncovered_intervals(
+    turns: list[dict],
+    total_dur: float,
+    min_gap_s: float = 0.25,
+) -> list[tuple[float, float]]:
+    """Return timeline spans with no diarization turn coverage."""
+    if total_dur <= 0:
+        return []
+    ordered = sorted(turns, key=lambda turn: turn["start"])
+    gaps: list[tuple[float, float]] = []
+    cursor = 0.0
+    for turn in ordered:
+        if turn["start"] - cursor >= min_gap_s:
+            gaps.append((cursor, turn["start"]))
+        cursor = max(cursor, turn["end"])
+    if total_dur - cursor >= min_gap_s:
+        gaps.append((cursor, total_dur))
+    return gaps
 
 
 def _append_orphan_timeline_lines(
@@ -2315,20 +2527,27 @@ def _append_orphan_timeline_lines(
     timeline: list[dict],
     turns: list[dict],
     diarization_segments: list[dict],
-    consumed: dict[int, int],
-    last_text_by_speaker: dict[str, str],
+    consumed: dict[int, set[int]],
+    total_dur: float,
 ) -> None:
+    for gap_start, gap_end in _uncovered_intervals(turns, total_dur):
+        text = _collect_text_for_interval(timeline, gap_start, gap_end, consumed)
+        if not text:
+            continue
+        speaker = _find_speaker(gap_start, gap_end, diarization_segments)
+        _append_turn_line(lines, speaker, gap_start, gap_end, text)
+
     for ti, item in enumerate(timeline):
         cs, ce = item["start"], item["end"]
-        words = item["text"].split()
-        if consumed.get(ti, 0) >= len(words) and words:
+        unit_count = _text_unit_count(item["text"])
+        assigned = consumed.get(ti, set())
+        if unit_count and len(assigned) >= unit_count:
             continue
-        if _timeline_chunk_covered(cs, ce, turns) and consumed.get(ti, 0) >= len(words):
+        if _timeline_chunk_covered(cs, ce, turns) and len(assigned) >= unit_count:
             continue
         speaker = _find_speaker(cs, ce, diarization_segments)
         _append_turn_line(
             lines,
-            last_text_by_speaker,
             speaker,
             cs,
             ce,
@@ -2341,22 +2560,22 @@ def _assign_speakers_by_turns(
     result: dict,
     diarization_segments: list[dict],
     max_speakers: int,
+    audio_duration_s: float = 0.0,
 ) -> list[str]:
     """Assign ASR text to each pyannote turn (not one label per ASR chunk)."""
     diar_end = diarization_segments[-1]["end"] if diarization_segments else 0.0
-    timeline = _build_asr_timeline(result.get("chunks") or [], diar_end)
+    total_dur = max(audio_duration_s, diar_end) if audio_duration_s > 0 else diar_end
+    timeline = _build_asr_timeline(result.get("chunks") or [], total_dur)
     turns = _turns_for_transcript(diarization_segments, max_speakers)
 
     lines: list[str] = []
-    consumed: dict[int, int] = {}
-    last_text_by_speaker: dict[str, str] = {}
+    consumed: dict[int, set[int]] = {}
     for turn in turns:
         text = _collect_text_for_interval(
             timeline, turn["start"], turn["end"], consumed,
         )
         _append_turn_line(
             lines,
-            last_text_by_speaker,
             turn["speaker"],
             turn["start"],
             turn["end"],
@@ -2365,7 +2584,7 @@ def _assign_speakers_by_turns(
 
     if timeline and turns:
         _append_orphan_timeline_lines(
-            lines, timeline, turns, diarization_segments, consumed, last_text_by_speaker,
+            lines, timeline, turns, diarization_segments, consumed, total_dur,
         )
 
     return _merge_transcript_lines(lines)
@@ -2375,6 +2594,7 @@ def assign_speakers(
     result: dict,
     diarization_segments: list[dict],
     max_speakers: int = 0,
+    audio_duration_s: float = 0.0,
 ) -> str:
     """Align Whisper output chunks with speaker segments.
 
@@ -2397,22 +2617,27 @@ def assign_speakers(
 
     non_empty = [c for c in chunks if c.get("text", "").strip()]
     diar_end = diarization_segments[-1]["end"]
+    total_dur = max(audio_duration_s, diar_end) if audio_duration_s > 0 else diar_end
     all_ts_none = all(_ts_is_none(c.get("timestamp")) for c in non_empty)
 
     if max_speakers <= 0:
         max_speakers = len({s["speaker"] for s in diarization_segments})
 
     logger.info(
-        "assign_speakers: total_chunks=%d  all_ts_none=%s  total_dur=%.1fs  "
-        "diar_segments=%d  speakers=%s  mode=turn_centric",
+        "assign_speakers: total_chunks=%d  all_ts_none=%s  audio_dur=%.1fs  "
+        "diar_end=%.1fs  timeline_dur=%.1fs  diar_segments=%d  speakers=%s  mode=turn_centric",
         len(non_empty),
         all_ts_none,
+        audio_duration_s,
         diar_end,
+        total_dur,
         len(diarization_segments),
         sorted({s["speaker"] for s in diarization_segments}),
     )
 
-    lines = _assign_speakers_by_turns(result, diarization_segments, max_speakers)
+    lines = _assign_speakers_by_turns(
+        result, diarization_segments, max_speakers, audio_duration_s,
+    )
     logger.info("assign_speakers complete: output_lines=%d", len(lines))
     from engines.text_cleanup import clean_transcript_lines
 

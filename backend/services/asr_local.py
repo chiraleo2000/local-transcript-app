@@ -16,9 +16,12 @@ logger = logging.getLogger(__name__)
 
 ENGINE_TYPHOON = "Typhoon Whisper"
 ENGINE_PATHUMMA = "Pathumma Whisper"
+ENGINE_AUTO = "Auto"
 _LEGACY_ENGINE_NAMES: dict[str, str] = {}
 ALL_ENGINES = [ENGINE_PATHUMMA, ENGINE_TYPHOON]
+UI_ENGINE_CHOICES = [ENGINE_AUTO, ENGINE_TYPHOON, ENGINE_PATHUMMA]
 FAST_8GB_ENGINES = [ENGINE_PATHUMMA]
+_AUTO_ALIASES = frozenset({"auto", ENGINE_AUTO.lower(), "auto (best for language)"})
 
 LANGUAGES = {
     "Thai": "thai",
@@ -86,24 +89,84 @@ def should_clear_model_between_engines() -> bool:
     return _env_bool("ASR_CLEAR_VRAM_BETWEEN_ENGINES", False)
 
 
+def is_auto_engine(selection: str) -> bool:
+    """Return whether the UI/env selection means language-aware auto routing."""
+    return selection.strip().lower() in _AUTO_ALIASES
+
+
+def best_asr_engine_for_language(language: str) -> str:
+    """Pick the highest-quality local engine for the requested UI language."""
+    policy = os.getenv("ASR_AUTO_POLICY", "quality").strip().lower()
+    lang = (language or "Thai").strip()
+    if policy in {"fast", "speed", "balanced"} and lang == "Thai":
+        return ENGINE_PATHUMMA
+    if lang == "Thai":
+        return ENGINE_TYPHOON
+    if lang == "English":
+        return ENGINE_TYPHOON
+    return ENGINE_TYPHOON
+
+
+def engine_for_preload(selection: str) -> str:
+    """Map UI selection (including Auto) to a concrete engine to warm at startup."""
+    normalized = _LEGACY_ENGINE_NAMES.get(selection, selection)
+    if is_auto_engine(normalized):
+        configured = os.getenv("ASR_AUTO_PRELOAD_ENGINE", "").strip()
+        if configured:
+            mapped = _LEGACY_ENGINE_NAMES.get(configured, configured)
+            if mapped in ALL_ENGINES:
+                return mapped
+        return best_asr_engine_for_language("Thai")
+    if normalized in ALL_ENGINES:
+        return normalized
+    return best_asr_engine_for_language("Thai")
+
+
+def resolve_asr_engine(language: str, selection: str) -> str:
+    """Resolve Auto (or unknown) to a concrete ASR engine for one job."""
+    normalized = _LEGACY_ENGINE_NAMES.get(selection, selection)
+    if is_auto_engine(normalized):
+        resolved = best_asr_engine_for_language(language)
+        logger.info(
+            "ASR auto engine: language=%s -> %s (policy=%s)",
+            language,
+            resolved,
+            os.getenv("ASR_AUTO_POLICY", "quality"),
+        )
+        return resolved
+    if normalized in ALL_ENGINES:
+        return normalized
+    logger.warning("Unknown ASR engine %r; using auto fallback.", selection)
+    return best_asr_engine_for_language(language)
+
+
+def resolve_asr_engines(language: str, selection: str | list[str]) -> list[str]:
+    """Return a one-element engine list for pipeline/UI job submission."""
+    if isinstance(selection, list):
+        pick = selection[0] if selection else ENGINE_AUTO
+    else:
+        pick = selection or ENGINE_AUTO
+    return [resolve_asr_engine(language, pick)]
+
+
 def default_asr_engines() -> list[str]:
-    """Return one default ASR engine for startup preload and UI selection."""
+    """Return default ASR selection for startup preload and UI (often Auto)."""
     configured = os.getenv("ASR_DEFAULT_ENGINES", "").strip()
     if configured:
         names = [part.strip() for part in configured.split(",") if part.strip()]
-        selected = [
-            _LEGACY_ENGINE_NAMES.get(engine, engine)
-            for engine in names
-            if _LEGACY_ENGINE_NAMES.get(engine, engine) in ALL_ENGINES
-        ]
+        selected: list[str] = []
+        for engine in names:
+            normalized = _LEGACY_ENGINE_NAMES.get(engine, engine)
+            if is_auto_engine(normalized):
+                selected.append(ENGINE_AUTO)
+            elif normalized in ALL_ENGINES:
+                selected.append(normalized)
         if selected:
             return selected[:1]
         logger.warning(
-            "ASR_DEFAULT_ENGINES=%r has no known engines; using policy default.", configured
+            "ASR_DEFAULT_ENGINES=%r has no known engines; using Auto.", configured
         )
-    if strict_memory_mode_active():
-        return FAST_8GB_ENGINES.copy()
-    return [ALL_ENGINES[0]]
+    return [ENGINE_AUTO]
 
 
 def clear_accelerator_cache() -> None:
@@ -136,9 +199,13 @@ def should_unload_on_cancel() -> bool:
     return _env_bool("ASR_UNLOAD_ON_CANCEL", False)
 
 
-def switch_asr_engine(selected_engine: str) -> None:
+def switch_asr_engine(selected_engine: str, *, language: str | None = None) -> None:
     """Unload other engines and load the selected one (UI engine change only)."""
     selected_engine = _LEGACY_ENGINE_NAMES.get(selected_engine, selected_engine)
+    if is_auto_engine(selected_engine):
+        selected_engine = engine_for_preload(ENGINE_AUTO)
+        if language:
+            selected_engine = resolve_asr_engine(language, ENGINE_AUTO)
     if selected_engine not in ALL_ENGINES:
         raise ValueError(f"Unknown ASR engine: {selected_engine}")
     for engine in ALL_ENGINES:
@@ -193,6 +260,23 @@ def should_clear_models_after_job() -> bool:
     return _env_bool("ASR_CLEAR_VRAM_AFTER_JOB", False)
 
 
+def diarization_wants_cuda() -> bool:
+    """True when diarization is configured to prefer CUDA (ignores transient free VRAM)."""
+    requested = os.getenv("DIARIZATION_DEVICE", "auto").strip().lower()
+    if requested == "cpu":
+        return False
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return False
+    except (ImportError, RuntimeError, OSError, AttributeError):
+        return False
+    if requested in {"cuda", "gpu"}:
+        return True
+    return _env_bool("DIARIZATION_GPU_CO_RESIDENT", False)
+
+
 def diarization_inference_uses_cuda() -> bool:
     """True when pyannote diarization will run on CUDA (not CPU)."""
     try:
@@ -215,11 +299,13 @@ def models_resident_on_gpu() -> bool:
 
 
 def should_unload_asr_for_diarization() -> bool:
-    """Never unload ASR for diarization when GPU co-resident policy is enabled."""
-    if _env_bool("DIARIZATION_GPU_CO_RESIDENT", True):
+    """Stage ASR off GPU before diarization when pyannote needs CUDA VRAM."""
+    if not diarization_wants_cuda():
         return False
-    if not diarization_inference_uses_cuda():
-        return False
+    if _env_bool("DIARIZATION_GPU_CO_RESIDENT", False):
+        return _env_bool("ASR_UNLOAD_FOR_DIARIZATION", False)
+    if strict_memory_mode_active():
+        return _env_bool("ASR_UNLOAD_FOR_DIARIZATION", False)
     if models_resident_on_gpu():
         return _env_bool("ASR_UNLOAD_FOR_DIARIZATION", False)
     return _env_bool("ASR_UNLOAD_FOR_DIARIZATION", True)

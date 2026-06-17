@@ -43,7 +43,13 @@ _PROFILE_DEFAULTS: dict[str, dict[str, str]] = {
         "DIARIZATION_TRANSCRIPT_MERGE_GAP_S": "1.0",
         "DIARIZATION_ACCURACY_MODE": "true",
         "DIARIZATION_MULTI_SAMPLE": "true",
-        "DIARIZATION_MULTI_SAMPLE_PASSES": "6",
+        "DIARIZATION_MULTI_SAMPLE_PASSES": "3",
+        "DIARIZATION_MULTI_SAMPLE_PASSES_8GB": "3",
+        "DIARIZATION_MULTI_SAMPLE_MAX_TOTAL": "9",
+        "DIARIZATION_MULTI_SAMPLE_EARLY_STOP": "true",
+        "DIARIZATION_MULTI_SAMPLE_TUNE_WINDOW": "true",
+        "DIARIZATION_MULTI_SAMPLE_TUNE_MIN_AUDIO_S": "300",
+        "DIARIZATION_MULTI_SAMPLE_TUNE_MAX_S": "150",
         "DIARIZATION_PREPROCESS_SR": "44100",
         "DIARIZATION_SEGMENT_S": "360",
         "DIARIZATION_SEGMENT_OVERLAP_S": "90",
@@ -99,7 +105,8 @@ def apply_low_vram_overrides() -> list[str]:
         return []
 
     chunk_cap = "90" if _env_bool("ASR_8GB_ALLOW_LARGE_CHUNKS", False) else "60"
-    diar_device = "auto" if _env_bool("DIARIZATION_GPU_CO_RESIDENT", False) else "cpu"
+    co_resident = _env_bool("DIARIZATION_GPU_CO_RESIDENT", False)
+    diar_device = "auto" if co_resident else "cpu"
     forced = {
         "PATHUMMA_WORD_TIMESTAMPS_ON_8GB": "false",
         "ASR_8GB_CHUNK_LENGTH_S": chunk_cap,
@@ -107,12 +114,21 @@ def apply_low_vram_overrides() -> list[str]:
         "ASR_8GB_RETRY_CHUNK_LENGTH_S": "15",
         "DIARIZATION_PRELOAD_DEVICE": "cpu",
         "DIARIZATION_DEVICE": diar_device,
-        "DIARIZATION_ALLOW_8GB_CUDA": "false",
+        "DIARIZATION_ALLOW_8GB_CUDA": "true" if co_resident else "false",
+        "DIARIZATION_CUDA_MIN_FREE_MB": "1536" if co_resident else "1024",
+        "DIARIZATION_CUDA_RUN_MIN_FREE_MB": "1024",
         "ASR_UNLOAD_FOR_DIARIZATION": "false",
     }
     applied: list[str] = []
     for key, value in forced.items():
         if os.getenv(key, "") != value:
+            os.environ[key] = value
+            applied.append(f"{key}={value}")
+    for key, value in {
+        "DIARIZATION_MULTI_SAMPLE_PASSES_8GB": "4",
+        "DIARIZATION_MULTI_SAMPLE_EARLY_STOP": "true",
+    }.items():
+        if not os.getenv(key, "").strip():
             os.environ[key] = value
             applied.append(f"{key}={value}")
     if applied:

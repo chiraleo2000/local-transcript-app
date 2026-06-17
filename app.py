@@ -131,11 +131,16 @@ from backend.ui_session import (
 )
 from backend.services.asr_local import (
     ALL_ENGINES,
+    ENGINE_AUTO,
     ENGINE_PATHUMMA,
     LANGUAGES,
+    UI_ENGINE_CHOICES,
     clear_accelerator_cache,
     default_asr_engines,
+    engine_for_preload,
+    is_auto_engine,
     load_model,
+    resolve_asr_engines,
     switch_asr_engine,
 )
 from backend.storage import ensure_app_dirs, list_jobs, load_job
@@ -275,13 +280,14 @@ def _preload_models() -> None:
         return
 
     preload_engines = default_asr_engines()
-    skipped = [e for e in ALL_ENGINES if e not in preload_engines]
+    warmed_engines = [engine_for_preload(engine) for engine in preload_engines]
+    skipped = [e for e in ALL_ENGINES if e not in warmed_engines]
     for engine in skipped:
         _load_status[engine] = "available"
     if skipped:
         logger.info(
             "ASR eager preload limited to %s; others available on demand.",
-            ", ".join(preload_engines),
+            ", ".join(warmed_engines),
         )
 
     preload_failed = False
@@ -299,7 +305,7 @@ def _preload_models() -> None:
             logger.exception("%s load failed: %s", engine, exc)
 
     for engine in preload_engines:
-        _load(engine)
+        _load(engine_for_preload(engine))
 
     diarization_preload_mode = os.getenv("DIARIZATION_PRELOAD_MODE", "eager").strip().lower()
     if diarization_preload_mode in {"eager", "preload", "true", "1"}:
@@ -536,10 +542,8 @@ def _reset_ui_outputs(tab_id: str) -> tuple:
     )
 
 
-def _selected_engines_for_job(selected_engines) -> list[str]:
-    if isinstance(selected_engines, str):
-        return [selected_engines]
-    return list(selected_engines or default_asr_engines())[:1]
+def _selected_engines_for_job(selected_engines, language: str) -> list[str]:
+    return resolve_asr_engines(language, selected_engines or default_asr_engines())
 
 
 def _diarize_kwargs_for_job(
@@ -598,7 +602,7 @@ def _transcription_error_outputs(tracker: JobProgress, exc: Exception) -> tuple:
 @dataclass
 class _TranscribeRequest:
     media_path: str
-    selected_engines: list
+    selected_engines: str
     language: str
     diarization: bool
     max_speakers: int
@@ -735,7 +739,7 @@ def transcribe(*inputs):
         cancel_tab_job(runtime)
 
     cancel_event = fresh_cancel_event(runtime, cancel_previous=False)
-    selected = _selected_engines_for_job(req.selected_engines)
+    selected = _selected_engines_for_job(req.selected_engines, req.language)
     diarize_kwargs = _diarize_kwargs_for_job(
         req.diarization,
         req.diar_override_defaults,
@@ -747,8 +751,9 @@ def transcribe(*inputs):
     )
 
     no_dl = gr.update(value=None, interactive=False)
-    engines_label = selected[0]
-    runtime["selected_asr_engine"] = engines_label
+    auto_selected = is_auto_engine(req.selected_engines)
+    engines_label = f"Auto → {selected[0]}" if auto_selected else selected[0]
+    runtime["selected_asr_engine"] = req.selected_engines if auto_selected else selected[0]
     output_name, display_name, source_filename = _resolve_job_names(
         req.media_path,
         req.output_name,
@@ -862,7 +867,7 @@ def _on_engine_change(new_engine: str, tab_id: str):
         runtime["selected_asr_engine"] = new_engine
         return gr.update()
     try:
-        switch_asr_engine(new_engine)
+        switch_asr_engine(new_engine, language="Thai")
     except Exception as exc:  # pylint: disable=broad-exception-caught
         logger.exception("ASR engine switch failed: %s", exc)
         return gr.update()
@@ -961,9 +966,14 @@ def build_ui() -> gr.Blocks:
                 )
             with gr.Column(scale=2, min_width=260):
                 engine_selector = gr.Radio(
-                    choices=ALL_ENGINES,
+                    choices=UI_ENGINE_CHOICES,
                     value=default_asr_engines()[0],
                     label="Local ASR Engine",
+                    info=(
+                        "Auto picks the best engine for the selected language "
+                        "(Typhoon for Thai/English quality; Pathumma for Thai when "
+                        "ASR_AUTO_POLICY=fast)."
+                    ),
                 )
             with gr.Column(scale=1, min_width=180):
                 enhance = gr.Checkbox(
