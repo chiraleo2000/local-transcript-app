@@ -1,4 +1,4 @@
-"""Golden automation: sample01 accuracy + Recording 172 performance."""
+"""Golden automation: sample01 accuracy + long-audio performance fixtures."""
 
 from __future__ import annotations
 
@@ -19,6 +19,25 @@ def _gpu_integration_enabled() -> bool:
     }
 
 
+def _run_perf(fixture_name: str) -> None:
+    fixture = active_fixture(fixture_name)
+    if not fixture.audio.is_file():
+        pytest.skip(f"audio missing: {fixture.audio}")
+    if not _gpu_integration_enabled():
+        pytest.skip("set RUN_GPU_INTEGRATION=1")
+    outcome = run_golden_fixture(
+        fixture,
+        run_id=f"pytest-{fixture_name}",
+        production_mode=True,
+    )
+    assert outcome["passed"], (
+        f"{fixture_name} performance failed\n"
+        f"elapsed={outcome['elapsed_s']:.1f}s target={outcome['target_s']:.1f}s\n"
+        f"performance_met={outcome['performance_met']}\n"
+        f"output={outcome['output_path']}"
+    )
+
+
 @pytest.fixture(scope="module")
 def sample01_fixture():
     fixture = active_fixture("sample01")
@@ -26,14 +45,6 @@ def sample01_fixture():
         pytest.skip(f"golden audio missing: {fixture.audio}")
     if fixture.expected is None or not fixture.expected.is_file():
         pytest.skip(f"golden transcript missing: {fixture.expected}")
-    return fixture
-
-
-@pytest.fixture(scope="module")
-def recording172_fixture():
-    fixture = active_fixture("recording172")
-    if not fixture.audio.is_file():
-        pytest.skip(f"long audio missing: {fixture.audio}")
     return fixture
 
 
@@ -70,18 +81,19 @@ def test_sample01_meets_golden_transcript(sample01_fixture):
 @pytest.mark.golden
 @pytest.mark.gpu
 @pytest.mark.slow
-def test_recording172_meets_performance_target(recording172_fixture):
-    if not _gpu_integration_enabled():
-        pytest.skip("set RUN_GPU_INTEGRATION=1 to run golden GPU integration test")
+def test_recording172_meets_performance_target():
+    _run_perf("recording172")
 
-    outcome = run_golden_fixture(
-        recording172_fixture,
-        run_id="pytest-recording172",
-        production_mode=True,
-    )
-    assert outcome["passed"], (
-        f"recording172 performance failed\n"
-        f"elapsed={outcome['elapsed_s']:.1f}s target={outcome['target_s']:.1f}s\n"
-        f"performance_met={outcome['performance_met']}\n"
-        f"output={outcome['output_path']}"
-    )
+
+@pytest.mark.golden
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_recording19_meets_performance_target():
+    _run_perf("recording19")
+
+
+@pytest.mark.golden
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_sample47_meets_performance_target():
+    _run_perf("sample47")

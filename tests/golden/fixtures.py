@@ -19,6 +19,7 @@ class GoldenFixture:
     max_speakers: int = 0
     accuracy_threshold: float | None = 0.95
     check_performance: bool = True
+    production_mode: bool = False
 
     def requires_accuracy(self) -> bool:
         return self.accuracy_threshold is not None and self.expected is not None
@@ -27,6 +28,9 @@ class GoldenFixture:
         if not self.check_performance:
             return 0.0
         return performance_target_seconds(_probe_audio_duration_s(self.audio))
+
+    def audio_duration_s(self) -> float:
+        return _probe_audio_duration_s(self.audio)
 
 
 def _probe_audio_duration_s(path: Path) -> float:
@@ -58,6 +62,7 @@ FIXTURES: dict[str, GoldenFixture] = {
         max_speakers=4,
         accuracy_threshold=0.95,
         check_performance=True,
+        production_mode=False,
     ),
     "recording172": GoldenFixture(
         name="recording172",
@@ -67,8 +72,32 @@ FIXTURES: dict[str, GoldenFixture] = {
         max_speakers=0,
         accuracy_threshold=None,
         check_performance=True,
+        production_mode=True,
+    ),
+    "recording19": GoldenFixture(
+        name="recording19",
+        audio=REPO_ROOT / "tests" / "Recording 19.wav",
+        expected=None,
+        output=REPO_ROOT / "tests" / "output" / "Recording_19_actual.txt",
+        max_speakers=0,
+        accuracy_threshold=None,
+        check_performance=True,
+        production_mode=True,
+    ),
+    "sample47": GoldenFixture(
+        name="sample47",
+        audio=REPO_ROOT / "tests" / "47.m4a",
+        expected=None,
+        output=REPO_ROOT / "tests" / "output" / "47_actual.txt",
+        max_speakers=0,
+        accuracy_threshold=None,
+        check_performance=True,
+        production_mode=True,
     ),
 }
+
+ACCURACY_FIXTURES = ("sample01",)
+LONG_PERF_FIXTURES = ("recording172", "recording19", "sample47")
 
 
 def active_fixture(name: str | None = None) -> GoldenFixture:
@@ -80,4 +109,8 @@ def active_fixture(name: str | None = None) -> GoldenFixture:
 
 
 def all_fixtures() -> list[GoldenFixture]:
-    return [FIXTURES["sample01"], FIXTURES["recording172"]]
+    return [FIXTURES[name] for name in (*ACCURACY_FIXTURES, *LONG_PERF_FIXTURES)]
+
+
+def long_perf_fixtures() -> list[GoldenFixture]:
+    return [FIXTURES[name] for name in LONG_PERF_FIXTURES]

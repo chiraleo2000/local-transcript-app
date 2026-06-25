@@ -133,14 +133,15 @@ def apply_performance_policy(audio_duration_s: float, *, diarization: bool) -> d
     }
     long_audio_s = _env_float("ASR_TARGET_LONG_AUDIO_S", 3600.0)
     if audio_duration_s >= long_audio_s:
-        beams = 2
+        beams = 1
         applied["ASR_FAST_MODE"] = "true"
         applied["ASR_TURN_GUIDED"] = "false"
         applied["ASR_LONG_FORM_MIN_DURATION_S"] = "600"
-        applied["ASR_LONG_FORM_WINDOW_S"] = "1200"
-        applied["ASR_LONG_FORM_OVERLAP_S"] = "60"
-        applied["DIARIZATION_SEGMENT_S"] = "360"
-        applied["DIARIZATION_SEGMENT_OVERLAP_S"] = "60"
+        applied["ASR_LONG_FORM_WINDOW_S"] = "2400"
+        applied["ASR_LONG_FORM_OVERLAP_S"] = "45"
+        applied["DIARIZATION_MAX_ASR_WINDOW_S"] = "2400"
+        applied["DIARIZATION_SEGMENT_S"] = "600"
+        applied["DIARIZATION_SEGMENT_OVERLAP_S"] = "45"
         applied["DIARIZATION_REFINE_AFTER_SEGMENTED"] = "false"
         applied["DIARIZATION_KEEP_PRELOADED"] = "false"
         applied["ASR_KEEP_PRELOADED"] = "false"

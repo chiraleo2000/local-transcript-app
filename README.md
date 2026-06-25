@@ -606,6 +606,14 @@ DIARIZATION_CUDA_MIN_VRAM_MB=12288
 
 Each job manifest records `audio_duration_s`, `total_elapsed_s`, `target_elapsed_s`, and `target_met`. Targets are tiered: **≤10 min** for short clips (&lt;20 min), **≤30 min** for medium long files, and **min(30 min, duration ÷ 4)** for 1 h+ audio. Adaptive policy raises beam width on short dialogue and switches 1 h+ files to windowed long-form ASR after segmented CUDA diarization.
 
+### Golden automation (GPU regression)
+
+```powershell
+python scripts/run_golden_automation.py --deploy
+```
+
+Fixtures: `test-sample01.m4a` (≥95% vs `tests/test-sample01.txt`) plus long-audio perf smoke tests on `Recording 172.wav`, `Recording 19.wav`, and `47.m4a`. Use `--skip-long` for the short clip only (~6 min).
+
 ### Stopping the app
 
 Press `Ctrl+C` in the terminal window where `app.py` is running.

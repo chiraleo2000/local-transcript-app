@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deploy Docker GPU stack and run golden automation (sample01 + long-audio perf)."""
+"""Deploy Docker GPU stack and run golden automation across all fixtures."""
 
 from __future__ import annotations
 
@@ -22,7 +22,13 @@ from tests.golden.config import (  # noqa: E402
     GOLDEN_ACCURACY_ENV,
     apply_golden_env,
 )
-from tests.golden.fixtures import active_fixture, all_fixtures  # noqa: E402
+from tests.golden.fixtures import (  # noqa: E402
+    LONG_PERF_FIXTURES,
+    GoldenFixture,
+    active_fixture,
+    all_fixtures,
+    long_perf_fixtures,
+)
 
 COMPOSE_FILE = REPO_ROOT / "docker-compose.gpu.yml"
 SERVICE_NAME = "transcription"
@@ -48,15 +54,14 @@ def _print_outcome(outcome: dict) -> None:
     print(f"Output: {outcome['output_path']}")
 
 
-def _run_sample01_profiles(threshold: float) -> int:
+def _run_accuracy_fixture(fixture: GoldenFixture, threshold: float) -> int:
     from tests.golden.runner import run_golden_fixture
 
-    fixture = active_fixture("sample01")
     if not fixture.audio.is_file():
-        print(f"SKIP sample01: audio missing ({fixture.audio})")
+        print(f"SKIP {fixture.name}: audio missing ({fixture.audio})")
         return 1
 
-    print("=== Golden accuracy: test-sample01.m4a ===")
+    print(f"=== Golden accuracy: {fixture.audio.name} ===")
     best_score = 0.0
     best_profile = 0
 
@@ -67,7 +72,7 @@ def _run_sample01_profiles(threshold: float) -> int:
             outcome = run_golden_fixture(
                 fixture,
                 threshold=threshold,
-                run_id=f"sample01-p{idx + 1}",
+                run_id=f"{fixture.name}-p{idx + 1}",
                 profile_extra=profile_extra,
             )
         except Exception as exc:
@@ -80,39 +85,40 @@ def _run_sample01_profiles(threshold: float) -> int:
             best_profile = idx + 1
         _print_outcome(outcome)
         if outcome["passed"]:
-            print(f"PASSED sample01 on profile {idx + 1}")
+            print(f"PASSED {fixture.name} on profile {idx + 1}")
             return 0
         print("Below threshold or over time budget; trying next profile...")
 
-    print(f"\nFAILED sample01: best accuracy {best_score:.1%} (profile {best_profile})")
+    print(f"\nFAILED {fixture.name}: best accuracy {best_score:.1%} (profile {best_profile})")
     return 1
 
 
-def _run_recording172_perf() -> int:
+def _run_perf_fixture(fixture: GoldenFixture) -> int:
     from tests.golden.runner import run_golden_fixture
 
-    fixture = active_fixture("recording172")
     if not fixture.audio.is_file():
-        print(f"SKIP recording172: audio missing ({fixture.audio})")
+        print(f"SKIP {fixture.name}: audio missing ({fixture.audio})")
         return 0
 
-    print("\n=== Long-audio performance: Recording 172.wav ===")
-    print(f"Target elapsed: {fixture.performance_target_s():.1f}s")
+    duration = fixture.audio_duration_s()
+    target = fixture.performance_target_s()
+    print(f"\n=== Long-audio performance: {fixture.audio.name} ===")
+    print(f"Audio: {duration:.1f}s ({duration / 60:.1f} min) | Target: {target:.1f}s ({target / 60:.1f} min)")
     try:
         outcome = run_golden_fixture(
             fixture,
-            run_id="recording172",
-            production_mode=True,
+            run_id=fixture.name,
+            production_mode=fixture.production_mode,
         )
     except Exception as exc:
-        print(f"recording172 FAILED: {exc}")
+        print(f"{fixture.name} FAILED: {exc}")
         return 1
 
     _print_outcome(outcome)
     if outcome["passed"]:
-        print("PASSED recording172 performance smoke test")
+        print(f"PASSED {fixture.name} performance smoke test")
         return 0
-    print("FAILED recording172 performance smoke test")
+    print(f"FAILED {fixture.name} performance smoke test")
     return 1
 
 
@@ -121,25 +127,33 @@ def _run_direct(fixtures: list[str] | None = None) -> int:
     os.environ["RUN_GPU_INTEGRATION"] = "1"
     threshold = float(os.getenv("GOLDEN_ACCURACY_THRESHOLD", "0.95"))
 
-    selected = fixtures or ["sample01", "recording172"]
+    selected = set(fixtures) if fixtures else None
     rc = 0
-    if "sample01" in selected:
-        rc = _run_sample01_profiles(threshold) or rc
-    if "recording172" in selected:
-        rc = _run_recording172_perf() or rc
+
+    for fixture in all_fixtures():
+        if selected is not None and fixture.name not in selected:
+            continue
+        if fixture.requires_accuracy():
+            rc = _run_accuracy_fixture(fixture, threshold) or rc
+        else:
+            rc = _run_perf_fixture(fixture) or rc
     return rc
 
 
 def _run_pytest(fixtures: list[str] | None) -> int:
     apply_golden_env()
     os.environ["RUN_GPU_INTEGRATION"] = "1"
-    tests = []
-    if not fixtures or "sample01" in fixtures:
-        tests.append("tests/test_golden_automation.py::test_sample01_meets_golden_transcript")
-    if not fixtures or "recording172" in fixtures:
-        tests.append(
-            "tests/test_golden_automation.py::test_recording172_meets_performance_target"
-        )
+    selected = set(fixtures) if fixtures else None
+    tests: list[str] = []
+    mapping = {
+        "sample01": "tests/test_golden_automation.py::test_sample01_meets_golden_transcript",
+        "recording172": "tests/test_golden_automation.py::test_recording172_meets_performance_target",
+        "recording19": "tests/test_golden_automation.py::test_recording19_meets_performance_target",
+        "sample47": "tests/test_golden_automation.py::test_sample47_meets_performance_target",
+    }
+    for name, node in mapping.items():
+        if selected is None or name in selected:
+            tests.append(node)
     if not tests:
         tests = ["tests/test_golden_automation.py"]
 
@@ -279,15 +293,17 @@ def main() -> int:
     parser.add_argument(
         "--skip-long",
         action="store_true",
-        help="skip recording172 long-audio performance test",
+        help="skip long-audio performance tests (recording172, recording19, sample47)",
     )
     args = parser.parse_args()
 
     fixtures = _parse_fixtures(args.fixtures)
-    if args.skip_long and fixtures is None:
-        fixtures = ["sample01"]
-    elif args.skip_long and fixtures:
-        fixtures = [f for f in fixtures if f != "recording172"]
+    if args.skip_long:
+        long_names = set(LONG_PERF_FIXTURES)
+        if fixtures is None:
+            fixtures = [f.name for f in all_fixtures() if f.name not in long_names]
+        else:
+            fixtures = [f for f in fixtures if f not in long_names]
 
     if args.in_container:
         return _run_direct(fixtures)

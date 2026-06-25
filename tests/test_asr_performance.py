@@ -61,8 +61,9 @@ class TestApplyPolicy(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True):
             applied = apply_performance_policy(77 * 60, diarization=True)
         self.assertEqual(applied.get("ASR_TURN_GUIDED"), "false")
-        self.assertEqual(applied.get("ASR_NUM_BEAMS"), "2")
-        self.assertEqual(applied.get("ASR_LONG_FORM_WINDOW_S"), "1200")
+        self.assertEqual(applied.get("ASR_NUM_BEAMS"), "1")
+        self.assertEqual(applied.get("ASR_LONG_FORM_WINDOW_S"), "2400")
+        self.assertEqual(applied.get("DIARIZATION_MAX_ASR_WINDOW_S"), "2400")
 
     def test_disabled_when_flag_off(self) -> None:
         with patch.dict(os.environ, {"ASR_ADAPTIVE_PERFORMANCE": "false"}, clear=False):
