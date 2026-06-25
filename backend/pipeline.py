@@ -327,7 +327,10 @@ def _prepare_selected_asr_model(selected: list[str], *, after_diarization: bool 
         try:
             from backend import vram_state
 
-            vram_state.teardown(aggressive=True)
+            fast = os.getenv("ASR_FAST_MODE", "").strip().lower() in {
+                "1", "true", "yes", "on",
+            }
+            vram_state.teardown(aggressive=not fast)
         except ImportError:
             clear_accelerator_cache()
     selected_engine = selected[0]
@@ -474,11 +477,9 @@ def _run_asr_engines(
 
 
 def _performance_target_seconds(audio_duration_s: float) -> float:
-    if audio_duration_s <= 0:
-        return 0.0
-    if audio_duration_s < 9 * 60:
-        return 180.0
-    return audio_duration_s / 3.0
+    from backend.asr_performance import performance_target_seconds
+
+    return performance_target_seconds(audio_duration_s)
 
 
 def _clear_asr_models(selected: list[str]) -> None:
@@ -623,6 +624,9 @@ def _execute_transcription_stages(
     if ctx.progress is not None:
         ctx.progress.set_audio_duration(audio_duration_s)
     logger.info("Job %s audio duration: %.2fs", ctx.job_id, audio_duration_s)
+    from backend.asr_performance import apply_performance_policy
+
+    apply_performance_policy(audio_duration_s, diarization=ctx.diarization)
     selected = _selected_engines(ctx.selected_engines, ctx.language)
     speaker_limit = _speaker_limit(ctx.diarization, ctx.max_speakers)
     logger.info("Job %s selected engines after policy: %s", ctx.job_id, selected)

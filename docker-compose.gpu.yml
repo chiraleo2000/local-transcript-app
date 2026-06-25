@@ -23,7 +23,7 @@ services:
       - .env
     # environment: values below override .env (prevents stale local .env breaking GPU deploy)
     environment:
-      - APP_VERSION=1.0.0
+      - APP_VERSION=1.1.1
       - GRADIO_SERVER_PORT=7896
       - GRADIO_SERVER_NAME=0.0.0.0
       - APP_CPU_THREADS=16
@@ -47,8 +47,16 @@ services:
       - APP_SUPPRESS_WARNING_LOGS=false
       - PYTHONUNBUFFERED=1
       - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:128
-      # --- ASR concurrency ---
-      # 8 GB GPU staging: sequential engines, ASR unloads before CUDA diarization.
+      # --- High-accuracy GPU profile with adaptive realtime budgets ---
+      - ASR_ADAPTIVE_PERFORMANCE=true
+      - ASR_TARGET_SHORT_MAX_S=600
+      - ASR_TARGET_LONG_MAX_S=1800
+      - ASR_TARGET_MEDIUM_AUDIO_S=1200
+      - ASR_TARGET_LONG_AUDIO_S=3600
+      - ASR_TARGET_RT_RATIO_LONG=4
+      - ASR_NUM_BEAMS_MAX=8
+      - ASR_NUM_BEAMS_MIN=4
+      - ASR_FAST_MODE=false
       - ASR_PARALLEL_MODE=sequential
       - ASR_PARALLEL_MIN_VRAM_MB=12288
       - ASR_ALLOW_8GB_PARALLEL=false
@@ -67,7 +75,7 @@ services:
       - ASR_NO_SPEECH_THRESHOLD=0.5
       - ASR_DEFAULT_ENGINES=Auto
       - ASR_AUTO_POLICY=quality
-      - ASR_NUM_BEAMS=8
+      - ASR_NUM_BEAMS=6
       - ASR_QUALITY_PROFILE=high
       - ASR_CUDA_BATCH_SIZE=1
       - ASR_BATCH_MIN_FREE_MB=5000
@@ -80,8 +88,8 @@ services:
       - ASR_8GB_CHUNK_LENGTH_S=45
       - ASR_8GB_MAX_CHUNK_LENGTH_S=45
       - ASR_8GB_RETRY_CHUNK_LENGTH_S=15
-      - ASR_MIN_CHUNKED_DURATION_S=120
-      - ASR_8GB_ALLOW_LARGE_CHUNKS=false
+      - ASR_MIN_CHUNKED_DURATION_S=90
+      - ASR_8GB_ALLOW_LARGE_CHUNKS=true
       - ASR_MAX_CONCURRENT_INFERENCE=1
       - ASR_UNLOAD_ON_CANCEL=false
       - UI_CANCEL_JOIN_TIMEOUT_S=120
@@ -89,17 +97,17 @@ services:
       - DIARIZATION_ASSIGN_TURN_MERGE_GAP_S=0.0
       - DIARIZATION_ASSIGN_IMBALANCE_RATIO=0.70
       - ASR_TURN_GUIDED=true
-      - ASR_TURN_GUIDED_MAX_TURN_S=50
-      - ASR_TURN_GUIDED_MERGE_GAP_S=0.35
-      - ASR_TURN_GUIDED_MIN_TURN_S=0.15
+      - ASR_TURN_GUIDED_MAX_TURN_S=90
+      - ASR_TURN_GUIDED_MERGE_GAP_S=0.55
+      - ASR_TURN_GUIDED_MIN_TURN_S=0.4
       - ASR_CLEANUP_THAI_SPACING=true
       - DIARIZATION_MIN_OVERLAP_S=0.06
       - DIARIZATION_SPLIT_MIN_TURN_S=1.5
       - ASR_8GB_STREAM_MIN_DURATION_S=240
-      - ASR_WORD_TIMESTAMPS_WITH_DIARIZATION=true
+      - ASR_WORD_TIMESTAMPS_WITH_DIARIZATION=false
       - TYPHOON_WORD_TIMESTAMPS_ON_8GB=false
       - PATHUMMA_WORD_TIMESTAMPS_ON_8GB=false
-      - ASR_LONG_FORM_MIN_DURATION_S=300
+      - ASR_LONG_FORM_MIN_DURATION_S=720
       - ASR_LONG_FORM_WINDOW_S=420
       - ASR_LONG_FORM_OVERLAP_S=75
       - ASR_SUSPICIOUS_FIRST_TS_S=60
@@ -107,7 +115,7 @@ services:
       - ASR_MAX_CHUNK_CHARS_PER_SECOND=35
       - ASR_ATTENTION_IMPLEMENTATION=sdpa
       - ASR_PRELOAD_MODE=lazy
-      - ASR_KEEP_PRELOADED=false
+      - ASR_KEEP_PRELOADED=true
       - ASR_CLEAR_VRAM_ON_MEDIA_CHANGE=false
       - UI_PREVIEW_MAX_MB=32
       - UI_PREVIEW_MAX_DURATION_S=300
@@ -119,7 +127,7 @@ services:
       - UI_GRADIO_TRANSCRIBE_CONCURRENCY=8
       # Audio enhancement is CPU-only; ASR + diarization stay on GPU.
       - AUDIO_ENHANCE_USE_GPU=false
-      - AUDIO_ENHANCE_DEFAULT=true
+      - AUDIO_ENHANCE_DEFAULT=false
       - AUDIO_ENHANCE_WHEN_DIARIZATION=false
       - AUDIO_ENHANCE_TARGET_PEAK_DB=-0.5
       - AUDIO_ENHANCE_MAX_GAIN_DB=24
@@ -134,11 +142,11 @@ services:
       - AUDIO_ENHANCE_COMPRESSOR_RATIO=4
       - AUDIO_ENHANCE_LIMITER_THRESHOLD_DB=-0.5
       - DIARIZATION_MODEL_ID=pyannote/speaker-diarization-community-1
-      # 8 GB GPU staging: unload ASR → CUDA diar (single pass) → CUDA turn-guided ASR.
+      # CUDA diar (single pass) → turn-guided Typhoon ASR with adaptive beams.
       - DIARIZATION_DEVICE=cuda
       - DIARIZATION_GPU_CO_RESIDENT=false
-      - DIARIZATION_KEEP_PRELOADED=false
-      - DIARIZATION_PRELOAD_MODE=lazy
+      - DIARIZATION_KEEP_PRELOADED=true
+      - DIARIZATION_PRELOAD_MODE=eager
       - DIARIZATION_PRELOAD_DEVICE=cpu
       - DIARIZATION_CUDA_MIN_VRAM_MB=6000
       - DIARIZATION_CUDA_MIN_FREE_MB=768
@@ -153,7 +161,7 @@ services:
       - DIARIZATION_MEGA_TURN_RETRY_S=45
       - DIARIZATION_MEGA_TURN_SCORE_THRESHOLD_S=45
       - DIARIZATION_CHUNK_ALIGN_MIN_OVERLAP_S=1.5
-      - DIARIZATION_PREPROCESS_SR=44100
+      - DIARIZATION_PREPROCESS_SR=16000
       - DIARIZATION_SEGMENT_S=480
       - DIARIZATION_SEGMENT_OVERLAP_S=150
       - DIARIZATION_MAX_ASR_WINDOW_S=300

@@ -17,7 +17,7 @@ services:
     env_file:
       - .env
     environment:
-      - APP_VERSION=1.0.0
+      - APP_VERSION=1.1.1
       - GRADIO_SERVER_NAME=0.0.0.0
       - GRADIO_SERVER_PORT=7896
       - APP_CPU_THREADS=16

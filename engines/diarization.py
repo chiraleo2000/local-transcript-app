@@ -189,6 +189,20 @@ def _cuda_free_mb(torch_module) -> int:
         return 0
 
 
+def _is_recoverable_cuda_error(msg: str) -> bool:
+    lowered = msg.lower()
+    return any(
+        token in lowered
+        for token in (
+            "out of memory",
+            "device not ready",
+            "cachingallocator",
+            "internal assert",
+            "cuda error",
+        )
+    )
+
+
 def _recover_cuda_after_failure(torch_module) -> None:
     """Best-effort CUDA cleanup after a failed device move."""
     import gc
@@ -1148,7 +1162,7 @@ def _run_pyannote(pipe, audio_input: dict, kwargs: dict):
         return _call_pyannote(pipe, audio_input, kwargs)
     except RuntimeError as exc:
         msg = str(exc).lower()
-        if "out of memory" not in msg and "device not ready" not in msg:
+        if not _is_recoverable_cuda_error(msg):
             raise
         if _diarization_cuda_required() and _tracked_device == "cuda":
             logger.warning(
@@ -1162,6 +1176,11 @@ def _run_pyannote(pipe, audio_input: dict, kwargs: dict):
                 vram_state.teardown(aggressive=True)
             except ImportError:
                 pass
+            try:
+                unload_model()
+            except (RuntimeError, AttributeError):
+                pass
+            pipe = _get_diarization_pipeline()
             _move_pipeline_to_inference_device(pipe)
             try:
                 return _call_pyannote(pipe, audio_input, kwargs)
@@ -1641,6 +1660,8 @@ def _effective_diarization_segment_s(audio_duration_s: float) -> int:
         return max(base, 900) if not is_accuracy_mode() else min(base, 420)
     if audio_duration_s >= 7200:
         return max(base, 600) if not is_accuracy_mode() else min(base, 360)
+    if audio_duration_s >= 3600:
+        return min(base, 300)
     return base
 
 
@@ -1785,11 +1806,33 @@ def _diarize_segmented(
             subprocess.run(cmd, check=True, capture_output=True)
             audio_input = _prepare_audio_for_pyannote(tmp_path)
             try:
-                segments = _execute_pyannote_pass(pipe, audio_input, kwargs)
+                try:
+                    segments = _execute_pyannote_pass(pipe, audio_input, kwargs)
+                except RuntimeError as exc:
+                    if not _is_recoverable_cuda_error(str(exc)):
+                        raise
+                    logger.warning(
+                        "Segmented diarization segment %d failed (%s); reloading pipeline.",
+                        segment_idx,
+                        exc,
+                    )
+                    import torch
+                    from backend import vram_state
+
+                    vram_state.teardown(aggressive=True)
+                    _recover_cuda_after_failure(torch)
+                    unload_model()
+                    pipe = _get_diarization_pipeline()
+                    _move_pipeline_to_inference_device(pipe)
+                    segments = _execute_pyannote_pass(pipe, audio_input, kwargs)
             finally:
                 del audio_input
                 from backend import vram_state
-                vram_state.teardown(aggressive=False)
+
+                vram_state.teardown(aggressive=True)
+                import torch
+
+                _recover_cuda_after_failure(torch)
             for seg in segments:
                 merged.append({
                     "start": seg["start"] + offset_s,

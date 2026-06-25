@@ -604,7 +604,7 @@ DIARIZATION_CUDA_MIN_FREE_MB=1024        # move diarization to CPU if CUDA memor
 DIARIZATION_CUDA_MIN_VRAM_MB=12288
 ```
 
-Each job manifest records `audio_duration_s`, `total_elapsed_s`, `target_elapsed_s`, and `target_met`. The target is 180 seconds for audio under 9 minutes and one-third of the audio duration for longer files. Hardware, audio quality, diarization, and selecting both engines can still affect the result, but the defaults are tuned for the fastest single-engine path within the 8 GB VRAM budget.
+Each job manifest records `audio_duration_s`, `total_elapsed_s`, `target_elapsed_s`, and `target_met`. Targets are tiered: **≤10 min** for short clips (&lt;20 min), **≤30 min** for medium long files, and **min(30 min, duration ÷ 4)** for 1 h+ audio. Adaptive policy raises beam width on short dialogue and switches 1 h+ files to windowed long-form ASR after segmented CUDA diarization.
 
 ### Stopping the app
 

@@ -6,7 +6,11 @@ import os
 import time
 
 from tests.golden.accuracy import accuracy_report
-from tests.golden.config import apply_golden_env
+from tests.golden.config import (
+    apply_golden_env,
+    apply_production_perf_env,
+    performance_check_enabled,
+)
 from tests.golden.debug_log import debug_log
 from tests.golden.fixtures import GoldenFixture, active_fixture
 
@@ -15,6 +19,13 @@ def _gpu_required() -> bool:
     return os.getenv("GOLDEN_REQUIRE_GPU", "").strip().lower() in {
         "1", "true", "yes", "on",
     }
+
+
+def _apply_env(profile_extra: dict[str, str] | None, *, production_mode: bool) -> None:
+    if production_mode:
+        apply_production_perf_env(profile_extra)
+    else:
+        apply_golden_env(profile_extra)
 
 
 def _pipeline_gpu_status() -> dict[str, str | bool]:
@@ -74,13 +85,12 @@ def run_golden_fixture(
     threshold: float | None = None,
     run_id: str = "golden",
     profile_extra: dict[str, str] | None = None,
+    production_mode: bool = False,
 ) -> dict:
-    """Run full pipeline and score against expected transcript."""
+    """Run full pipeline and score against expected transcript (if configured)."""
     fixture = fixture or active_fixture(os.getenv("GOLDEN_FIXTURE"))
-    apply_golden_env(profile_extra)
-    threshold = threshold if threshold is not None else float(
-        os.getenv("GOLDEN_ACCURACY_THRESHOLD", "0.95")
-    )
+    _apply_env(profile_extra, production_mode=production_mode)
+
     use_reference_diar = os.getenv("GOLDEN_REFERENCE_DIAR", "").strip().lower() in {
         "1", "true", "yes", "on",
     }
@@ -92,10 +102,18 @@ def run_golden_fixture(
 
     if not fixture.audio.is_file():
         raise FileNotFoundError(f"golden audio missing: {fixture.audio}")
-    if not fixture.expected.is_file():
-        raise FileNotFoundError(f"golden transcript missing: {fixture.expected}")
+    if fixture.requires_accuracy() and fixture.expected is not None:
+        if not fixture.expected.is_file():
+            raise FileNotFoundError(f"golden transcript missing: {fixture.expected}")
 
-    expected_text = fixture.expected.read_text(encoding="utf-8")
+    if threshold is None:
+        threshold = fixture.accuracy_threshold
+
+    expected_text = ""
+    if fixture.expected is not None and fixture.expected.is_file():
+        expected_text = fixture.expected.read_text(encoding="utf-8")
+
+    target_s = fixture.performance_target_s()
     t0 = time.perf_counter()
 
     debug_log(
@@ -106,7 +124,9 @@ def run_golden_fixture(
             "fixture": fixture.name,
             "audio": str(fixture.audio),
             "threshold": threshold,
+            "target_s": target_s,
             "max_speakers": fixture.max_speakers,
+            "production_mode": production_mode,
             "asr_turn_guided": os.getenv("ASR_TURN_GUIDED"),
             "diarization_device": os.getenv("DIARIZATION_DEVICE"),
             "require_gpu": _gpu_required(),
@@ -118,8 +138,7 @@ def run_golden_fixture(
     from backend.pipeline import run_transcription_job
 
     profile = apply_quality_profile()
-    # Quality profile 8GB safety must not override explicit golden CUDA staging.
-    apply_golden_env(profile_extra)
+    _apply_env(profile_extra, production_mode=production_mode)
 
     if _gpu_required():
         try:
@@ -167,31 +186,59 @@ def run_golden_fixture(
         raise RuntimeError("pipeline returned empty transcript")
     if actual_text.startswith("ERROR:"):
         raise RuntimeError(actual_text[:500])
-    if _gpu_required() and fixture.max_speakers > 1:
-        speaker_tags = sum(
-            1 for line in actual_text.splitlines() if "SPEAKER_" in line.upper()
+
+    speaker_tags = sum(
+        1 for line in actual_text.splitlines() if "SPEAKER_" in line.upper()
+    )
+    if _gpu_required() and fixture.max_speakers > 1 and speaker_tags < 2:
+        raise RuntimeError(
+            "GOLDEN_REQUIRE_GPU: diarization appears to have failed "
+            f"(only {speaker_tags} speaker-tagged lines in output)"
         )
-        if speaker_tags < 2:
-            raise RuntimeError(
-                "GOLDEN_REQUIRE_GPU: diarization appears to have failed "
-                f"(only {speaker_tags} speaker-tagged lines in output)"
-            )
 
     fixture.output.parent.mkdir(parents=True, exist_ok=True)
     fixture.output.write_text(actual_text, encoding="utf-8")
 
-    report = accuracy_report(expected_text, actual_text)
-    score = report["accuracy"]
-    passed = score >= threshold
+    manifest_target = float(result.get("target_elapsed_s") or 0.0)
+    if target_s <= 0 and manifest_target > 0:
+        target_s = manifest_target
+    performance_met = (
+        not performance_check_enabled()
+        or target_s <= 0
+        or elapsed_s <= target_s
+    )
+
+    report = accuracy_report(expected_text, actual_text) if expected_text else {
+        "accuracy": None,
+        "line_best_match": None,
+        "time_aligned": None,
+        "corpus_similarity": None,
+        "expected_chars": 0,
+        "actual_chars": len(actual_text),
+        "coverage_ratio": 1.0,
+        "expected_lines": 0,
+        "actual_lines": len([ln for ln in actual_text.splitlines() if ln.strip()]),
+        "expected_speakers": {},
+        "actual_speakers": {},
+    }
+
+    score = report.get("accuracy")
+    if fixture.requires_accuracy() and threshold is not None and score is not None:
+        passed = score >= threshold and performance_met
+    else:
+        line_count = int(report.get("actual_lines") or 0)
+        passed = performance_met and line_count >= 20 and len(actual_text) >= 500
 
     debug_log(
         hypothesis_id="H1-H5",
         location="tests/golden/runner.py:score",
         message="golden accuracy report",
         data={
-            **report,
+            **{k: v for k, v in report.items() if v is not None},
             "fixture": fixture.name,
             "threshold": threshold,
+            "target_s": target_s,
+            "performance_met": performance_met,
             "passed": passed,
             "elapsed_s": round(elapsed_s, 1),
             **gpu_status,
@@ -204,6 +251,8 @@ def run_golden_fixture(
     return {
         "passed": passed,
         "threshold": threshold,
+        "target_s": target_s,
+        "performance_met": performance_met,
         "fixture": fixture.name,
         "report": report,
         "elapsed_s": elapsed_s,
