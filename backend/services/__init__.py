@@ -1,1 +1,1 @@
-"""Backend service modules for local ASR, media, hardware, and correction."""
+"""Backend service modules for local ASR, media, and hardware."""

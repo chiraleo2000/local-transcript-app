@@ -58,7 +58,6 @@ hiddenimports = [
     "backend.storage",
     "backend.paths",
     "backend.services.asr_local",
-    "backend.services.correction_local",
     "backend.services.hardware_policy",
     "backend.services.media_pipeline",
     "engines",

@@ -11,8 +11,7 @@ No cloud APIs. No telemetry. All processing stays on your machine.
 - **Pathumma Whisper Thai Large v3** — fast alternative ASR engine
 - **Speaker diarization** — `pyannote/speaker-diarization-community-1` (Sep 2025), fully local
 - **Advanced diarization tuning** — segmentation threshold, clustering threshold, min cluster size, silence gap — adjustable live in the UI
-- **Audio enhancement** — bandpass filter → spectral noise reduction → compressor / limiter chain
-- **Local LLM correction** — optional post-transcription text cleanup via llama.cpp or Ollama
+- **Audio enhancement** — bandpass filter → spectral noise reduction → gate / compress / limiter chain (louder speech, minimal background)
 - **Native desktop window** — pywebview wraps the Gradio UI; no browser required when using `launcher.py` or `LocalTranscriptApp.exe`
 - **Docker GPU mode** — NVIDIA CUDA 13 + PyTorch; models cached in `./models/`
 - **Strict 8 GB VRAM policy** — safe on RTX 4060 Laptop (8 GB); one model at a time, sequential engines, capped chunk size
@@ -197,7 +196,6 @@ local-transcript-app/
 │   └── services/
 │       ├── asr_local.py          # ASR engine facade
 │       ├── media_pipeline.py     # Normalise, enhance, diarize
-│       ├── correction_local.py   # LLM correction
 │       └── hardware_policy.py    # GPU/CPU backend detection
 ├── engines/
 │   ├── typhoon_asr.py            # Typhoon Whisper Large v3
@@ -405,7 +403,6 @@ All processing is local. No audio, video, or transcript data is sent to any clou
   - Typhoon Whisper Large v3.
   - Pathumma Whisper Thai Large v3.
 - Speaker diarization with local `pyannote/speaker-diarization-community-1` pipeline.
-- Optional local LLM correction through a local Ollama-compatible endpoint.
 - Folder-based storage inside the app path.
 - Hardware-aware backend selection for NVIDIA GPU, Intel OpenVINO GPU/NPU, AMD GPU fallback, and CPU-only systems.
 
@@ -420,7 +417,6 @@ local-transcript-app/
     services/
       asr_local.py               # Local ASR service facade
       media_pipeline.py          # Video/audio normalize, enhancement, diarization
-      correction_local.py        # Optional local-only LLM correction
       hardware_policy.py         # Hardware checks and backend selection
   engines/                       # Model implementation compatibility layer
   scripts/
@@ -430,8 +426,6 @@ local-transcript-app/
   models/                        # Created at runtime; model/cache folders
   RUN_INSTRUCTIONS.md            # Practical run guide
 ```
-
-The runnable app is now in the main `local-transcript-app` path. The older `speaker-aware-ai/` and `test-transcript-service/` folders are legacy/reference folders and are not needed to run the root app.
 
 ## Hardware Policy
 
@@ -668,7 +662,7 @@ venv\Scripts\python.exe -m pip install .\vendor\pyannote_audio-4.0.4-py3-none-an
 
 ## Privacy Statement
 
-Audio/video processing, transcription, diarization, transcript storage, and optional correction are local. The app does not send files to Azure, OpenAI, or any cloud transcription service. Internet access is used only when the user installs/downloads models.
+Audio/video processing, transcription, diarization, and transcript storage are local. The app does not send files to Azure, OpenAI, or any cloud transcription service. Internet access is used only when the user installs/downloads models.
 
 ## Troubleshooting Reference
 

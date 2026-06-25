@@ -144,8 +144,6 @@ def multi_sample_max_tries() -> int:
 
 def tune_window_bounds(audio_duration_s: float) -> tuple[float, float] | None:
     """Return (start_s, end_s) for hyperparameter tuning, or None for full-file sweep."""
-    if multi_sample_preprocess_srs():
-        return None
     if not long_audio_tune_enabled():
         return None
     min_audio_s = _env_float("DIARIZATION_MULTI_SAMPLE_TUNE_MIN_AUDIO_S", 300.0)
@@ -177,38 +175,40 @@ def _min_cluster_size(max_speakers: int) -> int:
 
 
 def _curated_accuracy_configs(max_speakers: int) -> list[tuple[str, dict]]:
-    """Hand-picked community-1 combos that cover the highest-impact tuning region."""
-    min_cluster = _min_cluster_size(max_speakers)
+    """Hand-picked community-1 combos using instantiate()-supported keys only.
+
+    community-1 ignores segmentation.threshold; vary clustering threshold,
+    min_duration_off, and min_cluster_size so each pass can score differently.
+    """
     if max_speakers == 2:
         combos = [
-            (0.38, 0.44, 0.03),
-            (0.36, 0.42, 0.03),
-            (0.40, 0.46, 0.04),
-            (0.38, 0.48, 0.05),
-            (0.40, 0.44, 0.04),
+            (0.40, 0.03, 2),
+            (0.44, 0.05, 2),
+            (0.42, 0.08, 3),
+            (0.46, 0.06, 2),
+            (0.38, 0.10, 3),
         ]
     elif max_speakers >= 3:
         combos = [
-            (0.36, 0.42, 0.03),
-            (0.38, 0.44, 0.03),
-            (0.38, 0.46, 0.04),
-            (0.40, 0.48, 0.05),
-            (0.36, 0.40, 0.03),
-            (0.38, 0.50, 0.04),
+            (0.40, 0.03, 2),
+            (0.42, 0.05, 2),
+            (0.44, 0.06, 3),
+            (0.38, 0.08, 2),
+            (0.46, 0.04, 3),
         ]
     else:
         combos = [
-            (0.40, 0.48, 0.04),
-            (0.38, 0.46, 0.03),
-            (0.42, 0.50, 0.05),
+            (0.44, 0.04, 2),
+            (0.46, 0.06, 3),
+            (0.40, 0.08, 2),
         ]
     configs: list[tuple[str, dict]] = []
-    for seg_t, clust_t, min_off in combos:
-        label = f"curated_seg={seg_t:.2f}_clust={clust_t:.2f}"
+    for clust_t, min_off, min_cluster in combos:
+        label = f"curated_clust={clust_t:.2f}_off={min_off:.2f}_mc={min_cluster}"
         configs.append((
             label,
             {
-                "segmentation": {"threshold": seg_t, "min_duration_off": min_off},
+                "segmentation": {"min_duration_off": min_off},
                 "clustering": {"threshold": clust_t, "min_cluster_size": min_cluster},
             },
         ))
@@ -263,11 +263,62 @@ def _params_key(params: dict) -> tuple:
     seg = params.get("segmentation") or {}
     clust = params.get("clustering") or {}
     return (
-        round(float(seg.get("threshold", -1)), 3),
         round(float(seg.get("min_duration_off", -1)), 3),
         round(float(clust.get("threshold", -1)), 3),
         int(clust.get("min_cluster_size", -1)),
     )
+
+
+def _dedupe_candidates(
+    candidates: list[tuple[str, dict]],
+    param_filter: Callable[[dict], dict | None] | None,
+) -> list[tuple[str, dict]]:
+    """Drop configs that collapse to the same effective instantiate() params."""
+    seen: set[tuple] = set()
+    unique: list[tuple[str, dict]] = []
+    for label, params in candidates:
+        effective = param_filter(params) if param_filter else params
+        key = _params_key(effective or {})
+        if key in seen:
+            logger.info(
+                "Skipping duplicate diarization config %s (effective=%s)",
+                label,
+                effective,
+            )
+            continue
+        seen.add(key)
+        unique.append((label, params))
+    return unique
+
+
+def _try_add_config(
+    picked: list[tuple[str, dict]],
+    seen: set[tuple],
+    label: str,
+    params: dict,
+    limit: int,
+) -> bool:
+    """Append a unique config; return True when the pick list is full."""
+    key = _params_key(params)
+    if key in seen:
+        return len(picked) >= limit
+    seen.add(key)
+    picked.append((label, params))
+    return len(picked) >= limit
+
+
+def _fill_picked_from_grid(
+    grid: list[tuple[str, dict]],
+    picked: list[tuple[str, dict]],
+    seen: set[tuple],
+    limit: int,
+) -> None:
+    if len(picked) >= limit or len(grid) <= len(picked):
+        return
+    step = max(1, len(grid) // max(1, limit - len(picked)))
+    for label, params in grid[::step]:
+        if _try_add_config(picked, seen, label, params, limit):
+            break
 
 
 def _prioritize_configs(
@@ -280,23 +331,9 @@ def _prioritize_configs(
     seen: set[tuple] = set()
     picked: list[tuple[str, dict]] = []
     for label, params in curated + grid:
-        key = _params_key(params)
-        if key in seen:
-            continue
-        seen.add(key)
-        picked.append((label, params))
-        if len(picked) >= limit:
+        if _try_add_config(picked, seen, label, params, limit):
             break
-    if len(picked) < limit and len(grid) > len(picked):
-        step = max(1, len(grid) // max(1, limit - len(picked)))
-        for label, params in grid[::step]:
-            key = _params_key(params)
-            if key in seen:
-                continue
-            seen.add(key)
-            picked.append((label, params))
-            if len(picked) >= limit:
-                break
+    _fill_picked_from_grid(grid, picked, seen, limit)
     logger.info(
         "Diarization multi-sample: evaluating %d config(s) (limit=%d).",
         len(picked),
@@ -387,13 +424,15 @@ def _dominant_speaker_penalty(segments: list[dict], max_speakers: int) -> float:
         return 0.0
     totals = _speaker_durations(segments)
     if len(totals) < 2:
-        return 0.0
+        return 0.35
     total = sum(totals.values())
     if total <= 0:
         return 0.0
     max_share = max(totals.values()) / total
     if max_share > 0.90:
-        return min(0.25, (max_share - 0.90) * 2.5)
+        return min(0.35, (max_share - 0.90) * 3.5)
+    if max_share > 0.80:
+        return min(0.20, (max_share - 0.80) * 2.0)
     return 0.0
 
 
@@ -418,15 +457,115 @@ def _accuracy_penalties(
     if not _accuracy_mode() or max_speakers < 2:
         return 0.0, frag_penalty
     mega_turn_penalty = 0.0
+    mega_threshold = _env_float("DIARIZATION_MEGA_TURN_SCORE_THRESHOLD_S", 45.0)
     for seg in segments:
         dur = seg["end"] - seg["start"]
-        if dur > 55.0:
-            mega_turn_penalty += (dur - 55.0) * 0.012
+        if dur > mega_threshold:
+            mega_turn_penalty += (dur - mega_threshold) * 0.018
     if audio_duration_s >= 180.0:
-        expected_turns = max(2, int(audio_duration_s / 40.0))
+        expected_turns = max(2, int(audio_duration_s / 35.0))
         if len(segments) < expected_turns // 2:
-            mega_turn_penalty += 0.12
+            mega_turn_penalty += 0.18
     return mega_turn_penalty, frag_penalty
+
+
+def _speaker_balance_score(segments: list[dict], max_speakers: int) -> float:
+    if max_speakers < 2:
+        return 0.5
+    totals = _speaker_durations(segments)
+    if len(totals) < 2:
+        return 0.0
+    total = sum(totals.values())
+    if total <= 0:
+        return 0.0
+    shares = sorted((value / total for value in totals.values()), reverse=True)
+    imbalance = abs(shares[0] - shares[1]) if len(shares) >= 2 else 1.0
+    return max(0.0, 1.0 - imbalance * 1.25)
+
+
+def _turn_length_quality(segments: list[dict]) -> float:
+    durations = [
+        seg["end"] - seg["start"]
+        for seg in segments
+        if seg["end"] > seg["start"]
+    ]
+    if not durations:
+        return 0.0
+    durations.sort()
+    median = durations[len(durations) // 2]
+    if 1.0 <= median <= 25.0:
+        return 1.0
+    if median < 0.5:
+        return 0.25
+    if median > 60.0:
+        return 0.20
+    return 0.55
+
+
+def score_segments_breakdown(
+    segments: list[dict],
+    audio_duration_s: float,
+    max_speakers: int,
+) -> dict[str, float]:
+    """Return score components for logging and tuning."""
+    if not segments or audio_duration_s <= 0:
+        return {"total": -1.0}
+
+    covered = sum(max(0.0, seg["end"] - seg["start"]) for seg in segments)
+    coverage = min(1.0, covered / audio_duration_s)
+    n_speakers = len({seg["speaker"] for seg in segments})
+    if max_speakers >= 2 and n_speakers == 1:
+        return {"total": -1.0}
+
+    speaker_fit = _speaker_fit_score(n_speakers, max_speakers)
+    balance = _speaker_balance_score(segments, max_speakers)
+    turn_quality = _turn_length_quality(segments)
+    mega_turn_penalty, frag_penalty = _accuracy_penalties(segments, audio_duration_s, max_speakers)
+    gap_penalty = _coverage_gap_penalty(segments, audio_duration_s)
+    short_penalty = _short_turn_penalty(segments)
+    dominant_penalty = _dominant_speaker_penalty(segments, max_speakers)
+    switch_penalty = _switch_rate_penalty(segments, audio_duration_s)
+
+    if _accuracy_mode():
+        total = (
+            (coverage * 0.28)
+            + (speaker_fit * 0.30)
+            + (balance * 0.14)
+            + (turn_quality * 0.10)
+            - mega_turn_penalty
+            - frag_penalty
+            - gap_penalty
+            - short_penalty
+            - dominant_penalty
+            - switch_penalty
+        )
+    else:
+        avg_turn = covered / max(len(segments), 1)
+        turn_quality = min(1.0, avg_turn / 2.5)
+        total = (
+            (coverage * 0.42)
+            + (speaker_fit * 0.33)
+            + (turn_quality * 0.18)
+            - frag_penalty
+            - gap_penalty
+            - short_penalty
+        )
+
+    return {
+        "total": total,
+        "coverage": coverage,
+        "speaker_fit": speaker_fit,
+        "balance": balance,
+        "turn_quality": turn_quality,
+        "mega_turn_penalty": mega_turn_penalty,
+        "frag_penalty": frag_penalty,
+        "gap_penalty": gap_penalty,
+        "short_penalty": short_penalty,
+        "dominant_penalty": dominant_penalty,
+        "switch_penalty": switch_penalty,
+        "segments": float(len(segments)),
+        "speakers": float(n_speakers),
+    }
 
 
 def score_segments(
@@ -435,45 +574,7 @@ def score_segments(
     max_speakers: int,
 ) -> float:
     """Higher is better — rewards coverage, plausible speaker count, stable turns."""
-    if not segments or audio_duration_s <= 0:
-        return -1.0
-
-    covered = sum(max(0.0, seg["end"] - seg["start"]) for seg in segments)
-    coverage = min(1.0, covered / audio_duration_s)
-    n_speakers = len({seg["speaker"] for seg in segments})
-
-    if max_speakers >= 2 and n_speakers == 1:
-        return -1.0
-
-    speaker_fit = _speaker_fit_score(n_speakers, max_speakers)
-    mega_turn_penalty, frag_penalty = _accuracy_penalties(segments, audio_duration_s, max_speakers)
-    gap_penalty = _coverage_gap_penalty(segments, audio_duration_s)
-    short_penalty = _short_turn_penalty(segments)
-    dominant_penalty = _dominant_speaker_penalty(segments, max_speakers)
-    switch_penalty = _switch_rate_penalty(segments, audio_duration_s)
-
-    if _accuracy_mode():
-        return (
-            (coverage * 0.36)
-            + (speaker_fit * 0.42)
-            - mega_turn_penalty
-            - frag_penalty
-            - gap_penalty
-            - short_penalty
-            - dominant_penalty
-            - switch_penalty
-        )
-
-    avg_turn = covered / max(len(segments), 1)
-    turn_quality = min(1.0, avg_turn / 2.5)
-    return (
-        (coverage * 0.42)
-        + (speaker_fit * 0.33)
-        + (turn_quality * 0.18)
-        - frag_penalty
-        - gap_penalty
-        - short_penalty
-    )
+    return score_segments_breakdown(segments, audio_duration_s, max_speakers)["total"]
 
 
 def _should_early_stop(
@@ -494,12 +595,12 @@ def _should_early_stop(
             tries,
         )
         return True, stall_count
-    stall_delta = _env_float("DIARIZATION_MULTI_SAMPLE_EARLY_STALL_DELTA", 0.012)
-    if tries >= min_tries and last_score < best_score - stall_delta:
+    stall_delta = _env_float("DIARIZATION_MULTI_SAMPLE_EARLY_STALL_DELTA", 0.008)
+    if tries >= min_tries and last_score <= best_score + stall_delta:
         stall_count += 1
         if stall_count >= _env_int("DIARIZATION_MULTI_SAMPLE_EARLY_STALL_COUNT", 2):
             logger.info(
-                "Diarization multi-sample early stop: no improvement after %d tries "
+                "Diarization multi-sample early stop: flat scores after %d tries "
                 "(best=%.3f).",
                 tries,
                 best_score,
@@ -515,10 +616,11 @@ def run_multi_sample_diarization(
     audio_duration_s: float,
     max_speakers: int,
     base_params: dict | None,
+    param_filter: Callable[[dict], dict | None] | None = None,
 ) -> tuple[list[dict], str, float]:
     """Try several hyperparameter sets; return the highest-scoring segment list."""
     best_segments, best_label, best_score, _best_params = _run_multi_sample_core(
-        instantiate_fn, run_fn, audio_duration_s, max_speakers, base_params,
+        instantiate_fn, run_fn, audio_duration_s, max_speakers, base_params, param_filter,
     )
     return best_segments, best_label, best_score
 
@@ -529,10 +631,11 @@ def select_best_diarization_params(
     audio_duration_s: float,
     max_speakers: int,
     base_params: dict | None,
+    param_filter: Callable[[dict], dict | None] | None = None,
 ) -> tuple[dict | None, str, float]:
     """Pick the best instantiate() config without returning segment output."""
     _segments, best_label, best_score, best_params = _run_multi_sample_core(
-        instantiate_fn, run_fn, audio_duration_s, max_speakers, base_params,
+        instantiate_fn, run_fn, audio_duration_s, max_speakers, base_params, param_filter,
     )
     return best_params, best_label, best_score
 
@@ -543,18 +646,20 @@ def _run_multi_sample_core(
     audio_duration_s: float,
     max_speakers: int,
     base_params: dict | None,
+    param_filter: Callable[[dict], dict | None] | None = None,
 ) -> tuple[list[dict], str, float, dict | None]:
     """Try several hyperparameter sets; return the highest-scoring segment list."""
     candidates = sample_param_sets(max_speakers, audio_duration_s)
     if base_params:
         candidates.insert(0, ("adaptive_base", copy.deepcopy(base_params)))
+    candidates = _dedupe_candidates(candidates, param_filter)
     max_tries = multi_sample_max_tries()
     if candidates:
         candidates = candidates[:max_tries]
         logger.info(
-            "Diarization multi-sample: capped to %d pass(es) per SR (global budget=%d).",
+            "Diarization multi-sample: evaluating %d unique config(s) (limit=%d).",
             len(candidates),
-            multi_sample_max_total_tries(),
+            max_tries,
         )
 
     best_segments: list[dict] = []
@@ -568,14 +673,26 @@ def _run_multi_sample_core(
         tried = index + 1
         instantiate_fn(params, f"multi-sample:{label}")
         segments = run_fn()
-        score = score_segments(segments, audio_duration_s, max_speakers)
-        n_spk = len({s["speaker"] for s in segments})
+        try:
+            from backend import vram_state
+
+            vram_state.teardown(aggressive=False)
+        except ImportError:
+            pass
+        breakdown = score_segments_breakdown(segments, audio_duration_s, max_speakers)
+        score = breakdown["total"]
+        n_spk = int(breakdown.get("speakers", 0))
         logger.info(
-            "Diarization sample %s: segments=%d speakers=%d score=%.3f",
+            "Diarization sample %s: segments=%d speakers=%d score=%.4f "
+            "(balance=%.3f turn=%.3f mega=%.3f dom=%.3f)",
             label,
             len(segments),
             n_spk,
             score,
+            breakdown.get("balance", 0.0),
+            breakdown.get("turn_quality", 0.0),
+            breakdown.get("mega_turn_penalty", 0.0),
+            breakdown.get("dominant_penalty", 0.0),
         )
         if score > best_score:
             best_score = score
@@ -592,7 +709,7 @@ def _run_multi_sample_core(
             break
 
     logger.info(
-        "Diarization multi-sample winner: %s (score=%.3f, segments=%d, tried=%d)",
+        "Diarization multi-sample winner: %s (score=%.4f, segments=%d, tried=%d)",
         best_label,
         best_score,
         len(best_segments),

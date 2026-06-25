@@ -97,7 +97,7 @@ def whisper_generate_kwargs(language: str) -> dict:
     kwargs: dict = {
         "language": language,
         "task": "transcribe",
-        "num_beams": 1,
+        "num_beams": max(1, _env_int("ASR_NUM_BEAMS", 1)),
         "temperature": _env_float("ASR_TEMPERATURE", 0.0),
     }
     if _env_bool("ASR_SUPPRESS_HALLUCINATIONS", True):

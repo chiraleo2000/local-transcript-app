@@ -205,19 +205,14 @@ def _run_diarization(
         logger.exception("Diarization failed: %s", exc)
         return None
     finally:
-        _phase_teardown("diarize", aggressive=False)
+        _phase_teardown("diarize", aggressive=True)
         _debug_vram_snapshot("after-diarization", "H2")
-        if _asr_keep_preloaded():
-            logger.debug(
-                "ASR_KEEP_PRELOADED: skip diarization release_after_job (ASR stays on GPU)."
-            )
-        elif not models_resident_on_gpu():
-            from engines.diarization import release_after_job
+        from engines.diarization import release_after_job
 
-            release_after_job()
-            clear_accelerator_cache()
-            gc.collect()
-            _debug_vram_snapshot("after-diarization-release", "H2")
+        release_after_job()
+        clear_accelerator_cache()
+        gc.collect()
+        _debug_vram_snapshot("after-diarization-release", "H2")
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -325,9 +320,16 @@ def _asr_keep_preloaded() -> bool:
     }
 
 
-def _prepare_selected_asr_model(selected: list[str]) -> None:
+def _prepare_selected_asr_model(selected: list[str], *, after_diarization: bool = False) -> None:
     if not selected:
         return
+    if after_diarization:
+        try:
+            from backend import vram_state
+
+            vram_state.teardown(aggressive=True)
+        except ImportError:
+            clear_accelerator_cache()
     selected_engine = selected[0]
     cuda_ok = True
     try:
@@ -632,7 +634,7 @@ def _execute_transcription_stages(
 
     if ctx.progress is not None:
         ctx.progress.set_phase("prepare", "Preparing ASR model\u2026", 40)
-    _prepare_selected_asr_model(selected)
+    _prepare_selected_asr_model(selected, after_diarization=diar_segments is not None)
     if ctx.progress is not None:
         ctx.progress.set_phase("asr_prepare", "Loading ASR model on GPU\u2026", 45)
 
@@ -666,14 +668,12 @@ def run_transcription_job(
     max_speakers: int,
     enhance: bool,
     *,
-    local_correction: bool = False,
     diarize_kwargs: dict | None = None,
     cancel_event: threading.Event | None = None,
     progress: JobProgress | None = None,
     meta: JobMeta | None = None,
 ) -> dict:
     """Run the full local transcript pipeline and persist outputs."""
-    del local_correction
     register_job_started()
     try:
         with _job_semaphore:

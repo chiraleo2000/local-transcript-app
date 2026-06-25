@@ -298,10 +298,21 @@ def models_resident_on_gpu() -> bool:
     return True
 
 
+def _multi_pass_diarization_active() -> bool:
+    try:
+        from engines.diarization_sampling import multi_sample_sweep_enabled
+
+        return multi_sample_sweep_enabled()
+    except ImportError:
+        return False
+
+
 def should_unload_asr_for_diarization() -> bool:
     """Stage ASR off GPU before diarization when pyannote needs CUDA VRAM."""
     if not diarization_wants_cuda():
         return False
+    if strict_memory_mode_active() and _multi_pass_diarization_active():
+        return True
     if _env_bool("DIARIZATION_GPU_CO_RESIDENT", False):
         return _env_bool("ASR_UNLOAD_FOR_DIARIZATION", False)
     if strict_memory_mode_active():

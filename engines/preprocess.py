@@ -193,8 +193,8 @@ def _noisereduce_stage(wav_path: str, out_path: str) -> bool:
             "sr": sr,
             "prop_decrease": prop_decrease,
             "n_fft": 2048,
-            "freq_mask_smooth_hz": 500,
-            "time_mask_smooth_ms": 50,
+            "freq_mask_smooth_hz": 700,
+            "time_mask_smooth_ms": 80,
         }
         if profile_mode == "leading":
             profile_samples = int(_noise_profile_seconds() * sr)
@@ -235,11 +235,27 @@ def _pedalboard_stage(wav_path: str, out_path: str) -> bool:
         )
         from pedalboard.io import AudioFile  # pylint: disable=import-outside-toplevel
 
+        gate_db = _env_float("AUDIO_ENHANCE_GATE_THRESHOLD_DB", -42.0)
+        gate_ratio = _env_float("AUDIO_ENHANCE_GATE_RATIO", 6.0)
+        comp_db = _env_float("AUDIO_ENHANCE_COMPRESSOR_THRESHOLD_DB", -18.0)
+        comp_ratio = _env_float("AUDIO_ENHANCE_COMPRESSOR_RATIO", 4.0)
+        limiter_db = _env_float("AUDIO_ENHANCE_LIMITER_THRESHOLD_DB", -0.5)
+
         board = Pedalboard([
-            HighpassFilter(cutoff_frequency_hz=80),
-            NoiseGate(threshold_db=-50, ratio=4.0, attack_ms=5.0, release_ms=200.0),
-            Compressor(threshold_db=-24, ratio=3.0, attack_ms=8.0, release_ms=180.0),
-            Limiter(threshold_db=-1.0, release_ms=50.0),
+            HighpassFilter(cutoff_frequency_hz=100),
+            NoiseGate(
+                threshold_db=gate_db,
+                ratio=gate_ratio,
+                attack_ms=3.0,
+                release_ms=150.0,
+            ),
+            Compressor(
+                threshold_db=comp_db,
+                ratio=comp_ratio,
+                attack_ms=5.0,
+                release_ms=120.0,
+            ),
+            Limiter(threshold_db=limiter_db, release_ms=40.0),
         ])
 
         with AudioFile(wav_path) as f:  # pylint: disable=not-context-manager

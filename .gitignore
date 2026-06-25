@@ -18,6 +18,7 @@ debug-*.log
 
 # Large local test media (optional — copy into tests/ for E2E)
 tests/*.m4a
+tests/*.wav
 
 # Python cache
 __pycache__/
@@ -38,6 +39,13 @@ dist/
 # Logs
 *.log
 logs/
+
+# Test artifacts
+.pytest_cache/
+htmlcov/
+tests/e2e/playwright-report/
+tests/e2e/test-results/
+tests/output/
 
 # OS
 .DS_Store

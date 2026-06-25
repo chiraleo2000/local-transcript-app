@@ -168,7 +168,6 @@ APP_CSS = """
 .tall-audio-preview .waveform-container { min-height: 120px !important; }
 .tall-video-preview { min-height: 360px !important; }
 .tall-video-preview video { min-height: 320px !important; }
-.correction-button { margin-top: 4px; }
 .live-status {
     padding: 14px 18px;
     border-radius: 10px;

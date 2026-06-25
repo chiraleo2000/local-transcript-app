@@ -11,6 +11,9 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+_JOB_CANCELLED_MSG = "Job cancelled by user."
+_NO_SPEECH_MSG = "(no speech detected)"
+
 
 def is_cuda_oom(exc: Exception) -> bool:
     """Return True for CUDA, driver, HF, or allocator memory-pressure failures."""
@@ -90,6 +93,16 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return float(value.strip())
+    except ValueError:
+        return default
+
+
 def _strict_memory_mode() -> bool:
     return _env_bool("ASR_HARD_MEMORY_SAFE", True)
 
@@ -119,15 +132,17 @@ def _is_windowed_asr(audio_duration_s: float, window_duration_s: float) -> bool:
     return window_duration_s > 0 and audio_duration_s > window_duration_s * 1.5
 
 
-def _vram_batch_boost(batch: int) -> int:
+def _vram_batch_boost(batch: int, window_duration_s: float = 0.0) -> int:
     """Raise batch when free VRAM headroom allows (8 GB class with ASR resident)."""
+    if _strict_memory_mode() and window_duration_s >= 90:
+        return batch
     try:
         from backend.vram_state import snapshot
 
         snap = snapshot()
-        max_8gb = max(1, _env_int("ASR_8GB_MAX_BATCH_SIZE", 4))
-        target = max(batch, min(max_8gb, _env_int("ASR_CUDA_BATCH_SIZE", max_8gb)))
-        min_free = _env_int("ASR_BATCH_MIN_FREE_MB", 2500)
+        max_8gb = max(1, _env_int("ASR_8GB_MAX_BATCH_SIZE", 1))
+        target = min(max_8gb, max(batch, _env_int("ASR_CUDA_BATCH_SIZE", max_8gb)))
+        min_free = _env_int("ASR_BATCH_MIN_FREE_MB", 5000)
         if snap.get("free_mb", 0) >= min_free:
             return target
     except ImportError:
@@ -152,6 +167,35 @@ def _maybe_teardown_between_windows(runtime: WhisperRuntime, window_index: int) 
         gc.collect()
 
 
+def _check_job_cancelled(cancel_event) -> None:
+    if cancel_event and cancel_event.is_set():
+        raise RuntimeError(_JOB_CANCELLED_MSG)
+
+
+def _strict_8gb_batch_cap(
+    batch: int,
+    *,
+    windowed: bool,
+    window_duration_s: float,
+    audio_duration_s: float,
+    max_8gb: int,
+) -> int:
+    if windowed:
+        batch = min(batch, max_8gb)
+        if window_duration_s >= 180:
+            return 1
+        return _vram_batch_boost(batch, window_duration_s)
+    if max_8gb > 1 and _env_bool("ASR_BATCH_DURATION_CAP", True):
+        if audio_duration_s >= 180 or window_duration_s >= 120:
+            return min(batch, max(1, max_8gb // 2))
+        if audio_duration_s >= 60 or window_duration_s >= 60:
+            return min(batch, max_8gb)
+        return batch
+    if audio_duration_s >= 180 or window_duration_s >= 60:
+        return 1
+    return batch
+
+
 def _pipe_batch_size(runtime: WhisperRuntime, audio_duration_s: float, window_duration_s: float) -> int:
     """Conservative batch for long / windowed audio on low-VRAM GPUs."""
     windowed = _is_windowed_asr(audio_duration_s, window_duration_s)
@@ -166,18 +210,13 @@ def _pipe_batch_size(runtime: WhisperRuntime, audio_duration_s: float, window_du
     if not _strict_memory_mode():
         return batch
     max_8gb = max(1, _env_int("ASR_8GB_MAX_BATCH_SIZE", 1))
-    if windowed:
-        batch = min(batch, max_8gb)
-        return _vram_batch_boost(batch)
-    if max_8gb > 1 and _env_bool("ASR_BATCH_DURATION_CAP", True):
-        if audio_duration_s >= 180 or window_duration_s >= 120:
-            return min(batch, max(1, max_8gb // 2))
-        if audio_duration_s >= 60 or window_duration_s >= 60:
-            return min(batch, max_8gb)
-        return batch
-    if audio_duration_s >= 180 or window_duration_s >= 60:
-        return 1
-    return batch
+    return _strict_8gb_batch_cap(
+        batch,
+        windowed=windowed,
+        window_duration_s=window_duration_s,
+        audio_duration_s=audio_duration_s,
+        max_8gb=max_8gb,
+    )
 
 
 def _pipe_chunk_length(runtime: WhisperRuntime, audio_duration_s: float) -> int | None:
@@ -236,6 +275,13 @@ def _retry_pipe_on_oom(
     window_index: int = 0,
 ) -> dict:
     """Halve batch, then iteratively halve chunk length down to retry floor."""
+    runtime.clear_cuda_cache()
+    try:
+        from backend import vram_state
+
+        vram_state.teardown(aggressive=True)
+    except ImportError:
+        pass
     if batch_size > 1:
         halved = max(1, batch_size // 2)
         logger.warning(
@@ -427,8 +473,7 @@ def run_long_form_asr_from_path(
         iter_audio_windows_from_path(audio_path, window_s, overlap_s),
         start=1,
     ):
-        if cancel_event and cancel_event.is_set():
-            raise RuntimeError("Job cancelled by user.")
+        _check_job_cancelled(cancel_event)
         vram_state.log_phase(f"{runtime.engine_name}_asr_window_{index}", before=True)
         window_duration_s = len(window_input["raw"]) / window_input["sampling_rate"]
         batch_size = _pipe_batch_size(runtime, audio_duration_s, window_duration_s)
@@ -475,6 +520,145 @@ def _should_stream_windows(runtime: WhisperRuntime, audio_duration_s: float) -> 
     return audio_duration_s >= min_stream_s
 
 
+def _turn_guided_asr_enabled(diarization_active: bool) -> bool:
+    if not diarization_active:
+        return False
+    return _env_bool("ASR_TURN_GUIDED", True)
+
+
+def _chunk_length_for_turn(dur_s: float, runtime: WhisperRuntime) -> int | None:
+    if dur_s < 20.0:
+        return None
+    chunk_s = runtime.chunk_length_s()
+    if dur_s <= chunk_s * 1.25:
+        return None
+    return min(chunk_s, max(15, int(dur_s)))
+
+
+def format_turn_guided_transcript(chunks: list[dict]) -> str:
+    from engines.diarization import _fmt_ts
+    from engines.text_cleanup import clean_transcript_lines, clean_transcript_text
+
+    lines: list[str] = []
+    for chunk in chunks:
+        text = clean_transcript_text((chunk.get("text") or "").strip())
+        if not text:
+            continue
+        ts = chunk.get("timestamp") or (None, None)
+        start, end = ts if ts else (0.0, 0.0)
+        speaker = chunk.get("speaker") or "SPEAKER_01"
+        lines.append(f"[{_fmt_ts(start)} → {_fmt_ts(end)}] [{speaker}]: {text}")
+    if not lines:
+        return _NO_SPEECH_MSG
+    return clean_transcript_lines("\n".join(lines))
+
+
+def _extract_turn_text(result: dict) -> str:
+    text = (result.get("text") or "").strip()
+    if text:
+        return text
+    chunks = result.get("chunks") or []
+    return " ".join(
+        (chunk.get("text") or "").strip()
+        for chunk in chunks
+        if (chunk.get("text") or "").strip()
+    ).strip()
+
+
+def _transcribe_single_turn(
+    turn: dict,
+    index: int,
+    audio_path: str,
+    language: str,
+    ts_mode: Any,
+    pipe: Any,
+    run_pipe: Callable[..., dict],
+    runtime: WhisperRuntime,
+) -> dict | None:
+    from engines.audio_io import load_audio_slice
+    from backend import vram_state
+
+    dur = turn["end"] - turn["start"]
+    if dur < _env_float("ASR_TURN_GUIDED_MIN_TURN_S", 0.4):
+        return None
+    vram_state.log_phase(f"{runtime.engine_name}_turn_{index}", before=True)
+    audio_input = load_audio_slice(audio_path, turn["start"], dur)
+    chunk_s = _chunk_length_for_turn(dur, runtime)
+    try:
+        result, _pipe = run_pipe_with_oom_retry(
+            run_pipe,
+            pipe,
+            audio_input,
+            language,
+            ts_mode,
+            1,
+            runtime,
+            audio_duration_s=dur,
+            chunk_length_s=chunk_s,
+            window_index=index,
+        )
+    finally:
+        del audio_input
+        runtime.clear_cuda_cache()
+        gc.collect()
+    text = _extract_turn_text(result)
+    vram_state.log_phase(f"{runtime.engine_name}_turn_{index}", before=False)
+    if not text:
+        return None
+    return {
+        "text": text,
+        "timestamp": (turn["start"], turn["end"]),
+        "speaker": turn["speaker"],
+    }
+
+
+def run_turn_guided_asr(
+    audio_path: str,
+    language: str,
+    diarization_segments: list[dict],
+    pipe: Any,
+    run_pipe: Callable[..., dict],
+    runtime: WhisperRuntime,
+    timestamp_mode: Any,
+    audio_duration_s: float,
+    max_speakers: int = 0,
+    cancel_event=None,
+    window_progress=None,
+) -> str:
+    """Transcribe each diarization turn in isolation — best accuracy for dialogue."""
+    from engines.diarization import prepare_asr_turns
+
+    turns = prepare_asr_turns(diarization_segments, max_speakers)
+    if not turns:
+        logger.warning(
+            "%s turn-guided ASR: no turns; falling back to plain transcript.",
+            runtime.engine_name,
+        )
+        return _NO_SPEECH_MSG
+
+    total = len(turns)
+    logger.info(
+        "%s turn-guided ASR: %d turn(s) over %.1fs audio.",
+        runtime.engine_name,
+        total,
+        audio_duration_s,
+    )
+    ts_mode = True if timestamp_mode == "word" else timestamp_mode
+    output_chunks: list[dict] = []
+
+    for index, turn in enumerate(turns, start=1):
+        _check_job_cancelled(cancel_event)
+        chunk = _transcribe_single_turn(
+            turn, index, audio_path, language, ts_mode, pipe, run_pipe, runtime,
+        )
+        if chunk:
+            output_chunks.append(chunk)
+        if window_progress:
+            window_progress(index, total)
+
+    return format_turn_guided_transcript(output_chunks)
+
+
 def format_asr_result(
     result: dict,
     audio_duration_s: float,
@@ -512,7 +696,7 @@ def format_asr_result(
     chunks = result.get("chunks", [])
     if chunks:
         return format_chunks_fn(chunks)
-    return clean_transcript_text(result.get("text", "").strip()) or "(no speech detected)"
+    return clean_transcript_text(result.get("text", "").strip()) or _NO_SPEECH_MSG
 
 
 def transcribe_whisper_audio(
@@ -537,6 +721,21 @@ def transcribe_whisper_audio(
     chunk_s = _pipe_chunk_length(runtime, audio_duration_s)
     min_chunk_dur = _min_chunked_duration_s()
     diarization_active = diarization_segments is not None
+    if diarization_active and _turn_guided_asr_enabled(True):
+        return run_turn_guided_asr(
+            audio_path,
+            language,
+            diarization_segments,
+            pipe,
+            run_pipe,
+            runtime,
+            timestamp_mode,
+            audio_duration_s,
+            max_speakers=max_speakers,
+            cancel_event=cancel_event,
+            window_progress=window_progress,
+        )
+
     logger.info(
         "%s transcription started: audio=%.1fs language=%s diarization=%s "
         "timestamp_mode=%s batch=%d chunk=%s min_chunk_dur=%.0fs window=%ds "
@@ -571,8 +770,7 @@ def transcribe_whisper_audio(
     else:
         if window_progress:
             window_progress(0, 1)
-        if cancel_event and cancel_event.is_set():
-            raise RuntimeError("Job cancelled by user.")
+        _check_job_cancelled(cancel_event)
         audio_input = load_audio(audio_path)
         try:
             result, _pipe = run_pipe_with_oom_retry(
