@@ -3,6 +3,8 @@
 GPU-accelerated local audio/video transcription with speaker diarization.  
 No cloud APIs. No telemetry. All processing stays on your machine.
 
+**Version 1.0.0**
+
 ---
 
 ## Features
@@ -24,18 +26,20 @@ No cloud APIs. No telemetry. All processing stays on your machine.
 | Mode | URL | Notes |
 | --- | --- | --- |
 | Direct Python / GUI (`run.bat`, `launcher.py`) | `http://localhost:7896` | `GRADIO_SERVER_PORT=7896` |
-| Docker test deployment | `http://localhost:7987` | Host port maps to container `7896` |
+| Docker NVIDIA GPU | `http://localhost:7988` | `docker-compose.gpu.yml` |
+| Docker OpenVINO / CPU | `http://localhost:7987` | `docker-compose.openvino.yml` |
 
 ---
 
 ## Quick Start
 
-### Option A — Docker (recommended, GPU)
+### Option A — Docker (recommended)
 
-> Requires Docker Desktop with GPU enabled, or Linux with `nvidia-container-toolkit`.
+> **NVIDIA GPU:** `docker compose -f docker-compose.gpu.yml up -d --build` → http://localhost:7988  
+> **OpenVINO / CPU (no NVIDIA):** `docker compose -f docker-compose.openvino.yml up -d --build` → http://localhost:7987
 
 ```bat
-REM Windows
+REM Windows — auto-detect GPU vs OpenVINO
 run.bat docker
 
 # Linux / macOS
@@ -52,7 +56,7 @@ run.bat gui
 ./run.sh gui
 ```
 
-Or open manually: **Docker** → <http://localhost:7987> · **Direct/GUI** → <http://localhost:7896>
+Or open manually: **Docker GPU** → <http://localhost:7988> · **Docker OpenVINO** → <http://localhost:7987> · **Direct/GUI** → <http://localhost:7896>
 
 ---
 
@@ -497,7 +501,7 @@ run.bat
 Then open your browser at:
 
 ```text
-http://localhost:7987
+http://localhost:7896
 ```
 
 ---
@@ -525,7 +529,7 @@ python app.py
 Then open:
 
 ```text
-http://localhost:7987
+http://localhost:7896
 ```
 
 ---
@@ -534,7 +538,7 @@ http://localhost:7987
 
 1. Hardware is detected — NVIDIA CUDA (>=8 GB VRAM) is preferred; falls back to OpenVINO CPU or CPU.
 2. The configured default ASR engine preloads from `models/hf_cache/hub` at startup before the UI is served; other engines load on demand.
-3. Gradio UI starts after preload; the terminal shows `Running on local URL: http://0.0.0.0:7987`.
+3. Gradio UI starts after preload; the terminal shows `Running on local URL: http://0.0.0.0:7896`.
 4. Upload an audio or video file, choose engine and language, click **Transcribe**.
 
 Keep Hugging Face model snapshots under the canonical hub cache: `models/hf_cache/hub/models--...`. Legacy duplicate folders directly under `models/hf_cache/models--...` are not used by this app and should be moved out of the active cache root.

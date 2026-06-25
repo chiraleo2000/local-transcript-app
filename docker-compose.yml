@@ -1,79 +1,9 @@
+# Generic compose — prefer docker-compose.gpu.yml (NVIDIA, port 7988)
+# or docker-compose.openvino.yml (OpenVINO/CPU, port 7987).
+# This file mirrors the OpenVINO profile for backward compatibility.
 services:
   transcription:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    extends:
+      file: docker-compose.openvino.yml
+      service: transcription
     container_name: transcription-service
-    restart: unless-stopped
-    shm_size: "4gb"
-    ports:
-      - "7987:7896"
-    env_file:
-      - .env
-    environment:
-      - GRADIO_SERVER_NAME=0.0.0.0
-      - GRADIO_SERVER_PORT=7896
-      - PYTHONPATH=/app
-      - APP_MODEL_ROOT=/app/models
-      - HF_HOME=/app/models/hf_cache
-      - HF_HUB_CACHE=/app/models/hf_cache/hub
-      - HF_HUB_OFFLINE=1
-      - TRANSFORMERS_OFFLINE=1
-      - APP_AUTO_DOWNLOAD_MISSING_MODELS=false
-      - HUGGINGFACE_HUB_CACHE=/app/models/hf_cache/hub
-      - TORCH_HOME=/app/models/torch
-      - OV_CACHE_DIR=/app/models/ov_cache
-      - APP_SUPPRESS_WARNING_LOGS=false
-      - PYTHONUNBUFFERED=1
-      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-      # Sequential on 8 GB: parallel causes CUDA allocator corruption.
-      # Single engine at batch=8 saturates the GPU and beats audio/3 anyway.
-      - ASR_PARALLEL_MODE=sequential
-      - ASR_PARALLEL_MIN_VRAM_MB=12288
-      - ASR_ALLOW_8GB_PARALLEL=false
-      - ASR_HARD_MEMORY_SAFE=true
-      - MIN_NVIDIA_VRAM_MB=6000
-      - ASR_8GB_CLASS_MAX_MB=9000
-      - ASR_CLEAR_VRAM_AFTER_JOB=false
-      - ASR_CLEAR_VRAM_BETWEEN_ENGINES=false
-      - ASR_DEFAULT_ENGINES=Pathumma Whisper
-      - ASR_CUDA_BATCH_SIZE=8
-      - ASR_8GB_BATCH_SIZE=8
-      - ASR_8GB_MAX_BATCH_SIZE=8
-      - ASR_CUDA_MEMORY_FRACTION=0.92
-      - ASR_CHUNK_LENGTH_S=180
-      - ASR_8GB_CHUNK_LENGTH_S=30
-      - ASR_8GB_MAX_CHUNK_LENGTH_S=20
-      - ASR_8GB_RETRY_CHUNK_LENGTH_S=10
-      - ASR_WORD_TIMESTAMPS_WITH_DIARIZATION=true
-      - TYPHOON_WORD_TIMESTAMPS_ON_8GB=false
-      - PATHUMMA_WORD_TIMESTAMPS_ON_8GB=false
-      - ASR_LONG_FORM_MIN_DURATION_S=300
-      - ASR_LONG_FORM_WINDOW_S=360
-      - ASR_LONG_FORM_OVERLAP_S=30
-      - ASR_SUSPICIOUS_FIRST_TS_S=60
-      - ASR_TIMESTAMP_AUDIO_END_TOLERANCE_S=30
-      - ASR_MAX_CHUNK_CHARS_PER_SECOND=35
-      - ASR_ATTENTION_IMPLEMENTATION=sdpa
-      - ASR_PRELOAD_MODE=eager
-      - AUDIO_ENHANCE_DEFAULT=false
-      - AUDIO_ENHANCE_TARGET_PEAK_DB=-3.0
-      - AUDIO_ENHANCE_MAX_GAIN_DB=10.0
-      - AUDIO_ENHANCE_NOISE_REDUCTION=0.65
-      - DIARIZATION_MODEL_ID=pyannote/speaker-diarization-community-1
-      - DIARIZATION_DEVICE=cuda
-      - DIARIZATION_PRELOAD_MODE=eager
-      - DIARIZATION_CUDA_MIN_VRAM_MB=6000
-      - DIARIZATION_CUDA_MIN_FREE_MB=0
-      - DIARIZATION_ALLOW_8GB_CUDA=true
-    volumes:
-      # Bind-mount so models and transcripts persist and don't re-download
-      - ./models:/app/models
-      - ./storage:/app/storage
-    healthcheck:
-      test: ["CMD", "python3", "-c",
-        "import urllib.request; urllib.request.urlopen('http://localhost:7896/gradio_api/startup-events')"]
-      interval: 30s
-      timeout: 10s
-      start_period: 120s
-      retries: 3

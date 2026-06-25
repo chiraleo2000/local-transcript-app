@@ -5,7 +5,7 @@ echo "============================================================"
 echo " Transcription Service - Run (Linux / Mac)"
 echo " Usage:  ./run.sh          <-- run app directly (default)"
 echo "         ./run.sh gui      <-- native desktop window (pywebview)"
-echo "         ./run.sh docker   <-- run via Docker on port 7987"
+echo "         ./run.sh docker   <-- Docker (GPU :7988 or OpenVINO :7987)"
 echo "============================================================"
 echo
 
@@ -24,12 +24,13 @@ set_model_env() {
     export TRANSFORMERS_OFFLINE=0
     export HF_HUB_OFFLINE=0
     export APP_AUTO_DOWNLOAD_MISSING_MODELS=1
-    export DIARIZATION_GPU_CO_RESIDENT=1
-    export DIARIZATION_DEVICE=auto
+    export DIARIZATION_GPU_CO_RESIDENT=0
+    export DIARIZATION_DEVICE=cuda
     export DIARIZATION_PRELOAD_DEVICE=cpu
     export DIARIZATION_ALLOW_8GB_CUDA=1
-    export DIARIZATION_CUDA_MIN_FREE_MB=1536
-    export DIARIZATION_CUDA_RUN_MIN_FREE_MB=1024
+    export DIARIZATION_CUDA_MIN_FREE_MB=768
+    export DIARIZATION_CUDA_RUN_MIN_FREE_MB=512
+    export ASR_UNLOAD_FOR_DIARIZATION=1
     export ASR_DEFAULT_ENGINES=Auto
     export ASR_AUTO_POLICY=quality
 }
@@ -81,10 +82,16 @@ if [ "${1:-}" = "docker" ]; then
         echo "      To enable NVIDIA GPU: install nvidia-container-toolkit and restart Docker."
     fi
 
-    echo "[3/3] Docker Test Deployment running at http://localhost:7987 ..."
+    echo "[3/3] Docker deployment..."
     echo
     docker compose $COMPOSE_FILES up --build -d
-    docker logs -f transcription-service
+    if [[ "$COMPOSE_FILES" == *"gpu.yml"* ]]; then
+        echo "GPU stack: http://localhost:7988"
+        docker logs -f transcription-service
+    else
+        echo "OpenVINO/CPU stack: http://localhost:7987"
+        docker logs -f transcription-service-openvino
+    fi
     exit 0
 fi
 

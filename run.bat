@@ -4,7 +4,7 @@ echo ============================================================
 echo  Transcription Service - Run (Windows)
 echo  Usage:  run.bat          ^<-- run app directly (default)
 echo          run.bat gui      ^<-- native desktop window (pywebview)
-echo          run.bat docker   ^<-- run via Docker on port 7987
+echo          run.bat docker   ^<-- Docker (GPU :7988 or OpenVINO :7987)
 echo ============================================================
 echo.
 
@@ -108,10 +108,16 @@ if errorlevel 1 (
     set COMPOSE_FILES=-f docker-compose.gpu.yml
 )
 
-echo [3/3] Docker Test Deployment running at http://localhost:7987 ...
+echo [3/3] Docker deployment...
 echo.
 docker compose %COMPOSE_FILES% up --build -d
-docker logs -f transcription-service
+if "%COMPOSE_FILES%"=="-f docker-compose.gpu.yml" (
+    echo GPU stack: http://localhost:7988
+    docker logs -f transcription-service
+) else (
+    echo OpenVINO/CPU stack: http://localhost:7987
+    docker logs -f transcription-service-openvino
+)
 goto END
 
 :SET_MODEL_ENV
@@ -125,12 +131,13 @@ set "HF_HUB_DISABLE_SYMLINKS_WARNING=1"
 set "TRANSFORMERS_OFFLINE=0"
 set "HF_HUB_OFFLINE=0"
 set "APP_AUTO_DOWNLOAD_MISSING_MODELS=1"
-set "DIARIZATION_GPU_CO_RESIDENT=1"
-set "DIARIZATION_DEVICE=auto"
+set "DIARIZATION_GPU_CO_RESIDENT=0"
+set "DIARIZATION_DEVICE=cuda"
 set "DIARIZATION_PRELOAD_DEVICE=cpu"
 set "DIARIZATION_ALLOW_8GB_CUDA=1"
-set "DIARIZATION_CUDA_MIN_FREE_MB=1536"
-set "DIARIZATION_CUDA_RUN_MIN_FREE_MB=1024"
+set "DIARIZATION_CUDA_MIN_FREE_MB=768"
+set "DIARIZATION_CUDA_RUN_MIN_FREE_MB=512"
+set "ASR_UNLOAD_FOR_DIARIZATION=1"
 set "ASR_DEFAULT_ENGINES=Auto"
 set "ASR_AUTO_POLICY=quality"
 exit /b 0

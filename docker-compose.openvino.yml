@@ -1,15 +1,14 @@
 # OpenVINO / CPU AI compose — Intel Core Ultra (NPU/GPU), AMD AI CPU, ARM64.
-# Same application code and desktop installers (.exe / install.sh) as the CUDA build;
-# only the container image differs.
+# No NVIDIA GPU required.
 #
-# Usage:
 #   docker compose -f docker-compose.openvino.yml up -d --build
-#   docker compose -f docker-compose.openvino.yml down
+# UI: http://localhost:7987
 services:
   transcription:
     build:
       context: .
       dockerfile: Dockerfile.openvino
+    image: local-transcript-app-openvino
     container_name: transcription-service-openvino
     restart: unless-stopped
     shm_size: "4gb"
@@ -18,8 +17,15 @@ services:
     env_file:
       - .env
     environment:
+      - APP_VERSION=1.0.0
       - GRADIO_SERVER_NAME=0.0.0.0
       - GRADIO_SERVER_PORT=7896
+      - APP_CPU_THREADS=16
+      - OMP_NUM_THREADS=16
+      - MKL_NUM_THREADS=16
+      - OPENBLAS_NUM_THREADS=16
+      - NUMEXPR_NUM_THREADS=16
+      - TOKENIZERS_PARALLELISM=false
       - PYTHONPATH=/app
       - APP_MODEL_ROOT=/app/models
       - HF_HOME=/app/models/hf_cache
@@ -34,17 +40,58 @@ services:
       - OV_DEVICE=AUTO
       - APP_SUPPRESS_WARNING_LOGS=false
       - PYTHONUNBUFFERED=1
+      # --- ASR (OpenVINO) ---
       - ASR_PARALLEL_MODE=sequential
       - ASR_HARD_MEMORY_SAFE=true
-      - ASR_DEFAULT_ENGINES=Pathumma Whisper
+      - ASR_8GB_QUALITY_MODE=true
+      - ASR_DEFAULT_ENGINES=Auto
+      - ASR_AUTO_POLICY=quality
+      - ASR_QUALITY_PROFILE=high
+      - ASR_NUM_BEAMS=8
+      - ASR_SUPPRESS_HALLUCINATIONS=true
+      - ASR_LOGPROB_THRESHOLD=-0.6
+      - ASR_NO_SPEECH_THRESHOLD=0.5
       - ASR_CUDA_BATCH_SIZE=1
-      - ASR_CHUNK_LENGTH_S=180
+      - ASR_CHUNK_LENGTH_S=90
+      - ASR_8GB_CHUNK_LENGTH_S=45
+      - ASR_8GB_MAX_CHUNK_LENGTH_S=45
+      - ASR_8GB_RETRY_CHUNK_LENGTH_S=15
+      - ASR_MIN_CHUNKED_DURATION_S=120
       - ASR_ATTENTION_IMPLEMENTATION=sdpa
-      - ASR_PRELOAD_MODE=eager
+      - ASR_PRELOAD_MODE=lazy
+      - ASR_KEEP_PRELOADED=false
+      - ASR_TURN_GUIDED=true
+      - ASR_TURN_GUIDED_MAX_TURN_S=50
+      - ASR_TURN_GUIDED_MERGE_GAP_S=0.35
+      - ASR_TURN_GUIDED_MIN_TURN_S=0.15
+      - ASR_CLEANUP_THAI_SPACING=true
+      - ASR_WORD_TIMESTAMPS_WITH_DIARIZATION=true
+      - TYPHOON_WORD_TIMESTAMPS_ON_8GB=false
+      - PATHUMMA_WORD_TIMESTAMPS_ON_8GB=false
+      - ASR_UNLOAD_FOR_DIARIZATION=false
+      - UI_MAX_CONCURRENT_JOBS=2
+      - UI_GRADIO_TRANSCRIBE_CONCURRENCY=4
+      # Audio enhancement is CPU-only on this profile.
+      - AUDIO_ENHANCE_USE_GPU=false
+      - AUDIO_ENHANCE_DEFAULT=true
+      - AUDIO_ENHANCE_WHEN_DIARIZATION=false
+      - AUDIO_ENHANCE_NOISE_REDUCTION=0.0
+      # --- Diarization (CPU) ---
       - DIARIZATION_MODEL_ID=pyannote/speaker-diarization-community-1
       - DIARIZATION_DEVICE=cpu
-      - DIARIZATION_PRELOAD_MODE=eager
+      - DIARIZATION_PRELOAD_MODE=lazy
+      - DIARIZATION_PRELOAD_DEVICE=cpu
+      - DIARIZATION_KEEP_PRELOADED=false
       - DIARIZATION_ALLOW_8GB_CUDA=false
+      - DIARIZATION_ACCURACY_MODE=true
+      - DIARIZATION_MULTI_SAMPLE=false
+      - DIARIZATION_SEGMENTATION_THRESHOLD=0.40
+      - DIARIZATION_CLUSTERING_THRESHOLD=0.42
+      - DIARIZATION_TRANSCRIPT_MERGE_GAP_S=0.4
+      - DIARIZATION_ASSIGN_TURN_MERGE_GAP_S=0.0
+      - DIARIZATION_MIN_OVERLAP_S=0.06
+      - DIARIZATION_PREPROCESS_SR=44100
+      - DIARIZATION_NOISE_REDUCTION=0.0
     volumes:
       - ./models:/app/models
       - ./storage:/app/storage

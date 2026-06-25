@@ -16,7 +16,7 @@ set -euo pipefail
 
 APP_ID="local-transcript-app"
 APP_NAME="Local Transcript App"
-APP_VERSION="1.2.2"
+APP_VERSION="1.0.0"
 DEFAULT_PREFIX="${HOME}/.local/share/${APP_ID}"
 PREFIX="${DEFAULT_PREFIX}"
 DO_UNINSTALL=0

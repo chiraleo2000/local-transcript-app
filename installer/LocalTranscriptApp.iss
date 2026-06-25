@@ -14,7 +14,7 @@
 ;      LocalTranscriptAppSetup.exe.
 
 #define MyAppName "Local Transcript App"
-#define MyAppVersion "1.2.2"
+#define MyAppVersion "1.0.0"
 #define MyAppPublisher "Local Transcript App"
 #define MyAppExeName "LocalTranscriptApp.exe"
 #define ModelStageRoot "C:\lta-installer-stage-real"
@@ -26,7 +26,7 @@ AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
 DefaultDirName={autopf}\LocalTranscriptApp
 DefaultGroupName={#MyAppName}
-OutputDir=..\release\v1.2.2
+OutputDir=..\release\v1.0.0
 OutputBaseFilename=LocalTranscriptAppSetup
 Compression=none
 SolidCompression=no
@@ -49,7 +49,7 @@ Source: "{#ModelStageRoot}\models\hf_cache\*"; DestDir: "{app}\models\hf_cache";
 Source: "{#ModelStageRoot}\models\torch\*"; DestDir: "{app}\models\torch"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 ; Optional: ship source for advanced users / offline diagnostics.
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\RUN_INSTRUCTIONS.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\RELEASE_NOTES.md"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"
