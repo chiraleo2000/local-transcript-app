@@ -547,6 +547,7 @@ def _selected_engines_for_job(selected_engines, language: str) -> list[str]:
 
 def _diarize_kwargs_for_job(
     diarization: bool,
+    max_speakers: int,
     diar_override_defaults: bool,
     diar_short_clip_preset: bool,
     diar_seg_threshold,
@@ -554,14 +555,19 @@ def _diarize_kwargs_for_job(
     diar_clust_threshold,
     diar_clust_min_size,
 ) -> dict | None:
-    if not diarization or not (diar_override_defaults or diar_short_clip_preset):
+    if not diarization:
         return None
-    return {
-        "seg_threshold": float(diar_seg_threshold),
-        "seg_min_duration_off": float(diar_min_off),
-        "clust_threshold": float(diar_clust_threshold),
-        "clust_min_size": int(diar_clust_min_size),
-    }
+    kwargs: dict = {}
+    if max_speakers >= 2:
+        kwargs["num_speakers"] = int(max_speakers)
+    if diar_override_defaults or diar_short_clip_preset:
+        kwargs.update({
+            "seg_threshold": float(diar_seg_threshold),
+            "seg_min_duration_off": float(diar_min_off),
+            "clust_threshold": float(diar_clust_threshold),
+            "clust_min_size": int(diar_clust_min_size),
+        })
+    return kwargs
 
 
 def _running_transcript_outputs(snap: dict, engines_label: str, no_dl) -> tuple:
@@ -741,6 +747,7 @@ def transcribe(*inputs):
     selected = _selected_engines_for_job(req.selected_engines, req.language)
     diarize_kwargs = _diarize_kwargs_for_job(
         req.diarization,
+        int(req.max_speakers),
         req.diar_override_defaults,
         req.diar_short_clip_preset,
         req.diar_seg_threshold,
@@ -977,7 +984,7 @@ def build_ui() -> gr.Blocks:
             with gr.Column(scale=1, min_width=180):
                 enhance = gr.Checkbox(
                     label="Audio Enhancement",
-                    value=_env_bool("AUDIO_ENHANCE_DEFAULT", True),
+                    value=_env_bool("AUDIO_ENHANCE_DEFAULT", False),
                     elem_id="enhance-checkbox",
                     info="Recommended for diarization — denoise and normalize loudness.",
                 )
@@ -987,7 +994,7 @@ def build_ui() -> gr.Blocks:
                     elem_id="diarization-checkbox",
                 )
             with gr.Column(scale=1, min_width=180, visible=False) as speakers_row:
-                max_speakers = gr.Slider(1, 10, step=1, value=3, label="Max Speakers")
+                max_speakers = gr.Slider(1, 10, step=1, value=6, label="Max Speakers")
             with gr.Column(scale=1, min_width=180):
                 transcribe_btn = gr.Button(
                     "Transcribe", variant="primary", interactive=models_ready, elem_id="transcribe-btn",

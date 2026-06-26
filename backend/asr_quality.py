@@ -139,12 +139,13 @@ def _build_low_vram_forced_env(
         diar_device = requested
     else:
         diar_device = "cpu"
+    preload_device = diar_device if cuda_staging else "cpu"
     return {
         "PATHUMMA_WORD_TIMESTAMPS_ON_8GB": "false",
         "ASR_8GB_CHUNK_LENGTH_S": chunk_cap,
         "ASR_8GB_MAX_CHUNK_LENGTH_S": chunk_cap,
         "ASR_8GB_RETRY_CHUNK_LENGTH_S": "15",
-        "DIARIZATION_PRELOAD_DEVICE": "cpu",
+        "DIARIZATION_PRELOAD_DEVICE": preload_device,
         "DIARIZATION_DEVICE": diar_device,
         "DIARIZATION_ALLOW_8GB_CUDA": "true" if (co_resident or cuda_staging) else "false",
         "DIARIZATION_CUDA_MIN_FREE_MB": "1536" if co_resident else "1024",
@@ -200,7 +201,7 @@ def apply_low_vram_overrides() -> list[str]:
     chunk_cap = _8gb_chunk_cap()
     co_resident = _env_bool("DIARIZATION_GPU_CO_RESIDENT", False)
     multi_pass_diar = _multi_pass_diarization_active_env()
-    unload_for_diar = "true" if (co_resident and multi_pass_diar) else "false"
+    unload_for_diar = "true"
     forced = _build_low_vram_forced_env(chunk_cap, co_resident, unload_for_diar)
     _cap_cuda_batch_in_forced(forced, multi_pass_diar, co_resident)
 

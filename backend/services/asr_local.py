@@ -311,15 +311,10 @@ def should_unload_asr_for_diarization() -> bool:
     """Stage ASR off GPU before diarization when pyannote needs CUDA VRAM."""
     if not diarization_wants_cuda():
         return False
-    if strict_memory_mode_active() and _multi_pass_diarization_active():
-        return True
     if _env_bool("DIARIZATION_GPU_CO_RESIDENT", False):
         return _env_bool("ASR_UNLOAD_FOR_DIARIZATION", False)
-    if strict_memory_mode_active():
-        return _env_bool("ASR_UNLOAD_FOR_DIARIZATION", False)
-    if models_resident_on_gpu():
-        return _env_bool("ASR_UNLOAD_FOR_DIARIZATION", False)
-    return _env_bool("ASR_UNLOAD_FOR_DIARIZATION", True)
+    # CUDA diar on 8 GB: always free GPU for pyannote unless co-resident mode is on.
+    return True
 
 
 def model_is_loaded(engine_name: str) -> bool:

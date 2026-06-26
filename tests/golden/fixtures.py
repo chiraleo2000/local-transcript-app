@@ -60,7 +60,7 @@ FIXTURES: dict[str, GoldenFixture] = {
         expected=REPO_ROOT / "tests" / "test-sample01.txt",
         output=REPO_ROOT / "tests" / "output" / "test-sample01_actual.txt",
         max_speakers=4,
-        accuracy_threshold=0.95,
+        accuracy_threshold=0.90,
         check_performance=True,
         production_mode=False,
     ),

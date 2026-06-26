@@ -24,6 +24,8 @@ _NUMBER_WORDS = {
     "ห้า": "5",
     "นึง": "1",
 }
+_TS_START_TOLERANCE_S = 3.0
+_TS_END_TOLERANCE_S = 5.0
 
 
 def _line_body(line: str) -> str:
@@ -107,22 +109,81 @@ def _normalized_lines(text: str) -> list[str]:
     ]
 
 
-def _swap_speakers(text: str) -> str:
-    return (
-        text.replace("SPEAKER_01", "SPEAKER__TMP")
-        .replace("SPEAKER_02", "SPEAKER_01")
-        .replace("SPEAKER__TMP", "SPEAKER_02")
-    )
-
-
 def _overlap(a: dict, b: dict) -> float:
     start = max(a["start"], b["start"])
     end = min(a["end"], b["end"])
     return max(0.0, end - start)
 
 
+def _timestamp_score(expected: dict, actual: dict) -> float:
+    start_delta = abs(expected["start"] - actual["start"])
+    end_delta = abs(expected["end"] - actual["end"])
+    start_score = max(0.0, 1.0 - start_delta / _TS_START_TOLERANCE_S)
+    end_score = max(0.0, 1.0 - end_delta / _TS_END_TOLERANCE_S)
+    return (start_score + end_score) / 2.0
+
+
+def _speaker_score(expected: dict, actual: dict) -> float:
+    exp_speaker = (expected.get("speaker") or "").upper()
+    act_speaker = (actual.get("speaker") or "").upper()
+    if not exp_speaker:
+        return 1.0
+    if not act_speaker:
+        return 0.0
+    return 1.0 if exp_speaker == act_speaker else 0.0
+
+
+def strict_segment_accuracy(expected: dict, actual: dict) -> float:
+    """Score one utterance on text, speaker label, and timestamp alignment."""
+    if not expected["text"]:
+        return 1.0
+    text_score = SequenceMatcher(None, expected["text"], actual["text"]).ratio()
+    return (
+        text_score * 0.55
+        + _speaker_score(expected, actual) * 0.25
+        + _timestamp_score(expected, actual) * 0.20
+    )
+
+
+def strict_transcript_accuracy(expected: str, actual: str) -> float:
+    """Golden score: each reference turn must match text, speaker, and timestamps."""
+    exp_segments = _parsed_segments(expected)
+    act_segments = _parsed_segments(actual)
+    if not exp_segments:
+        return 1.0 if not act_segments else 0.0
+    if not act_segments:
+        return 0.0
+
+    scores: list[float] = []
+    weights: list[float] = []
+    for exp in exp_segments:
+        if not exp["text"]:
+            continue
+        best = 0.0
+        best_overlap = 0.0
+        for act in act_segments:
+            overlap = _overlap(exp, act)
+            if overlap <= 0:
+                continue
+            segment_score = strict_segment_accuracy(exp, act)
+            if overlap > best_overlap or (overlap == best_overlap and segment_score > best):
+                best = segment_score
+                best_overlap = overlap
+        duration = max(0.1, exp["end"] - exp["start"])
+        scores.append(best if best_overlap > 0 else 0.0)
+        weights.append(duration)
+
+    if not scores:
+        return 0.0
+    line_ratio = min(len(act_segments), len(exp_segments)) / max(
+        1, max(len(act_segments), len(exp_segments))
+    )
+    weighted = sum(s * w for s, w in zip(scores, weights)) / (sum(weights) or 1.0)
+    return weighted * (0.85 + 0.15 * line_ratio)
+
+
 def time_aligned_accuracy(expected: str, actual: str) -> float:
-    """Score by matching utterances on timestamp overlap."""
+    """Score by matching utterances on timestamp overlap (text only)."""
     exp_segments = _parsed_segments(expected)
     act_segments = _parsed_segments(actual)
     if not exp_segments:
@@ -172,23 +233,81 @@ def line_best_match_accuracy(expected: str, actual: str) -> float:
     return sum(scores) / len(scores)
 
 
-def transcript_accuracy(expected: str, actual: str) -> float:
-    """Return dialogue accuracy in [0, 1]."""
+def speaker_sequence_score(expected: str, actual: str) -> float:
+    """Fraction of lines where speaker label matches golden order."""
+    exp_spks = [seg["speaker"] for seg in _parsed_segments(expected) if seg.get("speaker")]
+    act_spks = [seg["speaker"] for seg in _parsed_segments(actual) if seg.get("speaker")]
+    if not exp_spks:
+        return 1.0 if not act_spks else 0.0
+    if not act_spks:
+        return 0.0
+    if len(exp_spks) == len(act_spks):
+        matches = sum(1 for e, a in zip(exp_spks, act_spks) if e == a)
+        return matches / len(exp_spks)
+    scores = [
+        max(
+            1.0 if exp_spk == act_spk else 0.0
+            for act_spk in act_spks
+        )
+        for exp_spk in exp_spks
+    ]
+    return sum(scores) / len(exp_spks)
+
+
+def timestamp_alignment_score(expected: str, actual: str) -> float:
+    """Average timestamp alignment score across matched reference turns."""
+    exp_segments = _parsed_segments(expected)
+    act_segments = _parsed_segments(actual)
+    if not exp_segments:
+        return 1.0 if not act_segments else 0.0
+    if not act_segments:
+        return 0.0
+
+    scores: list[float] = []
+    weights: list[float] = []
+    for exp in exp_segments:
+        if not exp["text"]:
+            continue
+        best = 0.0
+        best_overlap = 0.0
+        for act in act_segments:
+            overlap = _overlap(exp, act)
+            if overlap <= 0:
+                continue
+            ts_score = _timestamp_score(exp, act)
+            if overlap > best_overlap or (overlap == best_overlap and ts_score > best):
+                best = ts_score
+                best_overlap = overlap
+        duration = max(0.1, exp["end"] - exp["start"])
+        scores.append(best if best_overlap > 0 else 0.0)
+        weights.append(duration)
+
+    if not scores:
+        return 0.0
+    return sum(s * w for s, w in zip(scores, weights)) / (sum(weights) or 1.0)
+
+
+def content_accuracy(expected: str, actual: str) -> float:
+    """Text-only accuracy (speaker/timestamp ignored)."""
+    exp_norm = normalize_transcript_corpus(expected)
+    act_norm = normalize_transcript_corpus(actual)
     line_score = line_best_match_accuracy(expected, actual)
     time_score = time_aligned_accuracy(expected, actual)
-    corpus_scores = [
-        SequenceMatcher(
-            None,
-            normalize_transcript_corpus(expected),
-            normalize_transcript_corpus(actual),
-        ).ratio(),
-        SequenceMatcher(
-            None,
-            normalize_transcript_corpus(expected),
-            normalize_transcript_corpus(_swap_speakers(actual)),
-        ).ratio(),
-    ]
-    return max(line_score, time_score, max(corpus_scores))
+    corpus_score = SequenceMatcher(None, exp_norm, act_norm).ratio()
+    return max(line_score, time_score, corpus_score)
+
+
+def transcript_accuracy(expected: str, actual: str) -> float:
+    """Golden accuracy: text match with speaker labels on each line."""
+    text_score = content_accuracy(expected, actual)
+    strict_score = strict_transcript_accuracy(expected, actual)
+    speaker_score = speaker_sequence_score(expected, actual)
+
+    if text_score >= 0.95 and speaker_score >= 0.99:
+        return text_score
+    if text_score >= 0.93 and speaker_score >= 0.99:
+        return text_score * 0.98
+    return min(text_score, strict_score, (text_score * 0.7) + (speaker_score * 0.3))
 
 
 def count_speaker_lines(text: str) -> dict[str, int]:
@@ -204,8 +323,16 @@ def count_speaker_lines(text: str) -> dict[str, int]:
 def accuracy_report(expected: str, actual: str) -> dict:
     exp_norm = normalize_transcript_corpus(expected)
     act_norm = normalize_transcript_corpus(actual)
+    strict = strict_transcript_accuracy(expected, actual)
+    speaker_seq = speaker_sequence_score(expected, actual)
+    content = content_accuracy(expected, actual)
+    ts_align = timestamp_alignment_score(expected, actual)
     return {
         "accuracy": transcript_accuracy(expected, actual),
+        "content_accuracy": content,
+        "timestamp_accuracy": ts_align,
+        "strict_accuracy": strict,
+        "speaker_sequence": speaker_seq,
         "line_best_match": line_best_match_accuracy(expected, actual),
         "time_aligned": time_aligned_accuracy(expected, actual),
         "corpus_similarity": SequenceMatcher(None, exp_norm, act_norm).ratio(),

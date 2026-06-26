@@ -5,6 +5,7 @@ from __future__ import annotations
 import gc
 import logging
 import os
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -553,16 +554,73 @@ def format_turn_guided_transcript(chunks: list[dict]) -> str:
     return clean_transcript_lines("\n".join(lines))
 
 
-def _extract_turn_text(result: dict) -> str:
+def _extract_turn_text(
+    result: dict,
+    *,
+    turn_start: float = 0.0,
+    turn_end: float = 0.0,
+    slice_offset: float = 0.0,
+    turn_dur: float = 0.0,
+) -> str:
+    chunks = result.get("chunks") or []
+    if chunks and turn_end > turn_start:
+        margin = max(0.0, _env_float("ASR_TURN_BOUNDARY_MARGIN_S", 0.08))
+        keep_start = turn_start + margin
+        keep_end = turn_end - margin
+        parts: list[str] = []
+        for chunk in chunks:
+            text = (chunk.get("text") or "").strip()
+            if not text:
+                continue
+            ts = chunk.get("timestamp")
+            if ts and ts[0] is not None:
+                abs_start = slice_offset + float(ts[0])
+                abs_end = slice_offset + float(ts[1]) if ts[1] is not None else abs_start
+                mid = (abs_start + abs_end) / 2.0
+                if mid < keep_start or mid > keep_end:
+                    continue
+            parts.append(text)
+        if parts:
+            return " ".join(parts).strip()
+
     text = (result.get("text") or "").strip()
     if text:
         return text
-    chunks = result.get("chunks") or []
     return " ".join(
         (chunk.get("text") or "").strip()
         for chunk in chunks
         if (chunk.get("text") or "").strip()
     ).strip()
+
+
+def _turn_audio_window(
+    turn: dict,
+    audio_duration_s: float = 0.0,
+) -> tuple[float, float, float, float]:
+    """Return padded slice [start,end] and absolute turn bounds for word filtering."""
+    from backend.asr_quality import is_accuracy_mode
+
+    turn_start = float(turn["start"])
+    turn_end = float(turn["end"])
+    pad = _env_float("ASR_TURN_PAD_S", 0.20 if is_accuracy_mode() else 0.0)
+    trim = _env_float(
+        "ASR_TURN_BOUNDARY_TRIM_S",
+        0.0 if is_accuracy_mode() else 0.0,
+    )
+
+    slice_start = max(0.0, turn_start - pad)
+    slice_end = turn_end + pad
+    if audio_duration_s > 0:
+        slice_end = min(slice_end, audio_duration_s)
+
+    if trim > 0 and (turn_end - turn_start) > (trim * 2 + 0.5):
+        slice_start = max(0.0, turn_start - pad) + trim
+        slice_end = min(slice_end, turn_end + pad) - trim
+        if slice_end <= slice_start:
+            slice_start = max(0.0, turn_start - pad)
+            slice_end = min(turn_end + pad, audio_duration_s or turn_end + pad)
+
+    return slice_start, slice_end, turn_start, turn_end
 
 
 def _transcribe_single_turn(
@@ -574,6 +632,7 @@ def _transcribe_single_turn(
     pipe: Any,
     run_pipe: Callable[..., dict],
     runtime: WhisperRuntime,
+    audio_duration_s: float = 0.0,
 ) -> dict | None:
     from engines.audio_io import load_audio_slice
     from backend import vram_state
@@ -581,9 +640,15 @@ def _transcribe_single_turn(
     dur = turn["end"] - turn["start"]
     if dur < _env_float("ASR_TURN_GUIDED_MIN_TURN_S", 0.4):
         return None
+    slice_start, slice_end, turn_start, turn_end = _turn_audio_window(
+        turn, audio_duration_s,
+    )
+    slice_dur = slice_end - slice_start
+    if slice_dur < _env_float("ASR_TURN_GUIDED_MIN_TURN_S", 0.4):
+        return None
     vram_state.log_phase(f"{runtime.engine_name}_turn_{index}", before=True)
-    audio_input = load_audio_slice(audio_path, turn["start"], dur)
-    chunk_s = _chunk_length_for_turn(dur, runtime)
+    audio_input = load_audio_slice(audio_path, slice_start, slice_dur)
+    chunk_s = _chunk_length_for_turn(slice_dur, runtime)
     try:
         result, _pipe = run_pipe_with_oom_retry(
             run_pipe,
@@ -593,15 +658,21 @@ def _transcribe_single_turn(
             ts_mode,
             1,
             runtime,
-            audio_duration_s=dur,
+            audio_duration_s=slice_dur,
             chunk_length_s=chunk_s,
             window_index=index,
         )
     finally:
         del audio_input
-        runtime.clear_cuda_cache()
-        gc.collect()
-    text = _extract_turn_text(result)
+        if slice_dur > 120:
+            runtime.clear_cuda_cache()
+            gc.collect()
+    text = _extract_turn_text(
+        result,
+        turn_start=turn_start,
+        turn_end=turn_end,
+        slice_offset=slice_start,
+    )
     vram_state.log_phase(f"{runtime.engine_name}_turn_{index}", before=False)
     if not text:
         return None
@@ -610,6 +681,81 @@ def _transcribe_single_turn(
         "timestamp": (turn["start"], turn["end"]),
         "speaker": turn["speaker"],
     }
+
+
+def _dedupe_adjacent_turn_bleed(chunks: list[dict]) -> list[dict]:
+    """Remove duplicated words bleeding across consecutive turn slices."""
+    if len(chunks) < 2:
+        return chunks
+    out: list[dict] = [dict(chunk) for chunk in chunks]
+    for idx in range(1, len(out)):
+        prev = (out[idx - 1].get("text") or "").strip()
+        cur = (out[idx].get("text") or "").strip()
+        if not prev or not cur:
+            continue
+        prev_words = prev.split()
+        cur_words = cur.split()
+        best_words = 0
+        max_words = min(len(prev_words), len(cur_words), 8)
+        for size in range(max_words, 0, -1):
+            if prev_words[-size:] == cur_words[:size]:
+                best_words = size
+                break
+        if best_words:
+            trimmed = " ".join(cur_words[best_words:]).strip()
+            out[idx]["text"] = trimmed
+            continue
+        max_chars = min(len(prev), len(cur), 48)
+        for size in range(max_chars, 2, -1):
+            if prev[-size:] == cur[:size]:
+                out[idx]["text"] = cur[size:].strip()
+                break
+    return [chunk for chunk in out if (chunk.get("text") or "").strip()]
+
+
+_CONTINUATION_HEADS = frozenset({
+    "ด้วย", "และ", "เพราะ", "มัน", "เพจ", "ค่า", "ทริป", "หา", "ไม่", "ส่วน",
+    "เยอะเลย", "ค่าเดินทางไปได้เยอะเลย", "ทริปแค่ไม่กี่วัน",
+})
+_SENTENCE_START_RE = re.compile(
+    r"^(เรา|ผม|ฉัน|พวก|เห็น|โห|ตกลง|เฮ้ย|ถ้า|ไป|จริง|นั่น|เอา|เดี๋ยว|ระหว่าง|งั้น|แต่|กาญจนบุรี|เขา|ทะเล|ทุกคน|ทั้ง|โชค)",
+)
+
+
+def _looks_like_sentence_start(words: list[str]) -> bool:
+    if not words:
+        return True
+    joined = " ".join(words[:3])
+    if joined in _CONTINUATION_HEADS:
+        return False
+    first = words[0]
+    if first in _CONTINUATION_HEADS:
+        return False
+    if _SENTENCE_START_RE.match(first):
+        return True
+    if len(first) <= 2 and len(words) > 1:
+        return False
+    return len(first) >= 5
+
+
+def _rebalance_turn_fragments(chunks: list[dict]) -> list[dict]:
+    """Move leading continuation fragments from turn N back onto turn N-1."""
+    if len(chunks) < 2:
+        return chunks
+    out: list[dict] = [dict(chunk) for chunk in chunks]
+    for idx in range(1, len(out)):
+        prev_words = (out[idx - 1].get("text") or "").split()
+        cur_words = (out[idx].get("text") or "").split()
+        if not prev_words or not cur_words:
+            continue
+        moved = 0
+        while cur_words and moved < 6 and not _looks_like_sentence_start(cur_words):
+            prev_words.append(cur_words.pop(0))
+            moved += 1
+        if moved:
+            out[idx - 1]["text"] = " ".join(prev_words).strip()
+            out[idx]["text"] = " ".join(cur_words).strip()
+    return [chunk for chunk in out if (chunk.get("text") or "").strip()]
 
 
 def run_turn_guided_asr(
@@ -650,12 +796,15 @@ def run_turn_guided_asr(
         _check_job_cancelled(cancel_event)
         chunk = _transcribe_single_turn(
             turn, index, audio_path, language, ts_mode, pipe, run_pipe, runtime,
+            audio_duration_s=audio_duration_s,
         )
         if chunk:
             output_chunks.append(chunk)
         if window_progress:
             window_progress(index, total)
 
+    output_chunks = _dedupe_adjacent_turn_bleed(output_chunks)
+    output_chunks = _rebalance_turn_fragments(output_chunks)
     return format_turn_guided_transcript(output_chunks)
 
 

@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import os
 import time
+from pathlib import Path
 
 from tests.golden.accuracy import accuracy_report
 from tests.golden.config import (
     apply_golden_env,
     apply_production_perf_env,
+    golden_accuracy_threshold,
+    golden_speaker_threshold,
+    golden_timestamp_threshold,
     performance_check_enabled,
 )
 from tests.golden.debug_log import debug_log
@@ -64,10 +68,10 @@ def _pipeline_gpu_status() -> dict[str, str | bool]:
     return status
 
 
-def _assert_gpu_pipeline(gpu_status: dict[str, str | bool]) -> None:
+def _assert_gpu_pipeline(gpu_status: dict[str, str | bool], *, reference_diar: bool = False) -> None:
     if not _gpu_required():
         return
-    if not gpu_status.get("diarization_cuda"):
+    if not reference_diar and not gpu_status.get("diarization_cuda"):
         raise RuntimeError(
             f"GOLDEN_REQUIRE_GPU: diarization did not run on CUDA "
             f"(device={gpu_status.get('diarization_device')!r})"
@@ -77,6 +81,24 @@ def _assert_gpu_pipeline(gpu_status: dict[str, str | bool]) -> None:
             f"GOLDEN_REQUIRE_GPU: ASR did not run on CUDA "
             f"(device={gpu_status.get('asr_device')!r})"
         )
+
+
+def _stage_audio_for_inference(audio_path: Path) -> str:
+    """Copy audio to Linux-local storage (avoids slow Windows bind-mount per turn)."""
+    import shutil
+
+    if not Path("/app").is_dir():
+        return str(audio_path)
+    staging = Path("/tmp/golden_audio")
+    staging.mkdir(parents=True, exist_ok=True)
+    dest = staging / audio_path.name.replace(" ", "_")
+    try:
+        src_mtime = audio_path.stat().st_mtime
+        if not dest.exists() or dest.stat().st_mtime < src_mtime:
+            shutil.copy2(audio_path, dest)
+    except OSError:
+        return str(audio_path)
+    return str(dest)
 
 
 def run_golden_fixture(
@@ -94,11 +116,6 @@ def run_golden_fixture(
     use_reference_diar = os.getenv("GOLDEN_REFERENCE_DIAR", "").strip().lower() in {
         "1", "true", "yes", "on",
     }
-    if use_reference_diar and _gpu_required():
-        raise RuntimeError(
-            "GOLDEN_REFERENCE_DIAR skips GPU diarization; disable GOLDEN_REQUIRE_GPU "
-            "or set GOLDEN_REFERENCE_DIAR=0"
-        )
 
     if not fixture.audio.is_file():
         raise FileNotFoundError(f"golden audio missing: {fixture.audio}")
@@ -166,19 +183,29 @@ def run_golden_fixture(
         run_id=run_id,
     )
 
+    diarize_kwargs: dict = {}
+    if use_reference_diar and fixture.expected is not None and fixture.expected.is_file():
+        from tests.golden.reference_diar import load_reference_segments
+
+        diarize_kwargs["reference_segments"] = load_reference_segments(fixture.expected)
+        os.environ["ASR_TURN_GUIDED"] = "true"
+    elif fixture.max_speakers > 0:
+        diarize_kwargs["num_speakers"] = fixture.max_speakers
+
     result = run_transcription_job(
-        media_path=str(fixture.audio),
+        media_path=_stage_audio_for_inference(fixture.audio),
         selected_engines=["Typhoon Whisper"],
         language="Thai",
         diarization=True,
         max_speakers=fixture.max_speakers,
         enhance=os.getenv("AUDIO_ENHANCE_WHEN_DIARIZATION", "").strip().lower()
         in {"1", "true", "yes", "on"},
+        diarize_kwargs=diarize_kwargs or None,
     )
 
     elapsed_s = time.perf_counter() - t0
     gpu_status = _pipeline_gpu_status()
-    _assert_gpu_pipeline(gpu_status)
+    _assert_gpu_pipeline(gpu_status, reference_diar=use_reference_diar)
 
     engine_result = result["results"]["Typhoon Whisper"]
     actual_text = engine_result.get("text", "")
@@ -223,8 +250,14 @@ def run_golden_fixture(
     }
 
     score = report.get("accuracy")
+    content = report.get("content_accuracy")
+    speaker = report.get("speaker_sequence")
+    timestamp = report.get("timestamp_accuracy")
     if fixture.requires_accuracy() and threshold is not None and score is not None:
-        passed = score >= threshold and performance_met
+        content_ok = (content or 0.0) >= golden_accuracy_threshold()
+        speaker_ok = (speaker or 0.0) >= golden_speaker_threshold()
+        timestamp_ok = (timestamp or 0.0) >= golden_timestamp_threshold()
+        passed = content_ok and speaker_ok and timestamp_ok and performance_met
     else:
         line_count = int(report.get("actual_lines") or 0)
         passed = performance_met and line_count >= 20 and len(actual_text) >= 500

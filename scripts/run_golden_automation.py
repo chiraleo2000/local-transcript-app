@@ -204,10 +204,31 @@ def _wait_for_healthy(timeout_s: int = 180) -> bool:
     return False
 
 
-def _deploy_docker() -> None:
-    print("Building and deploying Docker GPU stack...")
+def _image_exists() -> bool:
+    probe = subprocess.run(
+        ["docker", "image", "inspect", "local-transcript-app:latest"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        check=False,
+    )
+    return probe.returncode == 0
+
+
+def _deploy_docker(*, rebuild: bool = False) -> None:
+    if rebuild or not _image_exists():
+        print("Building Docker GPU image (cached layers when unchanged)...")
+        env = {**os.environ, "DOCKER_BUILDKIT": "1", "COMPOSE_DOCKER_CLI_BUILD": "1"}
+        subprocess.run(
+            ["docker", "compose", "-f", str(COMPOSE_FILE), "build", "transcription"],
+            cwd=REPO_ROOT,
+            check=True,
+            env=env,
+        )
+    else:
+        print("Docker image local-transcript-app:latest present — skipping rebuild.")
+    print("Starting transcription-service...")
     subprocess.run(
-        ["docker", "compose", "-f", str(COMPOSE_FILE), "up", "-d", "--build"],
+        ["docker", "compose", "-f", str(COMPOSE_FILE), "up", "-d", "transcription"],
         cwd=REPO_ROOT,
         check=True,
     )
@@ -254,18 +275,13 @@ def _run_exclusive_gpu_container(fixtures: list[str] | None) -> int:
             )
 
 
-def _run_in_deployed_container(fixtures: list[str] | None) -> int:
+def _run_in_deployed_container(fixtures: list[str] | None, *, rebuild: bool = False) -> int:
     if not _docker_service_running():
-        _deploy_docker()
+        _deploy_docker(rebuild=rebuild or not _image_exists())
+    elif rebuild:
+        _deploy_docker(rebuild=True)
     else:
-        print(f"{CONTAINER_NAME} already running; rebuilding image...")
-        subprocess.run(
-            ["docker", "compose", "-f", str(COMPOSE_FILE), "up", "-d", "--build"],
-            cwd=REPO_ROOT,
-            check=True,
-        )
-        if not _wait_for_healthy():
-            raise RuntimeError(f"{CONTAINER_NAME} did not become healthy after rebuild")
+        print(f"{CONTAINER_NAME} running — using bind-mounted code (no image rebuild).")
     return _run_exclusive_gpu_container(fixtures)
 
 
@@ -285,6 +301,11 @@ def main() -> int:
     parser.add_argument("--in-container", action="store_true")
     parser.add_argument("--docker", action="store_true")
     parser.add_argument("--deploy", action="store_true")
+    parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="force docker image rebuild (default: reuse cached image + bind-mount code)",
+    )
     parser.add_argument(
         "--fixtures",
         default=os.getenv("GOLDEN_FIXTURES", "all"),
@@ -307,10 +328,13 @@ def main() -> int:
 
     if args.in_container:
         return _run_direct(fixtures)
+    rebuild = args.rebuild or os.getenv("GOLDEN_REBUILD", "").strip().lower() in {
+        "1", "true", "yes",
+    }
     if args.deploy or os.getenv("GOLDEN_DEPLOY", "").strip().lower() in {"1", "true", "yes"}:
-        return _run_in_deployed_container(fixtures)
+        return _run_in_deployed_container(fixtures, rebuild=rebuild)
     if args.docker or os.getenv("GOLDEN_USE_DOCKER", "").strip().lower() in {"1", "true", "yes"}:
-        return _run_in_deployed_container(fixtures)
+        return _run_in_deployed_container(fixtures, rebuild=rebuild)
 
     try:
         import pytest  # noqa: F401

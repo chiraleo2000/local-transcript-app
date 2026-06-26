@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # ---------- Stage 1: Build dependencies ----------
 FROM nvidia/cuda:13.0.0-runtime-ubuntu24.04 AS base
 
@@ -17,9 +18,10 @@ WORKDIR /app
 RUN mkdir -p models/hf_cache models/ov_cache storage/input storage/audio \
              storage/transcripts storage/jobs storage/logs config
 
-# Install Python deps first (layer cache)
+# Install Python deps first (layer cache; pip cache mount speeds rebuilds)
 COPY requirements.txt .
-RUN python3 -m pip install --no-cache-dir --break-system-packages -r requirements.txt \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install --break-system-packages -r requirements.txt \
     && (python3 -m pip uninstall --break-system-packages -y torchcodec || true) \
     && python3 -c "import site,os; \
 stub=[os.path.join(p,'torchcodec-0.0.1.dist-info') for p in site.getsitepackages() if os.path.isdir(p)]; \

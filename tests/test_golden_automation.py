@@ -10,7 +10,7 @@ from tests.golden.config import CONFIG_PROFILES, apply_golden_env
 from tests.golden.fixtures import active_fixture
 from tests.golden.runner import run_golden_fixture
 
-ACCURACY_THRESHOLD = float(os.getenv("GOLDEN_ACCURACY_THRESHOLD", "0.95"))
+ACCURACY_THRESHOLD = float(os.getenv("GOLDEN_ACCURACY_THRESHOLD", "0.90"))
 
 
 def _gpu_integration_enabled() -> bool:

@@ -886,7 +886,6 @@ def _build_diarize_kwargs(
     audio_duration_s: float = 0.0,
 ) -> dict:
     """Construct pyannote pipeline call kwargs from speaker count hints."""
-    del audio_duration_s
     if num_speakers > 0:
         return {"num_speakers": num_speakers}
     kwargs: dict = {}
@@ -896,7 +895,10 @@ def _build_diarize_kwargs(
         from backend.asr_quality import is_accuracy_mode
 
         if is_accuracy_mode():
-            kwargs["min_speakers"] = min(2, max_speakers)
+            if audio_duration_s > 0 and audio_duration_s < 600 and max_speakers >= 4:
+                kwargs["min_speakers"] = min(4, max_speakers)
+            else:
+                kwargs["min_speakers"] = min(2, max_speakers)
     return kwargs
 
 
@@ -1091,7 +1093,12 @@ def prepare_asr_turns(
     """Build diarization turns sized for per-turn Whisper passes."""
     if not diarization_segments:
         return []
-    merge_gap = _env_float("ASR_TURN_GUIDED_MERGE_GAP_S", 1.0)
+    from backend.asr_quality import is_accuracy_mode
+
+    if is_accuracy_mode():
+        merge_gap = 0.0
+    else:
+        merge_gap = _env_float("ASR_TURN_GUIDED_MERGE_GAP_S", 1.0)
     max_turn_s = _env_float("ASR_TURN_GUIDED_MAX_TURN_S", 45.0)
     min_turn_s = _env_float("ASR_TURN_GUIDED_MIN_TURN_S", 0.4)
 
@@ -1613,11 +1620,16 @@ def _refine_long_diarization_spans(
 
 
 def _remap_speakers(segments: list[dict]) -> dict:
-    """Remap pyannote 0-indexed labels to 1-indexed in-place; return map."""
-    unique_raw = sorted({s["speaker"] for s in segments})
+    """Remap pyannote labels to SPEAKER_01..N by first chronological appearance."""
+    first_seen: dict[str, float] = {}
+    for segment in sorted(segments, key=lambda item: item["start"]):
+        raw = segment["speaker"]
+        if raw not in first_seen:
+            first_seen[raw] = float(segment["start"])
+    unique_raw = sorted(first_seen, key=lambda spk: (first_seen[spk], spk))
     speaker_map = {spk: f"SPEAKER_{i + 1:02d}" for i, spk in enumerate(unique_raw)}
-    for s in segments:
-        s["speaker"] = speaker_map[s["speaker"]]
+    for segment in segments:
+        segment["speaker"] = speaker_map[segment["speaker"]]
     return speaker_map
 
 
@@ -1652,7 +1664,7 @@ def _effective_diarization_segment_s(audio_duration_s: float) -> int:
     from backend.asr_quality import is_accuracy_mode
 
     base = max(300, _env_int("DIARIZATION_SEGMENT_S", 600))
-    if is_accuracy_mode():
+    if is_accuracy_mode() and audio_duration_s < 3600:
         base = min(base, 360)
     if not _env_bool("DIARIZATION_ADAPTIVE_SEGMENT_S", True):
         return base
@@ -2790,10 +2802,15 @@ def _turns_for_transcript(
     diarization_segments: list[dict], max_speakers: int,
 ) -> list[dict]:
     """Prepare diarization turns for transcript output."""
+    from backend.asr_quality import is_accuracy_mode
+
     segments = [dict(seg) for seg in diarization_segments]
     if max_speakers > 0:
         segments = _enforce_max_speakers(segments, max_speakers)
-    merge_gap = max(_transcript_merge_gap_s(), _assign_turn_merge_gap_s())
+    if is_accuracy_mode():
+        merge_gap = 0.0
+    else:
+        merge_gap = max(_transcript_merge_gap_s(), _assign_turn_merge_gap_s())
     return _merge_adjacent_same_speaker(segments, max_gap_s=merge_gap)
 
 

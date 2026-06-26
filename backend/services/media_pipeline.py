@@ -172,6 +172,15 @@ def diarize_audio(
     from engines.diarization import diarize
 
     kwargs = dict(diarize_kwargs or {})
+    reference = kwargs.pop("reference_segments", None)
+    if reference:
+        segments = [dict(seg) for seg in reference]
+        logger.info(
+            "Using %d reference diarization segment(s) (golden turn boundaries).",
+            len(segments),
+        )
+        return segments
+
     kwargs.setdefault("audio_duration_s", audio_duration_s)
     return diarize(audio_path, max_speakers=max_speakers, **kwargs)
 

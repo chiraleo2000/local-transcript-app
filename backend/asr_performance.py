@@ -94,9 +94,17 @@ def adaptive_num_beams(audio_duration_s: float, *, diarization: bool) -> int:
 
 def adaptive_turn_merge_gap_s(audio_duration_s: float) -> float:
     """Wider merge on long audio → fewer ASR passes."""
+    from backend.asr_quality import is_accuracy_mode
+
+    configured = os.getenv("ASR_TURN_GUIDED_MERGE_GAP_S", "").strip()
+    if configured and audio_duration_s < 5 * 60 and is_accuracy_mode():
+        try:
+            return float(configured)
+        except ValueError:
+            pass
     long_audio_s = _env_float("ASR_TARGET_LONG_AUDIO_S", 3600.0)
     if audio_duration_s < 5 * 60:
-        return 0.5
+        return 0.35 if is_accuracy_mode() else 0.5
     if audio_duration_s < 12 * 60:
         return 0.6
     if audio_duration_s < 20 * 60:
