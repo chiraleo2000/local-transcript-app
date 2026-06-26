@@ -34,6 +34,7 @@ from backend.services.media_pipeline import (
     diarize_audio,
     enhance_audio,
     normalize_media,
+    stage_audio_for_inference,
 )
 from backend.storage import (
     copy_input_file,
@@ -620,6 +621,10 @@ def _execute_transcription_stages(
     if enhance:
         logger.info("Job %s enhanced audio path: %s", ctx.job_id, process_path)
     _check_cancel(ctx.cancel_event)
+    staged = stage_audio_for_inference(process_path, ctx.job_id)
+    if staged != process_path:
+        temp_files.append(staged)
+        process_path = staged
     audio_duration_s = audio_duration_seconds(process_path)
     if ctx.progress is not None:
         ctx.progress.set_audio_duration(audio_duration_s)

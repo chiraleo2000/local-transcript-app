@@ -96,10 +96,19 @@ if [ "${1:-}" = "docker" ]; then
         echo "      To enable NVIDIA GPU: install nvidia-container-toolkit and restart Docker."
     fi
 
-    echo "[3/3] Docker deployment..."
+    echo "[3/3] Docker deployment (BuildKit cached build)..."
     echo
-    docker compose $COMPOSE_FILES up --build -d
+    export DOCKER_BUILDKIT=1
+    export COMPOSE_DOCKER_CLI_BUILD=1
+    docker compose $COMPOSE_FILES build
+    docker compose $COMPOSE_FILES up -d
     if [[ "$COMPOSE_FILES" == *"gpu.yml"* ]]; then
+        echo "Waiting for transcription-service health..."
+        for _ in $(seq 1 24); do
+            status=$(docker inspect --format '{{.State.Health.Status}}' transcription-service 2>/dev/null || true)
+            if [ "$status" = "healthy" ]; then break; fi
+            sleep 5
+        done
         echo "GPU stack: http://localhost:7988"
         docker logs -f transcription-service
     else

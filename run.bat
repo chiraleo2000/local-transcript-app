@@ -108,10 +108,22 @@ if errorlevel 1 (
     set COMPOSE_FILES=-f docker-compose.gpu.yml
 )
 
-echo [3/3] Docker deployment...
+echo [3/3] Docker deployment (BuildKit cached build)...
 echo.
-docker compose %COMPOSE_FILES% up --build -d
+set DOCKER_BUILDKIT=1
+set COMPOSE_DOCKER_CLI_BUILD=1
+docker compose %COMPOSE_FILES% build
+if errorlevel 1 ( echo [ERROR] Docker build failed. && pause && exit /b 1 )
+docker compose %COMPOSE_FILES% up -d
+if errorlevel 1 ( echo [ERROR] Docker start failed. && pause && exit /b 1 )
 if "%COMPOSE_FILES%"=="-f docker-compose.gpu.yml" (
+    echo Waiting for transcription-service health...
+    for /L %%i in (1,1,24) do (
+        docker inspect --format "{{.State.Health.Status}}" transcription-service 2>nul | findstr /i "healthy" >nul && goto GPU_READY
+        timeout /t 5 /nobreak >nul
+    )
+    echo [WARNING] Service not healthy yet — check: docker logs transcription-service
+    :GPU_READY
     echo GPU stack: http://localhost:7988
     docker logs -f transcription-service
 ) else (

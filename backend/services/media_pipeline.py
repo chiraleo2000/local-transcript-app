@@ -67,7 +67,7 @@ def normalize_media(media_path: str, job_id: str) -> str:
 
 
 def _should_unload_vram_on_media_change() -> bool:
-    return os.getenv("ASR_CLEAR_VRAM_ON_MEDIA_CHANGE", "true").strip().lower() in {
+    return os.getenv("ASR_CLEAR_VRAM_ON_MEDIA_CHANGE", "false").strip().lower() in {
         "1", "true", "yes", "on",
     }
 
@@ -115,6 +115,39 @@ def enhance_audio(audio_path: str) -> str:
     if enhanced_path != audio_path and os.path.isfile(enhanced_path):
         logger.info("Audio enhancement complete: %s", enhanced_path)
     return enhanced_path
+
+
+def _stage_audio_enabled() -> bool:
+    return os.getenv("AUDIO_STAGE_TO_TMP", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def stage_audio_for_inference(audio_path: str, job_id: str) -> str:
+    """Copy job audio to container-local /tmp for fast per-turn ASR slicing."""
+    if not _stage_audio_enabled():
+        return audio_path
+    src = Path(audio_path)
+    if not src.is_file():
+        return audio_path
+    resolved = str(src.resolve())
+    if resolved.startswith("/tmp/"):
+        return audio_path
+    staging = Path("/tmp/job_audio")
+    staging.mkdir(parents=True, exist_ok=True)
+    dest = staging / f"{job_id}_{src.name}"
+    try:
+        if not dest.exists() or dest.stat().st_mtime < src.stat().st_mtime:
+            shutil.copy2(src, dest)
+        logger.info(
+            "Staged audio for GPU inference: %s (%d MB)",
+            dest,
+            dest.stat().st_size // (1024 * 1024),
+        )
+        return str(dest)
+    except OSError as exc:
+        logger.warning("Audio staging skipped (%s); using %s", exc, audio_path)
+        return audio_path
 
 
 def _duration_ffprobe(audio_path: str) -> float | None:
