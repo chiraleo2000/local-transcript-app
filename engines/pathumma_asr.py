@@ -5,7 +5,12 @@
 import logging
 import os
 
-from engines.model_cache import allow_online_download_if_missing, pretrained_local_files_only
+from engines.model_cache import (
+    has_cached_model_file,
+    offline_cache_error_message,
+    pretrained_local_files_only,
+    require_cached_model,
+)
 from engines.whisper_utils import whisper_generate_kwargs
 
 logger = logging.getLogger(__name__)
@@ -310,8 +315,11 @@ def _load_cpu_pipeline(hf_token: str | None):
 
 def _load_ov_pipeline(device: str, hf_token: str | None):
     """Build Pathumma pipeline via OpenVINO IR; falls back to CPU on export failure."""
+    from engines.openvino_compat import apply_openvino_whisper_compat
     from transformers.models.whisper.processing_whisper import WhisperProcessor
     from transformers import pipeline as hf_pipeline
+
+    apply_openvino_whisper_compat()
 
     cache_dir = os.getenv("OV_CACHE_DIR", "./ov_cache")
     # Namespace the OpenVINO export by the model id so swapping MODEL_ID does
@@ -324,11 +332,18 @@ def _load_ov_pipeline(device: str, hf_token: str | None):
         from optimum.intel.openvino import OVModelForSpeechSeq2Seq
         if os.path.isdir(export_dir) and os.path.isfile(ir_path):
             logger.info("Loading Pathumma from cached OpenVINO IR: %s", export_dir)
-            model = OVModelForSpeechSeq2Seq.from_pretrained(export_dir, device=device, compile=True)
+            model = OVModelForSpeechSeq2Seq.from_pretrained(
+                export_dir,
+                device=device,
+                compile=True,
+                local_files_only=True,
+            )
             processor = WhisperProcessor.from_pretrained(export_dir)
         else:
+            if not has_cached_model_file(MODEL_ID):
+                raise RuntimeError(offline_cache_error_message(MODEL_ID))
             logger.info(
-                "Exporting Pathumma to OpenVINO IR (first run, may take several minutes)..."
+                "Exporting Pathumma to OpenVINO IR from local cache (first run, may take several minutes)..."
             )
             model = OVModelForSpeechSeq2Seq.from_pretrained(
                 MODEL_ID,
@@ -392,7 +407,9 @@ def _get_pipeline():
     device = hw["selected_device"]
     hf_token = os.getenv("HF_TOKEN")
 
-    allow_online_download_if_missing(MODEL_ID, logger)
+    require_cached_model(MODEL_ID, logger)
+    if not has_cached_model_file(MODEL_ID):
+        raise RuntimeError(offline_cache_error_message(MODEL_ID))
     logger.info("Loading Pathumma Whisper (%s) on device=%s ...", MODEL_ID, device)
     if uses_pytorch_cuda_pipeline(hw):
         pipe = _load_cuda_pipeline_with_retry(hf_token)

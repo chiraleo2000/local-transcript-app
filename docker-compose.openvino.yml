@@ -27,12 +27,16 @@ services:
       - NUMEXPR_NUM_THREADS=16
       - TOKENIZERS_PARALLELISM=false
       - PYTHONPATH=/app
+      - HF_HUB_DISABLE_TELEMETRY=1
+      - GRADIO_ANALYTICS_ENABLED=false
+      - GRADIO_TELEMETRY_ENABLED=false
       - APP_MODEL_ROOT=/app/models
       - HF_HOME=/app/models/hf_cache
       - HF_HUB_CACHE=/app/models/hf_cache/hub
       - HF_HUB_OFFLINE=1
       - TRANSFORMERS_OFFLINE=1
       - APP_AUTO_DOWNLOAD_MISSING_MODELS=false
+      - APP_REQUIRE_DIARIZATION_MODELS=false
       - HUGGINGFACE_HUB_CACHE=/app/models/hf_cache/hub
       - TORCH_HOME=/app/models/torch
       - OV_CACHE_DIR=/app/models/ov_cache
@@ -58,8 +62,8 @@ services:
       - ASR_8GB_RETRY_CHUNK_LENGTH_S=15
       - ASR_MIN_CHUNKED_DURATION_S=120
       - ASR_ATTENTION_IMPLEMENTATION=sdpa
-      - ASR_PRELOAD_MODE=lazy
-      - ASR_KEEP_PRELOADED=false
+      - ASR_PRELOAD_MODE=eager
+      - ASR_KEEP_PRELOADED=true
       - ASR_TURN_GUIDED=true
       - ASR_TURN_GUIDED_MAX_TURN_S=50
       - ASR_TURN_GUIDED_MERGE_GAP_S=0.35
@@ -79,9 +83,9 @@ services:
       # --- Diarization (CPU) ---
       - DIARIZATION_MODEL_ID=pyannote/speaker-diarization-community-1
       - DIARIZATION_DEVICE=cpu
-      - DIARIZATION_PRELOAD_MODE=lazy
+      - DIARIZATION_PRELOAD_MODE=eager
       - DIARIZATION_PRELOAD_DEVICE=cpu
-      - DIARIZATION_KEEP_PRELOADED=false
+      - DIARIZATION_KEEP_PRELOADED=true
       - DIARIZATION_ALLOW_8GB_CUDA=false
       - DIARIZATION_ACCURACY_MODE=true
       - DIARIZATION_MULTI_SAMPLE=false
@@ -100,5 +104,5 @@ services:
         "import urllib.request; urllib.request.urlopen('http://localhost:7896/startup-events')"]
       interval: 30s
       timeout: 10s
-      start_period: 180s
+      start_period: 600s
       retries: 3

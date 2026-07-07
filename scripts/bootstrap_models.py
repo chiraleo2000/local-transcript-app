@@ -44,6 +44,19 @@ from backend.services.asr_local import (  # noqa: E402
 )
 from backend.services.hardware_policy import detect_hardware  # noqa: E402
 from backend.storage import ensure_app_dirs, update_config  # noqa: E402
+from engines.model_cache import (  # noqa: E402
+    configured_asr_model_ids,
+    consolidate_misplaced_hub_caches,
+    has_cached_model_file,
+    hub_cache_dir,
+)
+
+MAINTAINER_MODELS = (
+    *configured_asr_model_ids(),
+    "pyannote/speaker-diarization-community-1",
+    "pyannote/segmentation-3.0",
+    "pyannote/wespeaker-voxceleb-resnet34-LM",
+)
 
 
 logging.basicConfig(
@@ -51,6 +64,33 @@ logging.basicConfig(
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+def _download_missing_models() -> dict[str, str]:
+    """Download any maintainer models that are not yet complete in ./models/."""
+    from huggingface_hub import snapshot_download
+
+    failures: dict[str, str] = {}
+    token = os.getenv("HF_TOKEN") or None
+    cache_dir = str(hub_cache_dir())
+    for model_id in MAINTAINER_MODELS:
+        if has_cached_model_file(model_id):
+            logger.info("%s already cached.", model_id)
+            continue
+        try:
+            logger.info("Downloading %s into %s ...", model_id, cache_dir)
+            snapshot_download(
+                repo_id=model_id,
+                cache_dir=cache_dir,
+                local_files_only=False,
+                token=token,
+            )
+            if not has_cached_model_file(model_id):
+                failures[model_id] = "download finished but cache is still incomplete"
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            failures[model_id] = str(exc)
+            logger.error("Download failed for %s: %s", model_id, exc)
+    return failures
 
 
 def main() -> int:
@@ -62,11 +102,13 @@ def main() -> int:
             "running this maintainer bootstrap step."
         )
     ensure_app_dirs()
+    consolidate_misplaced_hub_caches(PROJECT_ROOT)
+    download_failures = _download_missing_models()
     hardware = detect_hardware(refresh=True)
     logger.info("Backend policy: %s / %s", hardware["backend"], hardware["selected_device"])
     logger.info("Reason: %s", hardware["backend_reason"])
 
-    failures: dict[str, str] = {}
+    failures: dict[str, str] = dict(download_failures)
     for engine in ALL_ENGINES:
         try:
             logger.info("Preparing %s...", engine)
@@ -81,6 +123,18 @@ def main() -> int:
             except Exception as exc:  # pylint: disable=broad-exception-caught
                 logger.debug("%s unload skipped during bootstrap: %s", engine, exc)
             clear_accelerator_cache()
+
+    try:
+        from engines.diarization import load_model as load_diarization_model
+        from engines.diarization import unload_model as unload_diarization_model
+
+        logger.info("Preparing pyannote diarization...")
+        load_diarization_model()
+        logger.info("Pyannote diarization ready.")
+        unload_diarization_model()
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        failures["diarization"] = str(exc)
+        logger.error("Diarization bootstrap failed: %s", exc, exc_info=True)
 
     update_config(model_bootstrap={"ready": not failures, "failures": failures})
     if failures:

@@ -45,17 +45,21 @@ ENV PYTHONPATH=/app \
     APP_MODEL_ROOT=/app/models \
     HF_HOME=/app/models/hf_cache \
     HF_HUB_CACHE=/app/models/hf_cache/hub \
-    HF_HUB_OFFLINE=0 \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    APP_AUTO_DOWNLOAD_MISSING_MODELS=false \
     HUGGINGFACE_HUB_CACHE=/app/models/hf_cache/hub \
     TORCH_HOME=/app/models/torch \
     OV_CACHE_DIR=/app/models/ov_cache \
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
+RUN sed -i 's/\r$//' scripts/docker_entrypoint.sh && chmod +x scripts/docker_entrypoint.sh
+
 # Gradio listens on 7896 inside the container (host maps 7987:7896 in compose)
 EXPOSE 7896
 
 # Health check — Gradio exposes startup-events at /startup-events (not /gradio_api/...)
-HEALTHCHECK --interval=30s --timeout=10s --start-period=300s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=600s --retries=3 \
     CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:7896/startup-events')" || exit 1
 
-CMD ["python3", "app.py"]
+ENTRYPOINT ["/bin/bash", "scripts/docker_entrypoint.sh"]

@@ -90,6 +90,12 @@ run.bat
 
 REM Windows — native desktop window
 run.bat gui
+
+REM Windows — force native OpenVINO (Intel Arc GPU / Intel NPU / CPU)
+run.bat ov
+REM Force GPU or NPU explicitly (if available)
+run.bat ov-gpu
+run.bat ov-npu
 ```
 
 ```bash
@@ -318,9 +324,12 @@ DIARIZATION_MIN_CLUSTER_SIZE=6
 | --- | --- |
 | NVIDIA GPU ≥ 6 GB VRAM | CUDA (PyTorch, strict memory mode up to 9 GB) |
 | NVIDIA GPU < 6 GB VRAM | OpenVINO / CPU fallback |
-| Intel GPU / NPU | OpenVINO GPU or NPU |
-| AMD GPU | OpenVINO CPU fallback (v1) |
+| Intel Core Ultra / Arc GPU | OpenVINO GPU (preferred) |
+| Intel NPU | OpenVINO NPU (fallback/optional) |
+| AMD GPU | Windows: DirectML (optional) · otherwise CPU/OpenVINO CPU |
 | CPU only | OpenVINO CPU |
+
+**Docker note (Intel GPU/NPU):** to actually use Intel **GPU/NPU inside Docker**, the container must have access to the host device nodes/drivers (Linux hosts). On Windows Docker Desktop, OpenVINO typically runs as **CPU-only** inside the Linux container unless you have a passthrough setup (e.g. WSL2 + `/dev/dri` mapping).
 
 The RTX 4060 Laptop (8 GB) is the reference hardware. Strict low-VRAM mode uses bounded long-form ASR windows and sequential multi-engine transcription by default, while the configured preloaded ASR models stay in VRAM for reuse across transcript rounds.
 

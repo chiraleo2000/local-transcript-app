@@ -203,6 +203,17 @@ def _run_diarization(
         logger.info("Diarization finished: segments=%d", len(segments))
         return segments
     except Exception as exc:  # pylint: disable=broad-exception-caught
+        msg = str(exc)
+        if (
+            "is not in the local cache" in msg
+            or "offline" in msg.lower()
+            or "local_files_only" in msg.lower()
+        ):
+            logger.warning(
+                "Diarization skipped (offline cache missing): %s",
+                msg,
+            )
+            return None
         logger.exception("Diarization failed: %s", exc)
         return None
     finally:

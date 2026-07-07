@@ -1,8 +1,8 @@
-"""Verify local Hugging Face caches and repair missing/broken snapshot files.
+"""Verify local Hugging Face caches under ./models/ before offline runtime.
 
-Windows often stores HF hub entries as broken reparse-point symlinks unless
-Developer Mode is enabled. This script materializes any missing model files
-into ./models/hf_cache/hub before the app starts in offline-friendly mode.
+Runtime is verify-only: it never downloads or deletes model files. Maintainers
+populate ./models/ once via scripts/bootstrap_models.py, then all engine swaps
+read from the local cache only.
 """
 
 from __future__ import annotations
@@ -22,7 +22,15 @@ load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
 load_dotenv(os.path.join(PROJECT_ROOT, ".env.production"), override=False)
 
 from backend.paths import app_root, resolve_path
-from engines.model_cache import has_cached_model_file
+from engines.model_cache import (
+    apply_runtime_cache_env_defaults,
+    configured_asr_model_ids,
+    consolidate_misplaced_hub_caches,
+    env_bool,
+    has_cached_model_file,
+    missing_cached_models,
+    offline_cache_error_message,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,13 +38,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-REQUIRED_MODELS = (
-    "nectec/Pathumma-whisper-th-large-v3",
-    "typhoon-ai/typhoon-whisper-large-v3",
+OPTIONAL_DIARIZATION_MODELS = (
     "pyannote/speaker-diarization-community-1",
-    "pyannote/speaker-diarization-3.1",
     "pyannote/segmentation-3.0",
     "pyannote/wespeaker-voxceleb-resnet34-LM",
+    "pyannote/speaker-diarization-3.1",
 )
 
 
@@ -67,47 +73,46 @@ def _configure_cache_paths() -> str:
     return hub_cache
 
 
-def _materialize_model(model_id: str, hub_cache: str) -> None:
-    if has_cached_model_file(model_id):
-        logger.info("%s cache OK.", model_id)
-        return
-
-    from huggingface_hub import snapshot_download
-
-    token = os.getenv("HF_TOKEN") or None
-    logger.info("Materializing %s into %s ...", model_id, hub_cache)
-    snapshot_download(
-        repo_id=model_id,
-        cache_dir=hub_cache,
-        local_files_only=False,
-        token=token,
-    )
-    if not has_cached_model_file(model_id):
-        raise RuntimeError(f"Model {model_id} is still missing after cache repair.")
-
-
 def main() -> int:
-    hub_cache = _configure_cache_paths()
+    _configure_cache_paths()
+    apply_runtime_cache_env_defaults()
+    moved = consolidate_misplaced_hub_caches(PROJECT_ROOT)
+    if moved:
+        logger.info("Consolidated misplaced hub caches: %s", ", ".join(moved))
+
+    hub_cache = os.environ["HF_HUB_CACHE"]
     logger.info("Using Hugging Face hub cache: %s", hub_cache)
+    logger.info("Offline verify-only mode (no Hugging Face downloads).")
 
-    failures: dict[str, str] = {}
-    for model_id in REQUIRED_MODELS:
-        try:
-            _materialize_model(model_id, hub_cache)
-        except Exception as exc:  # pylint: disable=broad-exception-caught
-            failures[model_id] = str(exc)
-            logger.error("Failed to prepare %s: %s", model_id, exc)
+    required = list(configured_asr_model_ids())
+    require_diarization = env_bool("APP_REQUIRE_DIARIZATION_MODELS", False)
+    if require_diarization:
+        required.extend(OPTIONAL_DIARIZATION_MODELS[:3])
 
-    if failures:
+    missing = missing_cached_models(required)
+    if missing:
+        for model_id in missing:
+            logger.error("%s", offline_cache_error_message(model_id))
         logger.error(
-            "Model cache incomplete (%d/%d failed). "
-            "Set HF_TOKEN in .env for gated models, then rerun.",
-            len(failures),
-            len(REQUIRED_MODELS),
+            "Model cache incomplete (%d/%d required missing). "
+            "Run scripts/bootstrap_models.py once on a maintainer machine, "
+            "then use the app fully offline.",
+            len(missing),
+            len(required),
         )
         return 1
 
-    logger.info("All %d local model caches are ready.", len(REQUIRED_MODELS))
+    for model_id in required:
+        logger.info("%s cache OK.", model_id)
+
+    diarization_missing = missing_cached_models(OPTIONAL_DIARIZATION_MODELS)
+    if diarization_missing and not require_diarization:
+        logger.warning(
+            "Optional diarization models missing (%s); ASR works offline without speaker labels.",
+            ", ".join(diarization_missing),
+        )
+
+    logger.info("Local model cache verification passed.")
     return 0
 
 
@@ -133,15 +138,10 @@ def print_versions() -> None:
     print(f"  PATHUMMA_MODEL_ID: {os.getenv('PATHUMMA_MODEL_ID', 'nectec/Pathumma-whisper-th-large-v3')}")
     print(f"  TYPHOON_MODEL_ID: {os.getenv('TYPHOON_MODEL_ID', 'typhoon-ai/typhoon-whisper-large-v3')}")
     print(f"  DIARIZATION_MODEL_ID: {os.getenv('DIARIZATION_MODEL_ID', 'pyannote/speaker-diarization-community-1')}")
-    print("\n=== Quality / chunk ===")
-    print(f"  ASR_QUALITY_PROFILE: {os.getenv('ASR_QUALITY_PROFILE', 'balanced')}")
-    print(f"  ASR_CHUNK_LENGTH_S: {os.getenv('ASR_CHUNK_LENGTH_S', '(default)')}")
-    print(f"  ASR_8GB_MAX_CHUNK_LENGTH_S: {os.getenv('ASR_8GB_MAX_CHUNK_LENGTH_S', '(default)')}")
-    print(f"  ASR_MIN_CHUNKED_DURATION_S: {os.getenv('ASR_MIN_CHUNKED_DURATION_S', '(default)')}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Verify HF model caches or print runtime versions.")
+    parser = argparse.ArgumentParser(description="Verify local HF model caches (offline runtime).")
     parser.add_argument("--versions", action="store_true", help="Print package/model versions and exit.")
     args = parser.parse_args()
     if args.versions:

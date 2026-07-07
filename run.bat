@@ -4,11 +4,17 @@ echo ============================================================
 echo  Transcription Service - Run (Windows)
 echo  Usage:  run.bat          ^<-- run app directly (default)
 echo          run.bat gui      ^<-- native desktop window (pywebview)
+echo          run.bat ov       ^<-- force native OpenVINO (Intel Arc GPU/NPU/CPU)
+echo          run.bat ov-gpu   ^<-- force OpenVINO GPU (Intel Arc)
+echo          run.bat ov-npu   ^<-- force OpenVINO NPU (Intel Core Ultra)
 echo          run.bat docker   ^<-- Docker (GPU :7988 or OpenVINO :7987)
 echo ============================================================
 echo.
 
 if /i "%1"=="gui"    goto GUI
+if /i "%1"=="ov"     goto OPENVINO
+if /i "%1"=="ov-gpu" goto OPENVINO_GPU
+if /i "%1"=="ov-npu" goto OPENVINO_NPU
 if /i "%1"=="docker" goto DOCKER
 
 REM ============================================================
@@ -47,7 +53,8 @@ echo [4/5] Verifying local model cache under .\models\hf_cache\hub ...
 call venv\Scripts\activate
 python scripts\ensure_model_cache.py
 if errorlevel 1 (
-    echo [ERROR] Local model cache is incomplete. Check HF_TOKEN in .env and retry.
+    echo [ERROR] Local model cache is incomplete. Populate ./models/hf_cache/hub/ then retry.
+    echo        Maintainer setup: python scripts\bootstrap_models.py
     pause
     exit /b 1
 )
@@ -73,7 +80,8 @@ set "PYTHONPATH=%CD%;%PYTHONPATH%"
 call venv\Scripts\activate
 python scripts\ensure_model_cache.py
 if errorlevel 1 (
-    echo [ERROR] Local model cache is incomplete. Check HF_TOKEN in .env and retry.
+    echo [ERROR] Local model cache is incomplete. Populate ./models/hf_cache/hub/ then retry.
+    echo        Maintainer setup: python scripts\bootstrap_models.py
     pause
     exit /b 1
 )
@@ -140,10 +148,18 @@ set "HUGGINGFACE_HUB_CACHE=%CD%\models\hf_cache\hub"
 set "TORCH_HOME=%CD%\models\torch"
 set "OV_CACHE_DIR=%CD%\models\ov_cache"
 set "HF_HUB_DISABLE_SYMLINKS_WARNING=1"
-set "TRANSFORMERS_OFFLINE=0"
-set "HF_HUB_OFFLINE=0"
-set "APP_AUTO_DOWNLOAD_MISSING_MODELS=1"
-set "ASR_ADAPTIVE_PERFORMANCE=1"
+set "HF_HUB_DISABLE_TELEMETRY=1"
+set "GRADIO_ANALYTICS_ENABLED=false"
+set "GRADIO_TELEMETRY_ENABLED=false"
+REM Offline-first: use bundled ./models cache; no Hugging Face downloads at runtime.
+set "TRANSFORMERS_OFFLINE=1"
+set "HF_HUB_OFFLINE=1"
+set "APP_AUTO_DOWNLOAD_MISSING_MODELS=0"
+set "ASR_PRELOAD_MODE=eager"
+set "DIARIZATION_PRELOAD_MODE=eager"
+set "ASR_KEEP_PRELOADED=1"
+set "ASR_TURN_GUIDED_MERGE_GAP_S=0.55"
+set "DIARIZATION_KEEP_PRELOADED=1"
 set "ASR_TARGET_SHORT_MAX_S=600"
 set "ASR_TARGET_LONG_MAX_S=1800"
 set "ASR_TARGET_LONG_AUDIO_S=3600"
@@ -152,13 +168,10 @@ set "ASR_NUM_BEAMS_MAX=8"
 set "ASR_NUM_BEAMS_MIN=4"
 set "ASR_NUM_BEAMS=6"
 set "ASR_QUALITY_PROFILE=high"
-set "ASR_KEEP_PRELOADED=1"
-set "ASR_TURN_GUIDED_MERGE_GAP_S=0.55"
-set "DIARIZATION_PRELOAD_MODE=eager"
-set "DIARIZATION_KEEP_PRELOADED=1"
+set "ASR_ADAPTIVE_PERFORMANCE=1"
 set "DIARIZATION_PREPROCESS_SR=16000"
 set "DIARIZATION_GPU_CO_RESIDENT=0"
-set "DIARIZATION_DEVICE=cuda"
+set "DIARIZATION_DEVICE=cpu"
 set "DIARIZATION_PRELOAD_DEVICE=cpu"
 set "DIARIZATION_ALLOW_8GB_CUDA=1"
 set "DIARIZATION_CUDA_MIN_FREE_MB=768"
@@ -167,5 +180,52 @@ set "ASR_UNLOAD_FOR_DIARIZATION=1"
 set "ASR_DEFAULT_ENGINES=Auto"
 set "ASR_AUTO_POLICY=quality"
 exit /b 0
+
+REM ============================================================
+REM  NATIVE OPENVINO (WINDOWS) MODE
+REM ============================================================
+:OPENVINO
+call :SET_MODEL_ENV
+set "APP_FORCE_BACKEND=openvino"
+set "OV_DEVICE=AUTO"
+goto DIRECT_RUN
+
+:OPENVINO_GPU
+call :SET_MODEL_ENV
+set "APP_FORCE_BACKEND=openvino"
+set "OV_DEVICE=GPU"
+goto DIRECT_RUN
+
+:OPENVINO_NPU
+call :SET_MODEL_ENV
+set "APP_FORCE_BACKEND=openvino"
+set "OV_DEVICE=NPU"
+goto DIRECT_RUN
+
+:DIRECT_RUN
+if not exist "venv\Scripts\activate.bat" (
+    echo [ERROR] Virtual environment not found. Run setup.bat first.
+    pause
+    exit /b 1
+)
+
+echo [1/4] Verifying local model cache under .\models\hf_cache\hub ...
+call venv\Scripts\activate
+python scripts\ensure_model_cache.py
+if errorlevel 1 (
+    echo [ERROR] Local model cache is incomplete. Populate ./models/hf_cache/hub/ then retry.
+    echo        Maintainer setup: python scripts\bootstrap_models.py
+    pause
+    exit /b 1
+)
+
+echo [2/4] Checking OpenVINO device visibility...
+python -c "from openvino import Core; print('OpenVINO devices:', Core().available_devices)" 2>nul
+
+echo [3/4] Starting local transcript app on http://localhost:7896 ...
+echo.
+set "PYTHONPATH=%CD%;%PYTHONPATH%"
+python app.py
+goto END
 
 :END

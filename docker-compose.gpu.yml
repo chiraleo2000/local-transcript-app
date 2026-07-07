@@ -60,8 +60,8 @@ services:
       - DIARIZATION_ALLOW_8GB_CUDA=true
       - DIARIZATION_GPU_CO_RESIDENT=false
       - DIARIZATION_PRELOAD_DEVICE=cuda
-      - DIARIZATION_PRELOAD_MODE=lazy
-      - DIARIZATION_KEEP_PRELOADED=false
+      - DIARIZATION_PRELOAD_MODE=eager
+      - DIARIZATION_KEEP_PRELOADED=true
       - DIARIZATION_CUDA_MIN_VRAM_MB=6000
       - DIARIZATION_CUDA_MIN_FREE_MB=768
       - DIARIZATION_CUDA_RUN_MIN_FREE_MB=512
@@ -85,8 +85,8 @@ services:
       - DIARIZATION_NOISE_REDUCTION=0.0
 
       - ASR_UNLOAD_FOR_DIARIZATION=true
-      - ASR_KEEP_PRELOADED=false
-      - ASR_PRELOAD_MODE=lazy
+      - ASR_KEEP_PRELOADED=true
+      - ASR_PRELOAD_MODE=eager
       - ASR_CLEAR_VRAM_ON_MEDIA_CHANGE=false
       - ASR_CLEAR_VRAM_AFTER_JOB=false
       - ASR_CLEAR_VRAM_BETWEEN_ENGINES=false
@@ -189,5 +189,5 @@ services:
         "import urllib.request; urllib.request.urlopen('http://localhost:7896/startup-events')"]
       interval: 30s
       timeout: 10s
-      start_period: 120s
+      start_period: 600s
       retries: 3

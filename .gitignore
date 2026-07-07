@@ -7,6 +7,15 @@ env/
 models/
 ov_cache/
 
+# Misplaced HF hub folders / download artifacts (should live under models/hf_cache/hub/)
+models--*/
+.locks/
+*.incomplete
+*.lock
+xet/
+CACHEDIR.TAG
+_pull_backup/
+
 # App runtime storage
 storage/
 config/

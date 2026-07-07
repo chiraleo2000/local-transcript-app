@@ -5,6 +5,9 @@ echo "============================================================"
 echo " Transcription Service - Run (Linux / Mac)"
 echo " Usage:  ./run.sh          <-- run app directly (default)"
 echo "         ./run.sh gui      <-- native desktop window (pywebview)"
+echo "         ./run.sh ov       <-- force native OpenVINO (Intel iGPU/NPU/CPU)"
+echo "         ./run.sh ov-gpu   <-- force OpenVINO GPU"
+echo "         ./run.sh ov-npu   <-- force OpenVINO NPU"
 echo "         ./run.sh docker   <-- Docker (GPU :7988 or OpenVINO :7987)"
 echo "============================================================"
 echo
@@ -21,10 +24,16 @@ set_model_env() {
     export TORCH_HOME="$SCRIPT_DIR/models/torch"
     export OV_CACHE_DIR="$SCRIPT_DIR/models/ov_cache"
     export HF_HUB_DISABLE_SYMLINKS_WARNING=1
-    export TRANSFORMERS_OFFLINE=0
-    export HF_HUB_OFFLINE=0
-    export APP_AUTO_DOWNLOAD_MISSING_MODELS=1
-    export ASR_ADAPTIVE_PERFORMANCE=1
+    export HF_HUB_DISABLE_TELEMETRY=1
+    export GRADIO_ANALYTICS_ENABLED=false
+    export GRADIO_TELEMETRY_ENABLED=false
+    # Offline-first: use bundled ./models cache; no Hugging Face downloads at runtime.
+    export TRANSFORMERS_OFFLINE=1
+    export HF_HUB_OFFLINE=1
+    export APP_AUTO_DOWNLOAD_MISSING_MODELS=0
+    export ASR_PRELOAD_MODE=eager
+    export DIARIZATION_PRELOAD_MODE=eager
+    export ASR_KEEP_PRELOADED=1
     export ASR_TARGET_SHORT_MAX_S=600
     export ASR_TARGET_LONG_MAX_S=1800
     export ASR_TARGET_LONG_AUDIO_S=3600
@@ -33,13 +42,12 @@ set_model_env() {
     export ASR_NUM_BEAMS_MIN=4
     export ASR_NUM_BEAMS=6
     export ASR_QUALITY_PROFILE=high
-    export ASR_KEEP_PRELOADED=1
     export ASR_TURN_GUIDED_MERGE_GAP_S=0.55
-    export DIARIZATION_PRELOAD_MODE=eager
     export DIARIZATION_KEEP_PRELOADED=1
+    export ASR_ADAPTIVE_PERFORMANCE=1
     export DIARIZATION_PREPROCESS_SR=16000
     export DIARIZATION_GPU_CO_RESIDENT=0
-    export DIARIZATION_DEVICE=cuda
+    export DIARIZATION_DEVICE=cpu
     export DIARIZATION_PRELOAD_DEVICE=cpu
     export DIARIZATION_ALLOW_8GB_CUDA=1
     export DIARIZATION_CUDA_MIN_FREE_MB=768
@@ -49,10 +57,30 @@ set_model_env() {
     export ASR_AUTO_POLICY=quality
 }
 
+direct_openvino() {
+    if [ ! -f "venv/bin/activate" ]; then
+        echo "[ERROR] Virtual environment not found. Run ./setup.sh first."
+        exit 1
+    fi
+    set_model_env
+    export APP_FORCE_BACKEND=openvino
+    case "${1:-AUTO}" in
+        GPU|gpu) export OV_DEVICE=GPU ;;
+        NPU|npu) export OV_DEVICE=NPU ;;
+        *) export OV_DEVICE=AUTO ;;
+    esac
+    export PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}"
+    source venv/bin/activate
+    ensure_model_cache
+    python -c "from openvino import Core; print('OpenVINO devices:', Core().available_devices)" || true
+    python app.py
+}
+
 ensure_model_cache() {
     echo "[cache] Verifying local model cache under ./models/hf_cache/hub ..."
     python scripts/ensure_model_cache.py || {
-        echo "[ERROR] Local model cache is incomplete. Check HF_TOKEN in .env and retry."
+        echo "[ERROR] Local model cache is incomplete. Populate ./models/hf_cache/hub/ then retry."
+        echo "        Maintainer setup: python scripts/bootstrap_models.py"
         exit 1
     }
 }
@@ -115,6 +143,22 @@ if [ "${1:-}" = "docker" ]; then
         echo "OpenVINO/CPU stack: http://localhost:7987"
         docker logs -f transcription-service-openvino
     fi
+    exit 0
+fi
+
+# ============================================================
+#  DIRECT OPENVINO MODE
+# ============================================================
+if [ "${1:-}" = "ov" ]; then
+    direct_openvino "AUTO"
+    exit 0
+fi
+if [ "${1:-}" = "ov-gpu" ]; then
+    direct_openvino "GPU"
+    exit 0
+fi
+if [ "${1:-}" = "ov-npu" ]; then
+    direct_openvino "NPU"
     exit 0
 fi
 

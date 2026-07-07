@@ -5,14 +5,22 @@
 import logging
 import os
 
-from engines.model_cache import allow_online_download_if_missing, pretrained_local_files_only
+from engines.model_cache import (
+    has_cached_model_file,
+    offline_cache_error_message,
+    pretrained_local_files_only,
+    require_cached_model,
+)
 from engines.whisper_utils import whisper_generate_kwargs
 
 logger = logging.getLogger(__name__)
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-MODEL_ID = "typhoon-ai/typhoon-whisper-large-v3"
+MODEL_ID = (
+    os.getenv("TYPHOON_MODEL_ID")
+    or "typhoon-ai/typhoon-whisper-large-v3"
+)
 
 _pipeline_cache: list = []
 
@@ -302,21 +310,34 @@ def _load_cpu_pipeline(hf_token: str | None):
 
 def _load_ov_pipeline(device: str, hf_token: str | None):
     """Build Typhoon pipeline via OpenVINO IR; falls back to CPU on export failure."""
+    from engines.openvino_compat import apply_openvino_whisper_compat
     from transformers.models.whisper.processing_whisper import WhisperProcessor
     from transformers import pipeline as hf_pipeline
 
+    apply_openvino_whisper_compat()
+
     cache_dir = os.getenv("OV_CACHE_DIR", "./ov_cache")
-    export_dir = os.path.join(cache_dir, "typhoon")
+    safe_model_slug = MODEL_ID.replace("/", "__")
+    export_dir = os.path.join(cache_dir, f"typhoon_{safe_model_slug}")
     ir_path = os.path.join(export_dir, "openvino_encoder_model.xml")
 
     try:
         from optimum.intel.openvino import OVModelForSpeechSeq2Seq
         if os.path.isdir(export_dir) and os.path.isfile(ir_path):
             logger.info("Loading Typhoon from cached OpenVINO IR: %s", export_dir)
-            model = OVModelForSpeechSeq2Seq.from_pretrained(export_dir, device=device, compile=True)
+            model = OVModelForSpeechSeq2Seq.from_pretrained(
+                export_dir,
+                device=device,
+                compile=True,
+                local_files_only=True,
+            )
             processor = WhisperProcessor.from_pretrained(export_dir)
         else:
-            logger.info("Exporting Typhoon to OpenVINO IR (first run, may take several minutes)...")
+            if not has_cached_model_file(MODEL_ID):
+                raise RuntimeError(offline_cache_error_message(MODEL_ID))
+            logger.info(
+                "Exporting Typhoon to OpenVINO IR from local cache (first run, may take several minutes)..."
+            )
             model = OVModelForSpeechSeq2Seq.from_pretrained(
                 MODEL_ID,
                 export=True,
@@ -379,7 +400,9 @@ def _get_pipeline():
     device = hw["selected_device"]
     hf_token = os.getenv("HF_TOKEN")
 
-    allow_online_download_if_missing(MODEL_ID, logger)
+    require_cached_model(MODEL_ID, logger)
+    if not has_cached_model_file(MODEL_ID):
+        raise RuntimeError(offline_cache_error_message(MODEL_ID))
     logger.info("Loading Typhoon Whisper (%s) on device=%s ...", MODEL_ID, device)
     if uses_pytorch_cuda_pipeline(hw):
         pipe = _load_cuda_pipeline_with_retry(hf_token)

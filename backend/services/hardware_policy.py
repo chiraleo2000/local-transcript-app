@@ -161,13 +161,13 @@ def _select_openvino_device(
         selected = "AUTO", "OpenVINO AUTO selected by OV_DEVICE."
     elif env_device and env_device in devices:
         selected = env_device, f"OpenVINO {env_device} selected by OV_DEVICE."
-    elif ov_info["npu"]:
-        selected = "NPU", "OpenVINO NPU detected and selected."
     elif ov_info["gpu"]:
         selected = (
             next(device for device in devices if device.startswith("GPU")),
             "OpenVINO GPU detected and selected.",
         )
+    elif ov_info["npu"]:
+        selected = "NPU", "OpenVINO NPU detected and selected."
     elif torch_info["cuda"]:
         selected = (
             "CPU",

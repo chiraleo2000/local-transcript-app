@@ -22,6 +22,10 @@ ensure_bundle_on_path()
 os.chdir(app_root())
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+# Prevent Gradio from making outbound requests (messaging/version/IP).
+os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
+os.environ.setdefault("GRADIO_TELEMETRY_ENABLED", "False")
 
 _install_root = app_root()
 load_dotenv(_install_root / ".env")
@@ -50,6 +54,11 @@ for _cache_dir in [
     os.environ["OV_CACHE_DIR"],
 ]:
     os.makedirs(_cache_dir, exist_ok=True)
+
+from engines.model_cache import apply_runtime_cache_env_defaults, consolidate_misplaced_hub_caches
+
+apply_runtime_cache_env_defaults()
+consolidate_misplaced_hub_caches(_install_root)
 
 
 def _install_torchcodec_stub() -> None:
@@ -290,13 +299,15 @@ def _preload_models() -> None:
         )
 
     preload_failed = False
+    asr_ready = False
 
     def _load(engine: str) -> None:
-        nonlocal preload_failed
+        nonlocal preload_failed, asr_ready
         try:
             _load_status[engine] = "loading..."
             load_model(engine)
             _load_status[engine] = "ready"
+            asr_ready = True
             logger.info("%s loaded.", engine)
         except Exception as exc:  # pylint: disable=broad-exception-caught
             preload_failed = True
@@ -306,21 +317,34 @@ def _preload_models() -> None:
     for engine in preload_engines:
         _load(engine_for_preload(engine))
 
+    if not asr_ready:
+        logger.error("No ASR engine preloaded; upload remains disabled until model cache is fixed.")
+        return
+
     diarization_preload_mode = os.getenv("DIARIZATION_PRELOAD_MODE", "eager").strip().lower()
     if diarization_preload_mode in {"eager", "preload", "true", "1"}:
         try:
             from engines.diarization import load_model as load_diarization_model
+            from engines.model_cache import has_cached_model_file
 
-            logger.info("Preloading pyannote diarization model...")
-            load_diarization_model()
-            logger.info("Pyannote diarization loaded.")
+            diarization_model = os.getenv(
+                "DIARIZATION_MODEL_ID",
+                "pyannote/speaker-diarization-community-1",
+            )
+            if not has_cached_model_file(diarization_model):
+                logger.warning(
+                    "Skipping diarization preload; model %s is not cached yet.",
+                    diarization_model,
+                )
+            else:
+                logger.info("Preloading pyannote diarization model...")
+                load_diarization_model()
+                logger.info("Pyannote diarization loaded.")
         except Exception as exc:  # pylint: disable=broad-exception-caught
-            preload_failed = True
-            logger.exception("Pyannote diarization load failed: %s", exc)
+            logger.warning("Pyannote diarization preload skipped: %s", exc)
 
     if preload_failed:
-        logger.error("Model preload failed; upload remains disabled until Docker cache/env is fixed.")
-        return
+        logger.warning("Some optional models failed preload; continuing with available engines.")
     _models_ready.set()
     logger.info("Model preload finished.")
 

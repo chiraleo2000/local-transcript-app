@@ -7,6 +7,10 @@ import warnings
 
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+# Prevent Gradio from calling home (analytics/version checks).
+os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "false")
+os.environ.setdefault("GRADIO_TELEMETRY_ENABLED", "false")
 
 
 def _install_root() -> str:
@@ -35,6 +39,28 @@ for _cache_dir in [
     os.environ["OV_CACHE_DIR"],
 ]:
     os.makedirs(_cache_dir, exist_ok=True)
+
+for _env_name in (".env", ".env.production"):
+    _env_path = os.path.join(_root, _env_name)
+    if os.path.isfile(_env_path):
+        try:
+            from dotenv import load_dotenv
+
+            load_dotenv(_env_path, override=_env_name == ".env")
+        except ImportError:
+            break
+
+try:
+    from engines.model_cache import apply_runtime_cache_env_defaults, consolidate_misplaced_hub_caches
+    from engines.openvino_compat import apply_openvino_whisper_compat
+
+    apply_runtime_cache_env_defaults()
+    consolidate_misplaced_hub_caches(_root)
+    apply_openvino_whisper_compat()
+except ImportError:
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    os.environ.setdefault("APP_AUTO_DOWNLOAD_MISSING_MODELS", "false")
 
 
 def _env_bool(name: str, default: bool) -> bool:

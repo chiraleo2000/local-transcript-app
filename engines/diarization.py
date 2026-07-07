@@ -567,12 +567,27 @@ def _get_diarization_pipeline():
     import torch
     from pyannote.audio import Pipeline
 
+    from engines.model_cache import (
+        cached_snapshot_path,
+        offline_cache_error_message,
+        pretrained_local_files_only,
+        require_cached_model,
+    )
+
     _check_ffmpeg()
 
     hf_token = os.getenv("HF_TOKEN")
+    require_cached_model(MODEL_ID, logger)
+    if pretrained_local_files_only() and not cached_snapshot_path(MODEL_ID):
+        raise RuntimeError(offline_cache_error_message(MODEL_ID))
+
     logger.info("Loading pyannote speaker diarization pipeline (%s)...", MODEL_ID)
 
-    pipeline = Pipeline.from_pretrained(MODEL_ID, token=hf_token)
+    pipeline = Pipeline.from_pretrained(
+        MODEL_ID,
+        token=hf_token,
+        local_files_only=pretrained_local_files_only(),
+    )
     if pipeline is None:
         raise RuntimeError(f"Failed to load pyannote pipeline '{MODEL_ID}'")
     device = _device_for_preload(torch)
