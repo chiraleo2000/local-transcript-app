@@ -11,6 +11,7 @@ import argparse
 import logging
 import os
 import sys
+from pathlib import Path
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
@@ -44,6 +45,36 @@ OPTIONAL_DIARIZATION_MODELS = (
     "pyannote/wespeaker-voxceleb-resnet34-LM",
     "pyannote/speaker-diarization-3.1",
 )
+
+
+def _manifest_path() -> Path:
+    model_root = os.getenv("APP_MODEL_ROOT") or str(app_root() / "models")
+    if not os.path.isabs(model_root):
+        model_root = str(resolve_path(model_root))
+    return Path(model_root) / "manifest.json"
+
+
+def _load_manifest() -> dict | None:
+    path = _manifest_path()
+    if not path.is_file():
+        return None
+    try:
+        import json
+
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        logger.warning("Could not read manifest.json (%s); falling back to cache scan.", exc)
+        return None
+
+
+def _manifest_required_models(manifest: dict) -> list[str]:
+    models = manifest.get("models") or []
+    out: list[str] = []
+    for entry in models:
+        mid = (entry or {}).get("model_id")
+        if isinstance(mid, str) and mid.strip():
+            out.append(mid.strip())
+    return out
 
 
 def _configure_cache_paths() -> str:
@@ -84,7 +115,13 @@ def main() -> int:
     logger.info("Using Hugging Face hub cache: %s", hub_cache)
     logger.info("Offline verify-only mode (no Hugging Face downloads).")
 
-    required = list(configured_asr_model_ids())
+    manifest = _load_manifest()
+    if manifest:
+        required = _manifest_required_models(manifest)
+        logger.info("Using manifest.json for required models (%d entries).", len(required))
+    else:
+        required = list(configured_asr_model_ids())
+
     require_diarization = env_bool("APP_REQUIRE_DIARIZATION_MODELS", False)
     if require_diarization:
         required.extend(OPTIONAL_DIARIZATION_MODELS[:3])
@@ -143,8 +180,15 @@ def print_versions() -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Verify local HF model caches (offline runtime).")
     parser.add_argument("--versions", action="store_true", help="Print package/model versions and exit.")
+    parser.add_argument(
+        "--strict-diarization",
+        action="store_true",
+        help="Require diarization models (equivalent to APP_REQUIRE_DIARIZATION_MODELS=true).",
+    )
     args = parser.parse_args()
     if args.versions:
         print_versions()
         raise SystemExit(0)
+    if args.strict_diarization:
+        os.environ["APP_REQUIRE_DIARIZATION_MODELS"] = "true"
     raise SystemExit(main())

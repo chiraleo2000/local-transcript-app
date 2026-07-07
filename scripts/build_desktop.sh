@@ -29,3 +29,4 @@ fi
 
 echo "[build] Done: ${DIST}/LocalTranscriptApp"
 echo "[build] Copy pre-cached models into ${DIST}/models before distributing."
+echo "[build] For full offline bundle: python scripts/stage_model_pack.py --pack <path-to-model-pack-models> --target ${DIST}"

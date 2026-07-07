@@ -27,7 +27,9 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-MIN_NVIDIA_VRAM_MB = _env_int("MIN_NVIDIA_VRAM_MB", 6000)
+# Minimum VRAM required to enable the CUDA backend in release/offline mode.
+# 8GB class GPUs are the minimum supported target.
+MIN_NVIDIA_VRAM_MB = _env_int("MIN_NVIDIA_VRAM_MB", 8192)
 MIN_SYSTEM_RAM_MB = _env_int("MIN_SYSTEM_RAM_MB", 16000)
 _hw_cache: list[dict] = []
 

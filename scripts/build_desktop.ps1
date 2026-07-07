@@ -38,3 +38,4 @@ Copy-Item -Force (Join-Path $Root ".env.production") (Join-Path $Dist ".env")
 
 Write-Host "[build] Done: $Dist\LocalTranscriptApp.exe"
 Write-Host "[build] Copy pre-cached models into $Dist\models before distributing."
+Write-Host "[build] For full offline bundle: run scripts\stage_model_pack.py --pack <path-to-model-pack-models> --target $Dist"
