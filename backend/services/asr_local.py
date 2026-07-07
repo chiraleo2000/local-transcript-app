@@ -200,7 +200,11 @@ def should_unload_on_cancel() -> bool:
 
 
 def switch_asr_engine(selected_engine: str, *, language: str | None = None) -> None:
-    """Unload other engines and load the selected one (UI engine change only)."""
+    """Activate one ASR engine for the UI.
+
+    When ASR_KEEP_PRELOADED=true, keep other engines resident so switching is fast
+    and never triggers re-downloads (offline-only runtime).
+    """
     selected_engine = _LEGACY_ENGINE_NAMES.get(selected_engine, selected_engine)
     if is_auto_engine(selected_engine):
         selected_engine = engine_for_preload(ENGINE_AUTO)
@@ -208,15 +212,21 @@ def switch_asr_engine(selected_engine: str, *, language: str | None = None) -> N
             selected_engine = resolve_asr_engine(language, ENGINE_AUTO)
     if selected_engine not in ALL_ENGINES:
         raise ValueError(f"Unknown ASR engine: {selected_engine}")
-    for engine in ALL_ENGINES:
-        if engine != selected_engine:
-            try:
-                unload_model(engine)
-            except ValueError:
-                pass
+    # Default behaviour unloads other engines (memory-saving). In cache-first mode
+    # we keep them resident so switching is instantaneous.
+    if not _env_bool("ASR_KEEP_PRELOADED", False):
+        for engine in ALL_ENGINES:
+            if engine != selected_engine:
+                try:
+                    unload_model(engine)
+                except ValueError:
+                    pass
     if not model_is_loaded(selected_engine):
         load_model(selected_engine)
-    logger.info("ASR engine active: %s (others unloaded).", selected_engine)
+    if _env_bool("ASR_KEEP_PRELOADED", False):
+        logger.info("ASR engine active: %s (preloaded engines kept resident).", selected_engine)
+    else:
+        logger.info("ASR engine active: %s (others unloaded).", selected_engine)
 
 
 def asr_worker_count(selected_count: int) -> int:

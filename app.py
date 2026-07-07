@@ -142,6 +142,7 @@ from backend.services.asr_local import (
     ALL_ENGINES,
     ENGINE_AUTO,
     ENGINE_PATHUMMA,
+    ENGINE_TYPHOON,
     LANGUAGES,
     UI_ENGINE_CHOICES,
     clear_accelerator_cache,
@@ -287,7 +288,20 @@ def _preload_models() -> None:
         logger.info("ASR preload skipped; models are available on demand.")
         return
 
-    preload_engines = default_asr_engines()
+    configured = os.getenv("ASR_PRELOAD_ENGINES", "").strip()
+    if configured:
+        preload_engines = [part.strip() for part in configured.split(",") if part.strip()]
+    else:
+        # When running cache-first (kept resident) on OpenVINO/CPU, preload both engines
+        # so switching is instant.
+        try:
+            hw = detect_hardware()
+        except Exception:  # pylint: disable=broad-exception-caught
+            hw = {}
+        if os.getenv("ASR_KEEP_PRELOADED", "false").strip().lower() in {"1", "true", "yes", "on"} and hw.get("backend") == "openvino":
+            preload_engines = [ENGINE_TYPHOON, ENGINE_PATHUMMA]
+        else:
+            preload_engines = default_asr_engines()
     warmed_engines = [engine_for_preload(engine) for engine in preload_engines]
     skipped = [e for e in ALL_ENGINES if e not in warmed_engines]
     for engine in skipped:

@@ -330,8 +330,9 @@ def _load_ov_pipeline(device: str, hf_token: str | None):
                 device=device,
                 compile=True,
                 local_files_only=True,
+                export=False,
             )
-            processor = WhisperProcessor.from_pretrained(export_dir)
+            processor = WhisperProcessor.from_pretrained(export_dir, local_files_only=True)
         else:
             if not has_cached_model_file(MODEL_ID):
                 raise RuntimeError(offline_cache_error_message(MODEL_ID))

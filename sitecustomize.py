@@ -12,6 +12,10 @@ os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "false")
 os.environ.setdefault("GRADIO_TELEMETRY_ENABLED", "false")
 
+# Silence noisy Optimum/OpenVINO conversion probes (we run offline, cache-first).
+logging.getLogger("optimum").setLevel(logging.ERROR)
+logging.getLogger("optimum.intel").setLevel(logging.ERROR)
+
 
 def _install_root() -> str:
     if getattr(sys, "frozen", False):
