@@ -7,7 +7,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     HF_HUB_DISABLE_SYMLINKS_WARNING=1 \
     APP_FORCE_BACKEND=openvino \
-    OV_DEVICE=AUTO
+    OV_DEVICE=GPU
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-pip python3-venv ffmpeg libsndfile1 git libatomic1 \

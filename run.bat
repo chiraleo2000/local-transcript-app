@@ -187,7 +187,7 @@ REM ============================================================
 :OPENVINO
 call :SET_MODEL_ENV
 set "APP_FORCE_BACKEND=openvino"
-set "OV_DEVICE=AUTO"
+set "OV_DEVICE=GPU"
 goto DIRECT_RUN
 
 :OPENVINO_GPU

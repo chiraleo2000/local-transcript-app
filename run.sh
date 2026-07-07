@@ -67,7 +67,7 @@ direct_openvino() {
     case "${1:-AUTO}" in
         GPU|gpu) export OV_DEVICE=GPU ;;
         NPU|npu) export OV_DEVICE=NPU ;;
-        *) export OV_DEVICE=AUTO ;;
+        *) export OV_DEVICE=GPU ;;
     esac
     export PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}"
     source venv/bin/activate

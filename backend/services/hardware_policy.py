@@ -152,35 +152,75 @@ def _detect_amd_gpu() -> bool:
         return False
 
 
+def _first_openvino_gpu(devices: list[str]) -> str | None:
+    for device in devices:
+        if device.startswith("GPU"):
+            return device
+    return None
+
+
+def _openvino_gpu_first(
+    torch_info: dict,
+    ov_info: dict,
+    has_amd_gpu: bool,
+    *,
+    reason_prefix: str = "",
+) -> tuple[str, str]:
+    """Prefer Intel GPU, then NPU, then CPU."""
+    devices = ov_info["available_devices"]
+    prefix = f"{reason_prefix} " if reason_prefix else ""
+    if ov_info["gpu"]:
+        gpu = _first_openvino_gpu(devices) or "GPU"
+        return gpu, f"{prefix}OpenVINO GPU selected (GPU-first policy)."
+    if ov_info["npu"]:
+        return "NPU", f"{prefix}OpenVINO NPU selected (no GPU available)."
+    if torch_info["cuda"]:
+        return (
+            "CPU",
+            f"{prefix}NVIDIA GPU has less than {MIN_NVIDIA_VRAM_MB} MB VRAM; "
+            "using OpenVINO CPU fallback.",
+        )
+    if has_amd_gpu:
+        return "CPU", f"{prefix}AMD GPU detected; using OpenVINO CPU fallback in v1."
+    return "CPU", f"{prefix}OpenVINO CPU selected (no GPU/NPU available)."
+
+
 def _select_openvino_device(
     torch_info: dict,
     ov_info: dict,
     has_amd_gpu: bool,
 ) -> tuple[str, str]:
     devices = ov_info["available_devices"]
-    env_device = os.getenv("OV_DEVICE", "").upper()
-    if env_device == "AUTO":
-        selected = "AUTO", "OpenVINO AUTO selected by OV_DEVICE."
-    elif env_device and env_device in devices:
-        selected = env_device, f"OpenVINO {env_device} selected by OV_DEVICE."
-    elif ov_info["gpu"]:
-        selected = (
-            next(device for device in devices if device.startswith("GPU")),
-            "OpenVINO GPU detected and selected.",
-        )
-    elif ov_info["npu"]:
-        selected = "NPU", "OpenVINO NPU detected and selected."
-    elif torch_info["cuda"]:
-        selected = (
+    env_device = os.getenv("OV_DEVICE", "GPU").strip().upper()
+    if not env_device or env_device == "AUTO":
+        return _openvino_gpu_first(torch_info, ov_info, has_amd_gpu)
+    if env_device == "GPU":
+        if ov_info["gpu"]:
+            gpu = _first_openvino_gpu(devices) or "GPU"
+            return gpu, f"OpenVINO {gpu} selected by OV_DEVICE=GPU."
+        return (
             "CPU",
-            f"NVIDIA GPU has less than {MIN_NVIDIA_VRAM_MB} MB VRAM; "
-            "using OpenVINO CPU fallback.",
+            "OV_DEVICE=GPU but no OpenVINO GPU visible; using CPU.",
         )
-    elif has_amd_gpu:
-        selected = "CPU", "AMD GPU detected; using OpenVINO CPU fallback in v1."
-    else:
-        selected = "CPU", "OpenVINO CPU selected."
-    return selected
+    if env_device == "NPU":
+        if ov_info["npu"]:
+            return "NPU", "OpenVINO NPU selected by OV_DEVICE."
+        return _openvino_gpu_first(
+            torch_info,
+            ov_info,
+            has_amd_gpu,
+            reason_prefix="OV_DEVICE=NPU but NPU unavailable;",
+        )
+    if env_device == "CPU":
+        return "CPU", "OpenVINO CPU forced by OV_DEVICE."
+    if env_device in devices:
+        return env_device, f"OpenVINO {env_device} selected by OV_DEVICE."
+    return _openvino_gpu_first(
+        torch_info,
+        ov_info,
+        has_amd_gpu,
+        reason_prefix=f"OV_DEVICE={env_device} not in {devices};",
+    )
 
 
 def _select_backend(

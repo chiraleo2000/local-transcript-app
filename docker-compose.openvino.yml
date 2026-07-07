@@ -1,8 +1,11 @@
 # OpenVINO / CPU AI compose — Intel Core Ultra (NPU/GPU), AMD AI CPU, ARM64.
-# No NVIDIA GPU required.
+# No NVIDIA GPU required. OV_DEVICE=GPU (GPU-first; falls back to CPU if no GPU visible).
 #
 #   docker compose -f docker-compose.openvino.yml up -d --build
 # UI: http://localhost:7987
+#
+# Intel GPU in Docker (Linux host only): uncomment devices/group_add below.
+# Windows Docker Desktop cannot pass Intel Arc/NPU — use native `run.bat ov-gpu`.
 services:
   transcription:
     build:
@@ -41,7 +44,7 @@ services:
       - TORCH_HOME=/app/models/torch
       - OV_CACHE_DIR=/app/models/ov_cache
       - APP_FORCE_BACKEND=openvino
-      - OV_DEVICE=AUTO
+      - OV_DEVICE=GPU
       - APP_SUPPRESS_WARNING_LOGS=false
       - PYTHONUNBUFFERED=1
       # --- ASR (OpenVINO) ---
@@ -99,6 +102,12 @@ services:
     volumes:
       - ./models:/app/models
       - ./storage:/app/storage
+    # Linux Intel iGPU passthrough (uncomment on hosts with /dev/dri):
+    # devices:
+    #   - /dev/dri:/dev/dri
+    # group_add:
+    #   - video
+    #   - render
     healthcheck:
       test: ["CMD", "python3", "-c",
         "import urllib.request; urllib.request.urlopen('http://localhost:7896/startup-events')"]
