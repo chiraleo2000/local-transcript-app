@@ -7,9 +7,12 @@ import os
 
 from engines.model_cache import (
     has_cached_model_file,
+    hub_pretrained_kwargs,
     offline_cache_error_message,
     pretrained_local_files_only,
     require_cached_model,
+    resolve_pretrained_checkpoint,
+    _sync_hub_constants,
 )
 from engines.whisper_utils import whisper_generate_kwargs
 
@@ -168,7 +171,7 @@ def _long_form_overlap_s() -> int:
 
 
 def _timestamp_mode(diarization_segments: list | None):
-    if diarization_segments and _env_bool("ASR_WORD_TIMESTAMPS_WITH_DIARIZATION", True):
+    if diarization_segments and _env_bool("ASR_WORD_TIMESTAMPS_WITH_DIARIZATION", False):
         if _strict_8gb_mode() and not _env_bool("TYPHOON_WORD_TIMESTAMPS_ON_8GB", False):
             logger.info("Typhoon strict 8 GB mode uses chunk timestamps to avoid CUDA OOM.")
             return True
@@ -177,13 +180,12 @@ def _timestamp_mode(diarization_segments: list | None):
 
 
 def _model_load_kwargs(hf_token: str | None, dtype) -> dict:
-    kwargs = {
+    kwargs = hub_pretrained_kwargs(hf_token)
+    kwargs.update({
         "dtype": dtype,
         "use_safetensors": True,
         "low_cpu_mem_usage": True,
-        "token": hf_token,
-        "local_files_only": pretrained_local_files_only(),
-    }
+    })
     attention = os.getenv("ASR_ATTENTION_IMPLEMENTATION", "sdpa").strip()
     if attention:
         kwargs["attn_implementation"] = attention
@@ -243,8 +245,9 @@ def _load_cuda_pipeline(hf_token: str | None):
 
     _configure_torch_runtime()
     logger.info("Using CUDA (float16) backend for Typhoon Whisper.")
+    checkpoint = resolve_pretrained_checkpoint(MODEL_ID)
     model = AutoModelForSpeechSeq2Seq.from_pretrained(
-        MODEL_ID,
+        checkpoint,
         **_model_load_kwargs(hf_token, torch.float16),
     )
     # Fix meta tensors left over from sharded checkpoint loading
@@ -263,7 +266,7 @@ def _load_cuda_pipeline(hf_token: str | None):
     model.tie_weights()
     model = model.to("cuda")
     processor = WhisperProcessor.from_pretrained(
-        MODEL_ID,
+        checkpoint,
         token=hf_token,
         local_files_only=pretrained_local_files_only(),
     )
@@ -287,12 +290,13 @@ def _load_cpu_pipeline(hf_token: str | None):
     from transformers.models.whisper.processing_whisper import WhisperProcessor
 
     logger.info("Using CPU (float32) fallback pipeline for Typhoon Whisper.")
+    checkpoint = resolve_pretrained_checkpoint(MODEL_ID)
     model = AutoModelForSpeechSeq2Seq.from_pretrained(
-        MODEL_ID,
+        checkpoint,
         **_model_load_kwargs(hf_token, torch.float32),
     )
     processor = WhisperProcessor.from_pretrained(
-        MODEL_ID,
+        checkpoint,
         token=hf_token,
         local_files_only=pretrained_local_files_only(),
     )
@@ -339,8 +343,9 @@ def _load_ov_pipeline(device: str, hf_token: str | None):
             logger.info(
                 "Exporting Typhoon to OpenVINO IR from local cache (first run, may take several minutes)..."
             )
+            checkpoint = resolve_pretrained_checkpoint(MODEL_ID)
             model = OVModelForSpeechSeq2Seq.from_pretrained(
-                MODEL_ID,
+                checkpoint,
                 export=True,
                 device=device,
                 compile=True,
@@ -348,7 +353,7 @@ def _load_ov_pipeline(device: str, hf_token: str | None):
                 local_files_only=pretrained_local_files_only(),
             )
             processor = WhisperProcessor.from_pretrained(
-                MODEL_ID,
+                checkpoint,
                 token=hf_token,
                 local_files_only=pretrained_local_files_only(),
             )
@@ -401,9 +406,8 @@ def _get_pipeline():
     device = hw["selected_device"]
     hf_token = os.getenv("HF_TOKEN")
 
+    _sync_hub_constants()
     require_cached_model(MODEL_ID, logger)
-    if not has_cached_model_file(MODEL_ID):
-        raise RuntimeError(offline_cache_error_message(MODEL_ID))
     logger.info("Loading Typhoon Whisper (%s) on device=%s ...", MODEL_ID, device)
     if uses_pytorch_cuda_pipeline(hw):
         pipe = _load_cuda_pipeline_with_retry(hf_token)

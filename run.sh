@@ -21,6 +21,7 @@ set_model_env() {
     export HF_HOME="$SCRIPT_DIR/models/hf_cache"
     export HF_HUB_CACHE="$SCRIPT_DIR/models/hf_cache/hub"
     export HUGGINGFACE_HUB_CACHE="$SCRIPT_DIR/models/hf_cache/hub"
+    export TRANSFORMERS_CACHE="$SCRIPT_DIR/models/hf_cache/hub"
     export TORCH_HOME="$SCRIPT_DIR/models/torch"
     export OV_CACHE_DIR="$SCRIPT_DIR/models/ov_cache"
     export HF_HUB_DISABLE_SYMLINKS_WARNING=1

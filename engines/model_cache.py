@@ -16,10 +16,28 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+_CONFIG_JSON = "config.json"
+_CONFIG_YAML = "config.yaml"
+_CONFIG_CANDIDATES = (_CONFIG_JSON, _CONFIG_YAML)
+
 DEFAULT_ASR_MODELS = (
     "nectec/Pathumma-whisper-th-large-v3",
     "typhoon-ai/typhoon-whisper-large-v3",
 )
+
+DEFAULT_DIARIZATION_MODEL = "pyannote/speaker-diarization-community-1"
+
+# Pyannote pipeline repos reference weights in separate hub repos.
+PYANNOTE_PIPELINE_DEPENDENCIES: dict[str, tuple[str, ...]] = {
+    "pyannote/speaker-diarization-3.1": (
+        "pyannote/segmentation-3.0",
+        "pyannote/wespeaker-voxceleb-resnet34-LM",
+    ),
+    "pyannote/speaker-diarization-community-1": (
+        "pyannote/segmentation-3.0",
+        "pyannote/wespeaker-voxceleb-resnet34-LM",
+    ),
+}
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -38,6 +56,28 @@ def hf_offline_enabled() -> bool:
 def pretrained_local_files_only() -> bool:
     """Return the local_files_only value for from_pretrained calls."""
     return hf_offline_enabled()
+
+
+def hub_pretrained_kwargs(hf_token: str | None = None) -> dict:
+    """Common kwargs for Hugging Face from_pretrained / hub loads."""
+    kwargs: dict = {"local_files_only": pretrained_local_files_only()}
+    if hf_token:
+        kwargs["token"] = hf_token
+    cache = os.getenv("HF_HUB_CACHE") or os.getenv("HUGGINGFACE_HUB_CACHE")
+    if cache:
+        kwargs["cache_dir"] = cache
+    return kwargs
+
+
+def resolve_pretrained_checkpoint(model_id: str) -> str:
+    """Return a local snapshot path when offline; otherwise the hub model id."""
+    _sync_hub_constants()
+    if hf_offline_enabled():
+        snapshot = cached_snapshot_path(model_id)
+        if snapshot is None:
+            raise RuntimeError(offline_cache_error_message(model_id))
+        return str(snapshot)
+    return model_id
 
 
 def hub_cache_dir() -> Path:
@@ -73,6 +113,37 @@ def _sync_hub_constants() -> None:
             pass
 
 
+def configure_project_cache_paths(
+    project_root: str | Path | None = None,
+    *,
+    model_root: str | Path | None = None,
+) -> dict[str, str]:
+    """Pin Hugging Face, Torch, and OpenVINO caches under a project-local tree."""
+    root = Path(project_root or os.getcwd()).resolve()
+    resolved_model_root = Path(model_root or os.getenv("APP_MODEL_ROOT") or root / "models")
+    if not resolved_model_root.is_absolute():
+        resolved_model_root = (root / resolved_model_root).resolve()
+
+    hf_home = resolved_model_root / "hf_cache"
+    hub_cache = hf_home / "hub"
+    torch_home = resolved_model_root / "torch"
+    ov_cache = resolved_model_root / "ov_cache"
+    paths = {
+        "APP_MODEL_ROOT": str(resolved_model_root),
+        "HF_HOME": str(hf_home),
+        "HF_HUB_CACHE": str(hub_cache),
+        "HUGGINGFACE_HUB_CACHE": str(hub_cache),
+        "TRANSFORMERS_CACHE": str(hub_cache),
+        "TORCH_HOME": str(torch_home),
+        "OV_CACHE_DIR": str(ov_cache),
+    }
+    for key, value in paths.items():
+        os.environ.setdefault(key, value)
+    for path in paths.values():
+        Path(path).mkdir(parents=True, exist_ok=True)
+    return paths
+
+
 def apply_runtime_cache_env_defaults() -> None:
     """Default to offline, project-local cache unless explicitly overridden."""
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
@@ -81,6 +152,12 @@ def apply_runtime_cache_env_defaults() -> None:
     os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
     os.environ.setdefault("ASR_PRELOAD_MODE", "eager")
     os.environ.setdefault("DIARIZATION_PRELOAD_MODE", "eager")
+    if env_bool("APP_AUTO_DOWNLOAD_MISSING_MODELS", False):
+        logger.warning(
+            "APP_AUTO_DOWNLOAD_MISSING_MODELS=true is ignored at runtime; "
+            "populate ./models/ once via scripts/bootstrap_models.py, then run offline."
+        )
+        os.environ["APP_AUTO_DOWNLOAD_MISSING_MODELS"] = "false"
     _sync_hub_constants()
 
 
@@ -120,7 +197,7 @@ def cached_snapshot_path(model_id: str) -> Path | None:
     for snapshot in snapshots_dir.iterdir():
         if not snapshot.is_dir():
             continue
-        for name in ("config.json", "config.yaml"):
+        for name in _CONFIG_CANDIDATES:
             candidate = snapshot / name
             if _snapshot_file_usable(candidate):
                 try:
@@ -158,7 +235,7 @@ def _snapshot_shard_files(snapshot: Path) -> set[str]:
             weight_map = payload.get("weight_map", {})
             if isinstance(weight_map, dict) and weight_map:
                 return {str(name) for name in weight_map.values()}
-        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        except (OSError, json.JSONDecodeError, TypeError):
             pass
     shards = {
         path.name
@@ -181,12 +258,40 @@ def _snapshot_weights_complete(snapshot: Path) -> bool:
     return all(_snapshot_file_usable(snapshot / name) for name in required)
 
 
+def _pipeline_bundle_complete(snapshot: Path) -> bool:
+    """Pyannote pipeline repos may ship weights under subfolders (embedding/, etc.)."""
+    if not _snapshot_file_usable(snapshot / _CONFIG_YAML):
+        return False
+    if _snapshot_weights_complete(snapshot):
+        return True
+    weight_names = ("pytorch_model.bin", "model.safetensors", "model.bin")
+    for sub in snapshot.iterdir():
+        if not sub.is_dir() or sub.name in {".github", "reproducible_research"}:
+            continue
+        for name in weight_names:
+            if _snapshot_file_usable(sub / name):
+                return True
+    return False
+
+
+def _hf_pipeline_complete(model_id: str, snapshot: Path) -> bool:
+    """Return whether a Hugging Face pipeline snapshot is usable offline."""
+    if _pipeline_bundle_complete(snapshot):
+        return True
+    if not _snapshot_file_usable(snapshot / _CONFIG_YAML):
+        return False
+    deps = diarization_pipeline_dependencies(model_id)
+    if not deps:
+        return False
+    return all(has_cached_model_file(dep) for dep in deps)
+
+
 def has_cached_model_file(model_id: str, filename: str | None = None) -> bool:
     """Return whether a Hugging Face snapshot contains a required model file."""
     snapshots_dir = _model_cache_dir(model_id) / "snapshots"
     if not snapshots_dir.is_dir():
         return False
-    candidates = (filename,) if filename else ("config.json", "config.yaml")
+    candidates = (filename,) if filename else _CONFIG_CANDIDATES
     for snapshot in snapshots_dir.iterdir():
         if not snapshot.is_dir():
             continue
@@ -197,7 +302,26 @@ def has_cached_model_file(model_id: str, filename: str | None = None) -> bool:
             return _snapshot_file_usable(snapshot / filename)
         if _snapshot_weights_complete(snapshot):
             return True
+        if _hf_pipeline_complete(model_id, snapshot):
+            return True
     return False
+
+
+def configured_diarization_model_id() -> str:
+    """Return the configured pyannote diarization pipeline model id."""
+    return os.getenv("DIARIZATION_MODEL_ID", DEFAULT_DIARIZATION_MODEL)
+
+
+def diarization_pipeline_dependencies(model_id: str) -> tuple[str, ...]:
+    """Return sub-model repos required by a pyannote pipeline id."""
+    return PYANNOTE_PIPELINE_DEPENDENCIES.get(model_id, ())
+
+
+def has_cached_pipeline(model_id: str) -> bool:
+    """Return whether a pyannote pipeline and its sub-models are cached offline."""
+    if not has_cached_model_file(model_id):
+        return False
+    return all(has_cached_model_file(dep) for dep in diarization_pipeline_dependencies(model_id))
 
 
 def configured_asr_model_ids() -> tuple[str, ...]:
@@ -219,7 +343,16 @@ def require_cached_model(model_id: str, logger) -> None:
     """Fail fast when a model is missing from the local cache (never goes online)."""
     if has_cached_model_file(model_id):
         return
-    logger.error("%s", offline_cache_error_message(model_id))
+    message = offline_cache_error_message(model_id)
+    logger.error("%s", message)
+    raise RuntimeError(message)
+
+
+def require_cached_pipeline(model_id: str, logger) -> None:
+    """Fail fast when a pyannote pipeline or its sub-models are missing locally."""
+    require_cached_model(model_id, logger)
+    for dep in diarization_pipeline_dependencies(model_id):
+        require_cached_model(dep, logger)
 
 
 def offline_cache_error_message(model_id: str) -> str:

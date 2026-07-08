@@ -345,7 +345,7 @@ python scripts/bootstrap_models.py
 
 `pyannote/speaker-diarization-community-1` is a gated model — accept its terms on Hugging Face, then set `HF_TOKEN` in `.env`.
 
-Keep `HF_HUB_OFFLINE=0` during setup and model swaps so missing model files can be downloaded. After every selected model has been bootstrapped, you may set `HF_HUB_OFFLINE=1` for fully offline runs.
+**Maintainer setup only:** keep `HF_HUB_OFFLINE=0` while running `bootstrap_models.py` so missing weights can be downloaded once. **Production and Docker defaults are offline** (`HF_HUB_OFFLINE=1`, `APP_AUTO_DOWNLOAD_MISSING_MODELS=false` in `.env.production` and `docker-compose.gpu.yml`). After bootstrap, the app reads only from `./models/hf_cache/` — no repeated hub downloads at runtime.
 
 ---
 
@@ -613,7 +613,30 @@ DIARIZATION_CUDA_MIN_FREE_MB=1024        # move diarization to CPU if CUDA memor
 DIARIZATION_CUDA_MIN_VRAM_MB=12288
 ```
 
-Each job manifest records `audio_duration_s`, `total_elapsed_s`, `target_elapsed_s`, and `target_met`. Targets are tiered: **≤10 min** for short clips (&lt;20 min), **≤30 min** for medium long files, and **min(30 min, duration ÷ 4)** for 1 h+ audio. Adaptive policy raises beam width on short dialogue and switches 1 h+ files to windowed long-form ASR after segmented CUDA diarization.
+Each job manifest records `audio_duration_s`, `total_elapsed_s`, `target_elapsed_s`, and `target_met`. Targets are tiered: **≤10 min** wall time for audio under 20 minutes, **half realtime** (audio duration ÷ 2) for longer files.
+
+### Enterprise Docker acceptance (production sign-off)
+
+Production GPU sign-off uses **two fixtures only** — never run host GPU validation while Docker holds the GPU:
+
+```powershell
+python scripts/stop_gpu_work.py --docker
+docker compose -f docker-compose.gpu.yml up -d --build --force-recreate
+pytest tests/test_asr_performance.py tests/test_asr_quality.py tests/test_meeting_eval.py tests/test_golden_automation.py -q
+python scripts/run_sonar_scan.py --skip-scan
+python scripts/run_docker_acceptance.py --tag final
+```
+
+| Fixture | Audio | Accuracy gates | Wall time |
+|---------|-------|----------------|-----------|
+| `sample01` | `tests/test-sample01.m4a` (~3.7 min) | 99/98/98/95% content/speaker/timestamp/strict, 4/4 speakers, 0 mismatched lines | ≤10 min |
+| `meeting309` | `tests/309.m4a` (~90 min) | 11/11 speakers + meeting gates | ≤ half audio (~45 min) |
+
+VRAM policy: `ASR_CUDA_MEMORY_FRACTION=0.92` with batch=1, beams=6, single concurrent job. See `backend/enterprise_config.py` and `docker-compose.gpu.yml`.
+
+**Offline models:** Docker and validation never download from Hugging Face Hub. Populate `./models/` once via `scripts/bootstrap_models.py` on a maintainer machine; `ensure_model_cache.py --strict-diarization` verifies ASR + pyannote caches before acceptance runs.
+
+**sample01 baseline:** `ENTERPRISE_FIXTURE_OVERRIDES["sample01"]` is locked to the cal8 Docker profile (diar on raw audio, ASR-only enhance, seg 0.31 / cluster 0.38). Do not change without a fresh Docker re-score.
 
 ### Golden automation (GPU regression)
 
@@ -621,7 +644,7 @@ Each job manifest records `audio_duration_s`, `total_elapsed_s`, `target_elapsed
 python scripts/run_golden_automation.py --deploy
 ```
 
-Fixtures: `test-sample01.m4a` (≥95% vs `tests/test-sample01.txt`) plus long-audio perf smoke tests on `Recording 172.wav`, `Recording 19.wav`, and `47.m4a`. Use `--skip-long` for the short clip only (~6 min).
+Fixtures: `test-sample01.m4a` (accuracy vs `tests/test-sample01.txt`) and optional long-audio perf smoke tests. Enterprise acceptance uses `run_docker_acceptance.py` (see above).
 
 ### Stopping the app
 

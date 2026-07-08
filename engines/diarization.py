@@ -37,6 +37,9 @@ warnings.filterwarnings(
 
 logger = logging.getLogger(__name__)
 
+_CUDA_INTERNAL_ASSERT = "internal assert"
+_CUDA_CACHING_ALLOCATOR = "cachingallocator"
+
 MODEL_ID = os.getenv("DIARIZATION_MODEL_ID", "pyannote/speaker-diarization-community-1")
 
 _pipeline_cache: list = []
@@ -104,14 +107,23 @@ def _build_pipeline_params() -> dict | None:
       DIARIZATION_MIN_DURATION_OFF        — minimum silence gap (s) to split
           a speaker turn; smaller = more splits (pyannote default 0.0).
       DIARIZATION_CLUSTERING_THRESHOLD    — speaker embedding distance; lower =
-          more distinct speakers separated (pyannote default ~0.70).
+          more distinct speakers separated (pyannote default ~0.70; community-1
+          VBx AHC-init distance, default 0.6).
       DIARIZATION_MIN_CLUSTER_SIZE        — minimum segments to form a cluster;
-          lower = rare/short speakers still detected (pyannote default 12).
+          lower = rare/short speakers still detected (pyannote default 12;
+          ignored by community-1 VBx).
+      DIARIZATION_VBX_FA                  — community-1 VBx acoustic scaling;
+          HIGHER keeps more distinct speakers (model default 0.07 merges
+          aggressively — brief speakers vanish in meetings).
+      DIARIZATION_VBX_FB                  — community-1 VBx speaker-prior
+          scaling (model default 0.8).
     """
     seg_threshold   = _env_float("DIARIZATION_SEGMENTATION_THRESHOLD", -1.0)
     seg_min_dur_off = _env_float("DIARIZATION_MIN_DURATION_OFF",        -1.0)
     clust_threshold = _env_float("DIARIZATION_CLUSTERING_THRESHOLD",    -1.0)
     clust_min_size  = _env_int(  "DIARIZATION_MIN_CLUSTER_SIZE",        -1)
+    vbx_fa          = _env_float("DIARIZATION_VBX_FA",                  -1.0)
+    vbx_fb          = _env_float("DIARIZATION_VBX_FB",                  -1.0)
 
     params: dict = {}
 
@@ -128,6 +140,10 @@ def _build_pipeline_params() -> dict | None:
         clust_params["threshold"] = clust_threshold
     if clust_min_size >= 0:
         clust_params["min_cluster_size"] = clust_min_size
+    if vbx_fa >= 0:
+        clust_params["Fa"] = vbx_fa
+    if vbx_fb >= 0:
+        clust_params["Fb"] = vbx_fb
     if clust_params:
         params["clustering"] = clust_params
 
@@ -189,6 +205,21 @@ def _cuda_free_mb(torch_module) -> int:
         return 0
 
 
+def _requires_cuda_process_restart(msg: str) -> bool:
+    """Errors that corrupt the CUDA context; in-process retry makes things worse."""
+    lowered = msg.lower()
+    return any(
+        token in lowered
+        for token in (
+            "device not ready",
+            _CUDA_CACHING_ALLOCATOR,
+            _CUDA_INTERNAL_ASSERT,
+            "cuda error: unknown",
+            "cudaerrorunknown",
+        )
+    )
+
+
 def _is_recoverable_cuda_error(msg: str) -> bool:
     lowered = msg.lower()
     return any(
@@ -196,8 +227,8 @@ def _is_recoverable_cuda_error(msg: str) -> bool:
         for token in (
             "out of memory",
             "device not ready",
-            "cachingallocator",
-            "internal assert",
+            _CUDA_CACHING_ALLOCATOR,
+            _CUDA_INTERNAL_ASSERT,
             "cuda error",
         )
     )
@@ -222,20 +253,17 @@ def _recover_cuda_after_failure(torch_module) -> None:
 
 
 def _device_for_preload(torch_module):
-    """Load diarization on CPU on 8 GB GPUs so ASR can own CUDA VRAM."""
+    """Place pyannote on CUDA when allowed; never CPU-cache when CUDA is required."""
     preload = os.getenv("DIARIZATION_PRELOAD_DEVICE", "cuda").strip().lower()
     if preload not in {"cuda", "gpu"} or not torch_module.cuda.is_available():
+        if _diarization_cuda_required():
+            _raise_if_cuda_required("preload (CUDA unavailable)")
         return torch_module.device("cpu")
-    try:
-        from backend.services.asr_local import requires_sequential_gpu_models
-
-        if requires_sequential_gpu_models():
-            return torch_module.device("cpu")
-    except ImportError:
-        pass
+    allow_low_vram_cuda = _env_bool("DIARIZATION_ALLOW_8GB_CUDA", False)
+    if _diarization_cuda_required() or allow_low_vram_cuda:
+        return torch_module.device("cuda")
     vram_mb = _cuda_vram_mb(torch_module)
     low_vram_limit_mb = _env_int("ASR_8GB_CLASS_MAX_MB", 9000)
-    allow_low_vram_cuda = _env_bool("DIARIZATION_ALLOW_8GB_CUDA", False)
     if 0 < vram_mb <= low_vram_limit_mb and not allow_low_vram_cuda:
         return torch_module.device("cpu")
     return torch_module.device("cuda")
@@ -556,7 +584,47 @@ def _select_diarization_device(torch_module):
         allow_low_vram_cuda=_env_bool("DIARIZATION_ALLOW_8GB_CUDA", False),
         gpu_co_resident=_env_bool("DIARIZATION_GPU_CO_RESIDENT", False),
     )
+    if not use_cuda and _diarization_cuda_required():
+        _raise_if_cuda_required(
+            f"free_mb={free_mb} vram_mb={vram_mb} allow_8gb={_env_bool('DIARIZATION_ALLOW_8GB_CUDA', False)}"
+        )
     return torch_module.device("cuda" if use_cuda else "cpu")
+
+
+def load_offline_pyannote_pipeline(model_id: str | None = None):
+    """Load pyannote pipeline from the local Hugging Face cache only (no hub download)."""
+    from pyannote.audio import Pipeline
+
+    from engines.model_cache import (
+        _sync_hub_constants,
+        offline_cache_error_message,
+        require_cached_pipeline,
+        resolve_pretrained_checkpoint,
+    )
+
+    pipeline_id = model_id or MODEL_ID
+    hf_token = os.getenv("HF_TOKEN")
+    _sync_hub_constants()
+    require_cached_pipeline(pipeline_id, logger)
+    checkpoint = resolve_pretrained_checkpoint(pipeline_id)
+    logger.info(
+        "Offline pyannote pipeline load (%s) from %s",
+        pipeline_id,
+        checkpoint,
+    )
+    try:
+        load_kwargs: dict = {}
+        if hf_token:
+            load_kwargs["token"] = hf_token
+        pipeline = Pipeline.from_pretrained(checkpoint, **load_kwargs)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        raise RuntimeError(
+            f"Failed to load pyannote pipeline '{pipeline_id}' from local cache: {exc}. "
+            f"{offline_cache_error_message(pipeline_id)}"
+        ) from exc
+    if pipeline is None:
+        raise RuntimeError(f"Failed to load pyannote pipeline '{pipeline_id}'")
+    return pipeline
 
 
 def _get_diarization_pipeline():
@@ -565,31 +633,10 @@ def _get_diarization_pipeline():
         return _pipeline_cache[0]
 
     import torch
-    from pyannote.audio import Pipeline
-
-    from engines.model_cache import (
-        cached_snapshot_path,
-        offline_cache_error_message,
-        pretrained_local_files_only,
-        require_cached_model,
-    )
 
     _check_ffmpeg()
 
-    hf_token = os.getenv("HF_TOKEN")
-    require_cached_model(MODEL_ID, logger)
-    if pretrained_local_files_only() and not cached_snapshot_path(MODEL_ID):
-        raise RuntimeError(offline_cache_error_message(MODEL_ID))
-
-    logger.info("Loading pyannote speaker diarization pipeline (%s)...", MODEL_ID)
-
-    pipeline = Pipeline.from_pretrained(
-        MODEL_ID,
-        token=hf_token,
-        local_files_only=pretrained_local_files_only(),
-    )
-    if pipeline is None:
-        raise RuntimeError(f"Failed to load pyannote pipeline '{MODEL_ID}'")
+    pipeline = load_offline_pyannote_pipeline(MODEL_ID)
     device = _device_for_preload(torch)
     pipeline = pipeline.to(device)
     _set_tracked_device(device)
@@ -831,6 +878,8 @@ def _override_params(
     seg_min_duration_off: float | None,
     clust_threshold: float | None,
     clust_min_size: int | None,
+    vbx_fa: float | None = None,
+    vbx_fb: float | None = None,
 ) -> dict | None:
     """Build pyannote instantiate() params from explicit per-call overrides."""
     params: dict = {}
@@ -846,6 +895,10 @@ def _override_params(
         clust["threshold"] = float(clust_threshold)
     if clust_min_size is not None:
         clust["min_cluster_size"] = int(clust_min_size)
+    if vbx_fa is not None:
+        clust["Fa"] = float(vbx_fa)
+    if vbx_fb is not None:
+        clust["Fb"] = float(vbx_fb)
     if clust:
         params["clustering"] = clust
     return params if params else None
@@ -876,9 +929,14 @@ def _adaptive_pipeline_params(
 def _retry_pipeline_params(base_params: dict | None) -> dict:
     """Looser clustering for a second pass when only one speaker was detected."""
     clust = dict((base_params or {}).get("clustering") or {})
-    threshold = float(clust.get("threshold", 0.58))
-    clust["threshold"] = max(0.35, threshold - 0.08)
-    clust["min_cluster_size"] = 2
+    if _is_vbx_pipeline():
+        # VBx merge pressure lives in Fa, not the AHC-init threshold.
+        clust["Fa"] = min(0.40, float(clust.get("Fa", 0.07)) + 0.13)
+        clust["threshold"] = max(0.45, float(clust.get("threshold", 0.60)) - 0.05)
+    else:
+        threshold = float(clust.get("threshold", 0.58))
+        clust["threshold"] = max(0.35, threshold - 0.08)
+        clust["min_cluster_size"] = 2
     seg = dict((base_params or {}).get("segmentation") or {})
     return {"segmentation": seg, "clustering": clust}
 
@@ -895,25 +953,70 @@ def _instantiate_pipeline_params(pipe, params: dict | None, label: str) -> None:
         logger.warning("Could not apply diarization %s params: %s", label, exc)
 
 
+def _overcluster_extra(max_speakers: int) -> int:
+    """Extra clusters to request beyond the cap on meeting-scale VBx jobs.
+
+    community-1's constrained VBx assignment starves most clusters on long
+    meetings (measured: 6 populated of ~13 on a 90-min 11-speaker file), while
+    a forced KMeans partition at cap+extra splits crowded clusters cleanly.
+    The same-voice duplicates this creates are reunified afterwards by
+    _merge_similar_speaker_clusters, and _enforce_max_speakers re-applies the
+    user's cap. Requires the user's Max Speakers to approximate the real
+    attendee count, which the UI guidance states for meetings.
+    """
+    configured = _env_int("DIARIZATION_OVERCLUSTER_EXTRA", -1)
+    from backend.asr_quality import is_accuracy_mode
+
+    if not (is_accuracy_mode() and _is_vbx_pipeline()):
+        if configured >= 0:
+            return configured
+        return 0
+    if max_speakers >= 11:
+        if configured >= 0:
+            return configured
+        return 7
+    if max_speakers >= 6:
+        return 3
+    if max_speakers >= 3:
+        return 1
+    return 0
+
+
 def _build_diarize_kwargs(
     num_speakers: int,
     max_speakers: int,
     audio_duration_s: float = 0.0,
+    min_speakers_hint: int = 0,
 ) -> dict:
-    """Construct pyannote pipeline call kwargs from speaker count hints."""
+    """Construct pyannote pipeline call kwargs from speaker count hints.
+
+    ``max_speakers`` is a strict UPPER bound. We do NOT synthesise a
+    ``min_speakers`` floor from the slider value: forcing a floor makes pyannote
+    fabricate phantom speakers on monologue / 2-person recordings. A floor is
+    applied only when an explicit ``min_speakers_hint`` is supplied (e.g. a
+    re-diarization retry that already detected a collapse), and it is always
+    clamped to the upper bound.
+
+    Meeting-scale VBx jobs overcluster on purpose (see _overcluster_extra);
+    centroid merging + the max-speaker cap bring the count back down.
+    """
+    del audio_duration_s
+    exact = _env_bool("DIARIZATION_EXACT_NUM_SPEAKERS", False)
+    if num_speakers > 0 and exact:
+        return {"num_speakers": num_speakers}
     if num_speakers > 0:
         return {"num_speakers": num_speakers}
+    if min_speakers_hint <= 0 and max_speakers > 0:
+        extra = _overcluster_extra(max_speakers)
+        if extra > 0:
+            return {"num_speakers": max_speakers + extra}
     kwargs: dict = {}
     if max_speakers > 0:
         kwargs["max_speakers"] = max_speakers
-    if max_speakers >= 2:
-        from backend.asr_quality import is_accuracy_mode
-
-        if is_accuracy_mode():
-            if audio_duration_s > 0 and audio_duration_s < 600 and max_speakers >= 4:
-                kwargs["min_speakers"] = min(4, max_speakers)
-            else:
-                kwargs["min_speakers"] = min(2, max_speakers)
+    if min_speakers_hint > 0:
+        kwargs["min_speakers"] = (
+            min(min_speakers_hint, max_speakers) if max_speakers > 0 else min_speakers_hint
+        )
     return kwargs
 
 
@@ -954,9 +1057,42 @@ def _max_speaker_cap_params(max_speakers: int, audio_duration_s: float) -> dict:
     }
 
 
+def _is_vbx_pipeline() -> bool:
+    """community-1 clusters with VBx (threshold/Fa/Fb), not agglomerative."""
+    return "community" in MODEL_ID.lower()
+
+
 def _accuracy_mode_params(max_speakers: int, audio_duration_s: float) -> dict:
     """Sensitive segmentation/clustering for maximum speaker separation."""
     del audio_duration_s
+    if _is_vbx_pipeline():
+        # community-1 VBx: default Fa=0.07 merges rapid dialogue and brief
+        # meeting speakers. Tier Fa/threshold by expected attendee count.
+        if max_speakers >= 11:
+            return {
+                "segmentation": {"min_duration_off": 0.03},
+                "clustering": {"threshold": 0.56, "Fa": 0.32, "Fb": 0.8},
+            }
+        if max_speakers >= 6:
+            return {
+                "segmentation": {"min_duration_off": 0.04},
+                "clustering": {"threshold": 0.60, "Fa": 0.22, "Fb": 0.8},
+            }
+        if max_speakers >= 3:
+            if max_speakers <= 5:
+                return {
+                    "segmentation": {"min_duration_off": 0.03},
+                    "clustering": {"threshold": 0.54, "Fa": 0.22, "Fb": 0.8},
+                }
+            return {
+                "segmentation": {"min_duration_off": 0.04},
+                "clustering": {"threshold": 0.55, "Fa": 0.18, "Fb": 0.8},
+            }
+        if max_speakers == 2:
+            return {
+                "segmentation": {"min_duration_off": 0.08},
+                "clustering": {"threshold": 0.42, "Fa": 0.15, "Fb": 0.8},
+            }
     if max_speakers == 2:
         clust_threshold = 0.42
         min_off = 0.03
@@ -987,6 +1123,17 @@ def _speaker_durations(segments: list[dict]) -> dict[str, float]:
         spk = seg["speaker"]
         totals[spk] = totals.get(spk, 0.0) + max(0.0, seg["end"] - seg["start"])
     return totals
+
+
+def _dominant_speaker_share(segments: list[dict]) -> tuple[float, int]:
+    """Return (max speaker time share, unique speaker count)."""
+    totals = _speaker_durations(segments)
+    if not totals:
+        return 0.0, 0
+    total = sum(totals.values())
+    if total <= 0:
+        return 0.0, len(totals)
+    return max(totals.values()) / total, len(totals)
 
 
 def _nearest_kept_speaker(
@@ -1110,12 +1257,21 @@ def prepare_asr_turns(
         return []
     from backend.asr_quality import is_accuracy_mode
 
-    if is_accuracy_mode():
+    configured_gap = os.getenv("ASR_TURN_GUIDED_MERGE_GAP_S", "").strip()
+    if configured_gap:
+        try:
+            merge_gap = float(configured_gap)
+        except ValueError:
+            merge_gap = 0.0 if is_accuracy_mode() else _env_float("ASR_TURN_GUIDED_MERGE_GAP_S", 1.0)
+    elif is_accuracy_mode():
         merge_gap = 0.0
     else:
         merge_gap = _env_float("ASR_TURN_GUIDED_MERGE_GAP_S", 1.0)
     max_turn_s = _env_float("ASR_TURN_GUIDED_MAX_TURN_S", 45.0)
     min_turn_s = _env_float("ASR_TURN_GUIDED_MIN_TURN_S", 0.4)
+    from engines.whisper_utils import whisper_max_asr_turn_body_s
+
+    max_turn_s = min(max_turn_s, whisper_max_asr_turn_body_s())
 
     segments = sorted(
         (dict(seg) for seg in diarization_segments),
@@ -1136,6 +1292,25 @@ def prepare_asr_turns(
     return turns
 
 
+def _postprocess_merge_gap_s() -> float:
+    """Gap for merging adjacent same-speaker diar fragments after pyannote."""
+    from backend.asr_quality import is_accuracy_mode
+
+    if _env_bool("DIARIZATION_LOCK_PARAMS", False):
+        for key in (
+            "DIARIZATION_TRANSCRIPT_MERGE_GAP_S",
+            "DIARIZATION_ASSIGN_TURN_MERGE_GAP_S",
+            "ASR_TURN_GUIDED_MERGE_GAP_S",
+        ):
+            raw = os.getenv(key, "").strip()
+            if raw:
+                try:
+                    return float(raw)
+                except ValueError:
+                    pass
+    return 0.35 if is_accuracy_mode() else 0.45
+
+
 def _postprocess_diarization_segments(
     segments: list[dict], max_speakers: int,
 ) -> list[dict]:
@@ -1145,12 +1320,20 @@ def _postprocess_diarization_segments(
     if not segments:
         return segments
     min_frag = 0.3 if is_accuracy_mode() else 0.4
-    merge_gap = 0.35 if is_accuracy_mode() else 0.45
+    merge_gap = _postprocess_merge_gap_s()
     out = _merge_short_segments(list(segments), min_duration_s=min_frag)
     out = _merge_adjacent_same_speaker(out, max_gap_s=merge_gap)
     out = _enforce_max_speakers(out, max_speakers)
     out = _merge_adjacent_same_speaker(out, max_gap_s=merge_gap)
     return out
+
+
+# (labels, centroid matrix) of the most recent pyannote pass. Consumed once by
+# _merge_similar_speaker_clusters right after the MAIN full pass; sub-passes
+# (tune windows, span refines) overwrite it but their label sets never match
+# the global segment labels at merge time, and the consumer clears it.
+_last_pass_embeddings: list = []
+_embedding_rescue_cache: tuple[list[str], object] | None = None
 
 
 def _segments_from_diarization(diarization) -> list[dict]:
@@ -1164,6 +1347,8 @@ def _segments_from_diarization(diarization) -> list[dict]:
     ) is not None:
         logger.info("Using community-1 exclusive_speaker_diarization for ASR alignment.")
 
+    _stash_speaker_embeddings(diarization, annotation)
+
     segments: list[dict] = []
     for turn, _, speaker in annotation.itertracks(yield_label=True):
         segments.append({
@@ -1175,10 +1360,266 @@ def _segments_from_diarization(diarization) -> list[dict]:
     return _merge_short_segments(segments)
 
 
-def _run_pyannote(pipe, audio_input: dict, kwargs: dict):
-    """Call pyannote pipeline; use ProgressHook when available."""
+def _stash_speaker_embeddings(diarization, annotation) -> None:
+    """Remember per-speaker centroids of this pass for cluster reunification."""
+    global _embedding_rescue_cache
+    _last_pass_embeddings.clear()
+    embeddings = getattr(diarization, "speaker_embeddings", None)
+    if embeddings is None:
+        return
+    try:
+        labels = [str(label) for label in annotation.labels()]
+        if len(labels) == getattr(embeddings, "shape", (0,))[0]:
+            _last_pass_embeddings.append((labels, embeddings))
+            _embedding_rescue_cache = (labels, embeddings)
+    except (AttributeError, TypeError, ValueError):
+        pass
+
+
+def _centroid_merge_threshold(max_speakers: int = 0) -> float:
+    """Cosine similarity above which two clusters are the same voice (0 = off).
+
+    Defaults on only for meeting-scale jobs (max_speakers >= 6) in accuracy
+    mode, where higher VBx Fa is in play and one voice can land in two
+    clusters. Small-group runs keep the model's own clustering untouched
+    unless DIARIZATION_CENTROID_MERGE_THRESHOLD is set explicitly.
+    """
+    configured = _env_float("DIARIZATION_CENTROID_MERGE_THRESHOLD", -1.0)
+    if configured >= 0:
+        return configured
+    from backend.asr_quality import is_accuracy_mode
+
+    # 0.72 sits in the measured gap between same-voice duplicate centroids
+    # (>= 0.74 across passes on the 309 fixture) and distinct-voice pairs
+    # (<= 0.69). Applies to unit-normalized WeSpeaker centroid cosines.
+    return 0.72 if (is_accuracy_mode() and max_speakers >= 6) else 0.0
+
+
+def _union_find_root(parent: dict[str, str], label: str) -> str:
+    while parent[label] != label:
+        parent[label] = parent[parent[label]]
+        label = parent[label]
+    return label
+
+
+def _should_merge_centroid_pair(
+    labels: list[str],
+    similarity,
+    valid,
+    durations: dict[str, float],
+    threshold: float,
+    parent: dict[str, str],
+    i: int,
+    i2: int,
+) -> bool:
+    if not (valid[i] and valid[i2]):
+        return False
+    if similarity[i, i2] < threshold:
+        return False
+    shorter = min(durations.get(labels[i], 0.0), durations.get(labels[i2], 0.0))
+    sim = float(similarity[i, i2])
+    # Ambiguous band: brief voices must not collapse into a dominant cluster.
+    if shorter < 15.0 and 0.72 <= sim < 0.80:
+        return False
+    root_big = _union_find_root(parent, labels[i])
+    root_small = _union_find_root(parent, labels[i2])
+    return root_big != root_small
+
+
+def _collect_centroid_merge_pairs(
+    labels: list[str],
+    similarity,
+    valid,
+    durations: dict[str, float],
+    threshold: float,
+) -> tuple[list[tuple[str, str, float]], dict[str, str]]:
+    """Return merge pairs and the union-find parent map."""
+    order = sorted(range(len(labels)), key=lambda i: -durations.get(labels[i], 0.0))
+    parent = {label: label for label in labels}
+    merged_pairs: list[tuple[str, str, float]] = []
+    for pos_a, i in enumerate(order):
+        for i2 in order[pos_a + 1:]:
+            if not _should_merge_centroid_pair(
+                labels, similarity, valid, durations, threshold, parent, i, i2,
+            ):
+                continue
+            root_big = _union_find_root(parent, labels[i])
+            root_small = _union_find_root(parent, labels[i2])
+            parent[root_small] = root_big
+            merged_pairs.append((labels[i2], labels[i], float(similarity[i, i2])))
+    return merged_pairs, parent
+
+
+def _merge_similar_speaker_clusters(
+    segments: list[dict], max_speakers: int = 0,
+) -> list[dict]:
+    """Reunify clusters whose speaker centroids are the same voice.
+
+    VBx can split one speaker across two clusters when their acoustics drift
+    (speaker moves relative to the mic mid-meeting). Merging by centroid
+    cosine similarity fixes those splits without touching genuinely distinct
+    voices. Uses the centroids stashed by the immediately preceding pass and
+    only acts when its labels exactly match the segment labels.
+    """
+    threshold = _centroid_merge_threshold(max_speakers)
+    if threshold <= 0 or not segments or not _last_pass_embeddings:
+        _last_pass_embeddings.clear()
+        return segments
+    labels, embeddings = _last_pass_embeddings[0]
+    _last_pass_embeddings.clear()
+    seg_labels = sorted({seg["speaker"] for seg in segments})
+    if sorted(labels) != seg_labels or len(labels) < 2:
+        return segments
+
+    import numpy as np
+
+    matrix = np.asarray(embeddings, dtype=float)
+    # Rows with non-finite values (silent clusters) must never merge.
+    valid = np.isfinite(matrix).all(axis=1)
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    unit = matrix / norms
+    similarity = unit @ unit.T
+    durations = _speaker_durations(segments)
+    merged_pairs, parent = _collect_centroid_merge_pairs(
+        labels, similarity, valid, durations, threshold,
+    )
+
+    if not merged_pairs:
+        return segments
+    for src, dst, sim in merged_pairs:
+        logger.info(
+            "Centroid merge: %s -> %s (cosine=%.3f >= %.2f, same voice).",
+            src, dst, sim, threshold,
+        )
+    return [
+        {**seg, "speaker": _union_find_root(parent, seg["speaker"])}
+        for seg in segments
+    ]
+
+
+def _settle_cuda_transient(torch_module) -> None:
+    """Brief pause + cache clear for WSL2 ``device not ready`` transients."""
+    import time
+
+    _recover_cuda_after_failure(torch_module)
+    time.sleep(5.0)
+    try:
+        torch_module.cuda.synchronize()
+        warm = torch_module.zeros(1, device="cuda")
+        del warm
+        torch_module.cuda.synchronize()
+    except RuntimeError:
+        pass
+
+
+def _request_diarization_cuda_restart(exc: RuntimeError, msg: str) -> None:
+    """Exit the process when allocator corruption cannot be recovered in-process."""
+    if _CUDA_CACHING_ALLOCATOR not in msg and _CUDA_INTERNAL_ASSERT not in msg:
+        return
+    try:
+        from backend import vram_state
+
+        vram_state.request_cuda_restart(f"Diarization CUDA: {exc}")
+    except ImportError:
+        pass
+
+
+def _retry_diarization_on_cuda(_pipe, audio_input: dict, kwargs: dict, exc: RuntimeError):
+    """Unload/reload pipeline and retry diarization on CUDA after a recoverable error."""
     import torch
 
+    logger.warning(
+        "Diarization CUDA error (%s); recovering and retrying on CUDA.",
+        exc,
+    )
+    _recover_cuda_after_failure(torch)
+    try:
+        from backend import vram_state
+
+        vram_state.teardown(aggressive=True)
+    except ImportError:
+        pass
+    try:
+        unload_model()
+    except (RuntimeError, AttributeError):
+        pass
+    reloaded_pipe = _get_diarization_pipeline()
+    _move_pipeline_to_inference_device(reloaded_pipe)
+    try:
+        result = _call_pyannote(reloaded_pipe, audio_input, kwargs)
+    except RuntimeError as retry_exc:
+        try:
+            from backend import vram_state
+
+            if _is_recoverable_cuda_error(str(retry_exc).lower()):
+                vram_state.request_cuda_restart(
+                    f"CUDA diarization after retry: {retry_exc}",
+                )
+        except ImportError:
+            pass
+        raise RuntimeError(
+            f"CUDA diarization failed after retry: {retry_exc}",
+        ) from retry_exc
+    try:
+        from backend import vram_state
+
+        unload_model()
+        vram_state.teardown(aggressive=True)
+        vram_state.ensure_cuda_healthy_or_restart("post-diarization CUDA retry")
+    except (ImportError, RuntimeError, AttributeError):
+        pass
+    return result
+
+
+def _retry_diarization_on_cpu(pipe, audio_input: dict, kwargs: dict, exc: RuntimeError):
+    """Fall back to CPU diarization after CUDA failure when allowed."""
+    import torch
+
+    logger.warning(
+        "Diarization CUDA error (%s); recovering and retrying on CPU.",
+        exc,
+    )
+    _recover_cuda_after_failure(torch)
+    try:
+        from backend import vram_state
+
+        vram_state.teardown(aggressive=True)
+    except ImportError:
+        pass
+    _move_pipeline_to_cpu(pipe)
+    return _call_pyannote(pipe, audio_input, kwargs)
+
+
+def _retry_after_transient_cuda(pipe, audio_input: dict, kwargs: dict, exc: RuntimeError):
+    """Settle the CUDA context and retry once after a device-not-ready error."""
+    import torch
+
+    msg = str(exc).lower()
+    if _CUDA_CACHING_ALLOCATOR in msg or _CUDA_INTERNAL_ASSERT in msg:
+        _request_diarization_cuda_restart(exc, msg)
+        raise
+    logger.warning(
+        "Transient CUDA before diarization (%s); settling and retrying once.",
+        exc,
+    )
+    _settle_cuda_transient(torch)
+    return _call_pyannote(pipe, audio_input, kwargs)
+
+
+def _recover_from_diarization_cuda_error(pipe, audio_input: dict, kwargs: dict, exc: RuntimeError):
+    """Dispatch CUDA diarization recovery: CUDA retry, hard fail, or CPU fallback."""
+    if _diarization_cuda_required() and _tracked_device == "cuda":
+        return _retry_diarization_on_cuda(pipe, audio_input, kwargs, exc)
+    if _diarization_cuda_required():
+        raise RuntimeError(
+            f"CUDA diarization failed and CPU fallback is disabled: {exc}"
+        ) from exc
+    return _retry_diarization_on_cpu(pipe, audio_input, kwargs, exc)
+
+
+def _run_pyannote(pipe, audio_input: dict, kwargs: dict):
+    """Call pyannote pipeline; use ProgressHook when available."""
     _move_pipeline_to_cpu_if_cuda_memory_low(pipe)
     try:
         return _call_pyannote(pipe, audio_input, kwargs)
@@ -1186,47 +1627,14 @@ def _run_pyannote(pipe, audio_input: dict, kwargs: dict):
         msg = str(exc).lower()
         if not _is_recoverable_cuda_error(msg):
             raise
-        if _diarization_cuda_required() and _tracked_device == "cuda":
-            logger.warning(
-                "Diarization CUDA error (%s); recovering and retrying on CUDA.",
-                exc,
-            )
-            _recover_cuda_after_failure(torch)
+        if _requires_cuda_process_restart(msg):
             try:
-                from backend import vram_state
-
-                vram_state.teardown(aggressive=True)
-            except ImportError:
-                pass
-            try:
-                unload_model()
-            except (RuntimeError, AttributeError):
-                pass
-            pipe = _get_diarization_pipeline()
-            _move_pipeline_to_inference_device(pipe)
-            try:
-                return _call_pyannote(pipe, audio_input, kwargs)
-            except RuntimeError as retry_exc:
-                raise RuntimeError(
-                    f"CUDA diarization failed after retry: {retry_exc}"
-                ) from retry_exc
-        if _diarization_cuda_required():
-            raise RuntimeError(
-                f"CUDA diarization failed and CPU fallback is disabled: {exc}"
-            ) from exc
-        logger.warning(
-            "Diarization CUDA error (%s); recovering and retrying on CPU.",
-            exc,
-        )
-        _recover_cuda_after_failure(torch)
-        try:
-            from backend import vram_state
-
-            vram_state.teardown(aggressive=True)
-        except ImportError:
-            pass
-        _move_pipeline_to_cpu(pipe)
-        return _call_pyannote(pipe, audio_input, kwargs)
+                return _retry_after_transient_cuda(pipe, audio_input, kwargs, exc)
+            except RuntimeError as settle_exc:
+                if not _is_recoverable_cuda_error(str(settle_exc).lower()):
+                    raise
+                exc = settle_exc
+        return _recover_from_diarization_cuda_error(pipe, audio_input, kwargs, exc)
 
 
 def _call_pyannote(pipe, audio_input: dict, kwargs: dict):
@@ -1494,6 +1902,9 @@ def _mega_turn_retry_params(base_params: dict | None) -> dict:
     retry = _retry_pipeline_params(base_params)
     clustering = dict(retry.get("clustering") or {})
     segmentation = dict(retry.get("segmentation") or {})
+    if _is_vbx_pipeline():
+        clustering["Fa"] = min(0.40, float(clustering.get("Fa", 0.20)) + 0.05)
+        return {"segmentation": segmentation, "clustering": clustering}
     clustering["threshold"] = max(
         0.32,
         float(clustering.get("threshold", 0.48)) - 0.04,
@@ -1550,6 +1961,120 @@ def _diarize_audio_span(
             pass
 
 
+def _global_speaker_order(segments: list[dict]) -> list[str]:
+    """Unique speakers in first-chronological-appearance order."""
+    order: list[str] = []
+    for seg in sorted(segments, key=lambda item: item["start"]):
+        spk = str(seg.get("speaker") or "")
+        if spk and spk not in order:
+            order.append(spk)
+    return order
+
+
+def _reload_diarization_pipeline_for_refine(pipe):
+    """Tear down VRAM and reload the diarization pipeline; return fallback on failure."""
+    try:
+        from backend import vram_state
+        import torch
+
+        vram_state.teardown(aggressive=True)
+        unload_model()
+        _settle_cuda_transient(torch)
+        reloaded = _get_diarization_pipeline()
+        _move_pipeline_to_inference_device(reloaded)
+        return reloaded
+    except (ImportError, RuntimeError, AttributeError):
+        return pipe
+
+
+def _speakers_in_appearance_order(segments: list[dict]) -> list[str]:
+    order: list[str] = []
+    for seg in segments:
+        spk = str(seg.get("speaker") or "")
+        if spk and spk not in order:
+            order.append(spk)
+    return order
+
+
+def _global_order_for_span(
+    span: dict,
+    span_idx: int,
+    context_segments: list[dict] | None,
+) -> list[str]:
+    global_order = _global_speaker_order(context_segments or [])
+    anchor = str(span.get("speaker") or "")
+    if anchor and anchor not in global_order:
+        global_order.append(anchor)
+    if not global_order:
+        global_order = [anchor or f"REFINE{span_idx}_A"]
+    return global_order
+
+
+def _sub_to_global_speaker_mapping(
+    sub_order: list[str],
+    global_order: list[str],
+    anchor: str,
+) -> dict[str, str]:
+    try:
+        start_idx = global_order.index(anchor) if anchor in global_order else 0
+    except ValueError:
+        start_idx = 0
+    return {
+        sub_spk: global_order[(start_idx + offset) % len(global_order)]
+        for offset, sub_spk in enumerate(sub_order)
+    }
+
+
+def _segment_overlaps_speaker_in_span(
+    seg: dict,
+    speaker: str,
+    span: dict,
+    context_segments: list[dict] | None,
+) -> bool:
+    for other in context_segments or []:
+        if str(other.get("speaker") or "") != speaker:
+            continue
+        if other["end"] <= span["start"] + 0.01 or other["start"] >= span["end"] - 0.01:
+            continue
+        if other["end"] <= seg["start"] + 0.01 or other["start"] >= seg["end"] - 0.01:
+            continue
+        return True
+    return False
+
+
+def _rebrand_span_replacement(
+    replacement: list[dict],
+    span: dict,
+    span_idx: int,
+    context_segments: list[dict] | None = None,
+) -> list[dict]:
+    """Map sub-pass speaker labels onto the global timeline.
+
+    Sub-passes return unrelated SPEAKER_00.. labels. The old dominant-voice
+    heuristic mis-assigned minority voices (e.g. sample01 SPEAKER_03 speech
+    labelled SPEAKER_04). Chronological mapping assigns sub-voices in time
+    order to the global speaker cycle starting at the span's speaker.
+    """
+    if not replacement:
+        return replacement
+
+    sub_order = _speakers_in_appearance_order(replacement)
+    if len(sub_order) <= 1:
+        return [{**seg, "speaker": span["speaker"]} for seg in replacement]
+
+    anchor = str(span.get("speaker") or "")
+    global_order = _global_order_for_span(span, span_idx, context_segments)
+    mapping = _sub_to_global_speaker_mapping(sub_order, global_order, anchor)
+
+    rebranded: list[dict] = []
+    for seg in replacement:
+        target = mapping.get(str(seg.get("speaker") or ""), span["speaker"])
+        if _segment_overlaps_speaker_in_span(seg, target, span, context_segments):
+            target = f"REFINE{span_idx}_{seg['speaker']}"
+        rebranded.append({**seg, "speaker": target})
+    return rebranded
+
+
 def _replace_interval_segments(
     segments: list[dict],
     interval: dict,
@@ -1565,6 +2090,216 @@ def _replace_interval_segments(
     return merged
 
 
+def _build_span_refine_kwargs(
+    kwargs: dict,
+    span_dur: float,
+    max_speakers: int,
+    retry_s: float,
+) -> dict:
+    span_kwargs = dict(kwargs)
+    if span_kwargs.get("num_speakers") and _env_bool("DIARIZATION_EXACT_NUM_SPEAKERS", False):
+        # Local sub-pass: allow pyannote to split voices inside one global label.
+        span_kwargs = {k: v for k, v in span_kwargs.items() if k != "num_speakers"}
+        if max_speakers > 0:
+            span_kwargs["max_speakers"] = max(4, max_speakers)
+    if span_dur >= retry_s * 0.5:
+        span_kwargs.setdefault("min_speakers", 2)
+    return span_kwargs
+
+
+def _diarize_span_maybe_on_cpu(
+    pipe,
+    audio_path: str,
+    span: dict,
+    span_kwargs: dict,
+    *,
+    cpu_subpass: bool,
+) -> list[dict]:
+    if cpu_subpass:
+        import torch
+
+        _move_pipeline_to_device(pipe, torch.device("cpu"), "short-span-refine")
+    try:
+        return _diarize_audio_span(
+            pipe, audio_path, span["start"], span["end"], span_kwargs,
+        )
+    finally:
+        if cpu_subpass:
+            try:
+                _move_pipeline_to_inference_device(pipe)
+            except RuntimeError:
+                pass
+
+
+def _should_force_span_split(
+    replacement: list[dict],
+    span_dur: float,
+    retry_s: float,
+    new_mega: float,
+    new_score: float,
+    old_score: float,
+    audio_duration_s: float,
+    *,
+    cpu_subpass: bool,
+) -> bool:
+    sub_speakers = len({str(s.get("speaker") or "") for s in replacement})
+    short_exact = (
+        _env_bool("DIARIZATION_EXACT_NUM_SPEAKERS", False)
+        and audio_duration_s > 0
+        and audio_duration_s < _env_float("DIARIZATION_MEGA_TURN_SHORT_AUDIO_S", 600.0)
+    )
+    force_split = (
+        _env_bool("DIARIZATION_EXACT_NUM_SPEAKERS", False)
+        and span_dur >= retry_s * 0.85
+        and len(replacement) >= 2
+        and sub_speakers >= 2
+        and new_mega < span_dur * 0.72
+        and new_score >= old_score - 0.01
+    )
+    if (
+        cpu_subpass
+        and short_exact
+        and len(replacement) >= 2
+        and sub_speakers >= 2
+        and _env_bool("DIARIZATION_FORCE_SHORT_REFINE_SPLIT", True)
+    ):
+        force_split = True
+    return force_split
+
+
+def _reject_span_refine(
+    old_score: float,
+    new_score: float,
+    new_mega: float,
+    span_dur: float,
+    force_split: bool,
+    refined: list[dict],
+) -> tuple[list[dict], bool, float] | None:
+    if new_score <= old_score and not force_split:
+        return refined, False, _max_segment_duration(refined)
+    if not force_split and new_score <= old_score and new_mega >= span_dur * 0.75:
+        return refined, False, new_mega
+    return None
+
+
+def _try_refine_long_span(
+    pipe,
+    audio_path: str,
+    span: dict,
+    span_idx: int,
+    refined: list[dict],
+    kwargs: dict,
+    audio_duration_s: float,
+    max_speakers: int,
+    *,
+    cpu_subpass: bool = False,
+) -> tuple[list[dict], bool, float]:
+    """Re-diarize one long span; return (segments, improved, longest_after)."""
+    from engines.diarization_sampling import score_segments
+
+    span_dur = span["end"] - span["start"]
+    logger.info(
+        "Re-diarizing long span %.1fs-%.1fs (%.1fs) for better speaker splits%s.",
+        span["start"],
+        span["end"],
+        span_dur,
+        " on CPU" if cpu_subpass else "",
+    )
+    retry_s = _env_float("DIARIZATION_MEGA_TURN_RETRY_S", 120.0)
+    span_kwargs = _build_span_refine_kwargs(kwargs, span_dur, max_speakers, retry_s)
+    replacement = _diarize_span_maybe_on_cpu(
+        pipe, audio_path, span, span_kwargs, cpu_subpass=cpu_subpass,
+    )
+    if not replacement:
+        return refined, False, _max_segment_duration(refined)
+    replacement = _rebrand_span_replacement(replacement, span, span_idx, refined)
+    candidate = _replace_interval_segments(refined, span, replacement)
+    old_score = score_segments(refined, audio_duration_s, max_speakers)
+    new_score = score_segments(candidate, audio_duration_s, max_speakers)
+    new_mega = _max_segment_duration(candidate)
+    force_split = _should_force_span_split(
+        replacement, span_dur, retry_s, new_mega, new_score, old_score,
+        audio_duration_s, cpu_subpass=cpu_subpass,
+    )
+    rejected = _reject_span_refine(
+        old_score, new_score, new_mega, span_dur, force_split, refined,
+    )
+    if rejected is not None:
+        return rejected
+    logger.info(
+        "Long-span refine accepted: score %.3f -> %.3f, longest=%.1fs.",
+        old_score,
+        new_score,
+        new_mega,
+    )
+    return candidate, True, new_mega
+
+
+def _mega_turn_refine_threshold_s(mega_turn_threshold_s: float | None) -> float:
+    if mega_turn_threshold_s is not None:
+        return mega_turn_threshold_s
+    return _env_float("DIARIZATION_MEGA_TURN_RETRY_S", 120.0)
+
+
+def _should_skip_mega_turn_refine(
+    segments: list[dict],
+    max_speakers: int,
+    audio_duration_s: float,
+    *,
+    allow_short_audio: bool,
+) -> bool:
+    from backend.asr_quality import is_accuracy_mode
+
+    if max_speakers < 2 or not segments:
+        return True
+    if not is_accuracy_mode() and not _refine_after_segmented_enabled():
+        return True
+    if max(0, _env_int("DIARIZATION_MEGA_TURN_MAX_REFINES", 10)) == 0:
+        return True
+    min_audio_s = _env_float("DIARIZATION_MEGA_TURN_MIN_AUDIO_S", 600.0)
+    return (
+        not allow_short_audio
+        and min_audio_s > 0
+        and audio_duration_s < min_audio_s
+    )
+
+
+def _teardown_vram_between_refines() -> None:
+    try:
+        from backend import vram_state
+
+        vram_state.teardown(aggressive=True)
+    except ImportError:
+        pass
+
+
+def _same_speaker_runs(
+    segments: list[dict],
+    *,
+    max_gap_s: float = 0.5,
+) -> list[dict]:
+    """Merge consecutive same-label diar segments into contiguous speaker runs."""
+    if not segments:
+        return []
+    ordered = sorted(segments, key=lambda seg: seg["start"])
+    runs: list[dict] = []
+    run_start = float(ordered[0]["start"])
+    run_end = float(ordered[0]["end"])
+    run_speaker = str(ordered[0].get("speaker") or "")
+    for seg in ordered[1:]:
+        gap = float(seg["start"]) - run_end
+        speaker = str(seg.get("speaker") or "")
+        if speaker == run_speaker and gap <= max_gap_s:
+            run_end = max(run_end, float(seg["end"]))
+        else:
+            runs.append({"start": run_start, "end": run_end, "speaker": run_speaker})
+            run_start = float(seg["start"])
+            run_end = float(seg["end"])
+            run_speaker = speaker
+    runs.append({"start": run_start, "end": run_end, "speaker": run_speaker})
+    return runs
+
+
 def _refine_long_diarization_spans(
     pipe,
     audio_path: str,
@@ -1573,27 +2308,46 @@ def _refine_long_diarization_spans(
     adaptive_params: dict | None,
     max_speakers: int,
     audio_duration_s: float,
+    *,
+    mega_turn_threshold_s: float | None = None,
+    allow_short_audio: bool = False,
 ) -> list[dict]:
     """Re-diarize spans where one speaker turn is implausibly long."""
-    from backend.asr_quality import is_accuracy_mode
-    from engines.diarization_sampling import score_segments
-
-    if not is_accuracy_mode() or max_speakers < 2 or not segments:
+    if _should_skip_mega_turn_refine(
+        segments, max_speakers, audio_duration_s, allow_short_audio=allow_short_audio,
+    ):
         return segments
 
-    threshold_s = _env_float("DIARIZATION_MEGA_TURN_RETRY_S", 120.0)
-    long_spans = [
-        seg for seg in segments
-        if seg["end"] - seg["start"] >= threshold_s
-    ]
+    max_refines = max(0, _env_int("DIARIZATION_MEGA_TURN_MAX_REFINES", 10))
+    threshold_s = _mega_turn_refine_threshold_s(mega_turn_threshold_s)
+    run_gap = min(0.5, max(0.0, _postprocess_merge_gap_s()))
+    if allow_short_audio:
+        run_gap = max(
+            run_gap,
+            _env_float("ASR_TURN_GUIDED_MERGE_GAP_S", 0.35),
+            _env_float("ASR_TURN_OUTPUT_MERGE_GAP_S", 0.0),
+        )
+    speaker_runs = _same_speaker_runs(segments, max_gap_s=run_gap)
+    long_spans = sorted(
+        (
+            run for run in speaker_runs
+            if run["end"] - run["start"] >= threshold_s
+        ),
+        key=lambda run: run["end"] - run["start"],
+        reverse=True,
+    )
     if not long_spans:
         return segments
 
+    if allow_short_audio:
+        # Reuse the warm pipeline — unload/reload between passes corrupts CUDA on 8 GB.
+        active_pipe = pipe
+    else:
+        active_pipe = _reload_diarization_pipeline_for_refine(pipe)
     retry_params = _mega_turn_retry_params(adaptive_params)
-    _instantiate_pipeline_params(pipe, retry_params, "mega-turn-retry")
+    _instantiate_pipeline_params(active_pipe, retry_params, "mega-turn-retry")
     refined = list(segments)
     improved = False
-    max_refines = max(0, _env_int("DIARIZATION_MEGA_TURN_MAX_REFINES", 10))
 
     for index, span in enumerate(long_spans):
         if index >= max_refines:
@@ -1603,35 +2357,315 @@ def _refine_long_diarization_spans(
                 len(long_spans) - index,
             )
             break
-        span_dur = span["end"] - span["start"]
-        logger.info(
-            "Re-diarizing long span %.1fs-%.1fs (%.1fs) for better speaker splits.",
-            span["start"],
-            span["end"],
-            span_dur,
+        refined, accepted, _longest = _try_refine_long_span(
+            active_pipe,
+            audio_path,
+            span,
+            index,
+            refined,
+            kwargs,
+            audio_duration_s,
+            max_speakers,
+            cpu_subpass=allow_short_audio
+            and _env_bool("DIARIZATION_SHORT_AUDIO_MEGA_REFINE_CPU", True),
         )
-        replacement = _diarize_audio_span(
-            pipe, audio_path, span["start"], span["end"], kwargs,
-        )
-        if not replacement:
-            continue
-        candidate = _replace_interval_segments(refined, span, replacement)
-        old_score = score_segments(refined, audio_duration_s, max_speakers)
-        new_score = score_segments(candidate, audio_duration_s, max_speakers)
-        new_mega = _max_segment_duration(candidate)
-        if new_score > old_score or new_mega < span_dur * 0.75:
-            refined = candidate
-            improved = True
-            logger.info(
-                "Long-span refine accepted: score %.3f -> %.3f, longest=%.1fs.",
-                old_score,
-                new_score,
-                new_mega,
-            )
+        improved = improved or accepted
+        if index + 1 < min(len(long_spans), max_refines):
+            _teardown_vram_between_refines()
 
     if improved and adaptive_params:
-        _instantiate_pipeline_params(pipe, adaptive_params, "adaptive-restore")
+        _instantiate_pipeline_params(active_pipe, adaptive_params, "adaptive-restore")
     return refined
+
+
+def _dominant_speaker_label(
+    durations: dict[str, float],
+    *,
+    min_share: float = 0.35,
+) -> str | None:
+    total_dur = sum(durations.values()) or 1.0
+    dominant_label: str | None = None
+    dominant_share = 0.0
+    for spk, dur in durations.items():
+        share = dur / total_dur
+        if share > dominant_share:
+            dominant_share = share
+            dominant_label = spk
+    if dominant_label is None or dominant_share < min_share:
+        return None
+    return dominant_label
+
+
+def _best_brief_alt_speaker(
+    similarity,
+    label_idx: dict[str, int],
+    dominant_label: str,
+    durations: dict[str, float],
+    *,
+    brief_threshold_s: float = 30.0,
+) -> str | None:
+    dom_idx = label_idx.get(dominant_label)
+    if dom_idx is None:
+        return None
+    best_alt = None
+    best_sim = -1.0
+    for alt_label, alt_idx in label_idx.items():
+        if alt_label == dominant_label:
+            continue
+        if durations.get(alt_label, 0.0) >= brief_threshold_s:
+            continue
+        sim = float(similarity[dom_idx, alt_idx])
+        if 0.68 <= sim < 0.80 and sim > best_sim:
+            best_sim = sim
+            best_alt = alt_label
+    return best_alt
+
+
+def _rescue_brief_dominant_segments(
+    segments: list[dict],
+    dominant_label: str,
+    label_idx: dict[str, int],
+    similarity,
+    durations: dict[str, float],
+) -> tuple[list[dict], int]:
+    rescued: list[dict] = []
+    next_id = 0
+    max_span_s = _env_float("DIARIZATION_BRIEF_RESCUE_MAX_SPAN_S", 8.0)
+    for seg in segments:
+        if seg["speaker"] != dominant_label:
+            rescued.append(seg)
+            continue
+        dur = seg["end"] - seg["start"]
+        if dur > max_span_s:
+            rescued.append(seg)
+            continue
+        best_alt = _best_brief_alt_speaker(
+            similarity, label_idx, dominant_label, durations,
+        )
+        if best_alt is None:
+            rescued.append(seg)
+            continue
+        new_label = f"BRIEF_{next_id}_{best_alt}"
+        next_id += 1
+        rescued.append({**seg, "speaker": new_label})
+        logger.info(
+            "Brief-speaker rescue: split %.1fs segment from %s (alt=%s).",
+            dur,
+            dominant_label,
+            best_alt,
+        )
+    return rescued, next_id
+
+
+def _recover_brief_speakers(
+    segments: list[dict],
+    max_speakers: int,
+) -> list[dict]:
+    """Split brief-voice clusters incorrectly absorbed into a dominant speaker."""
+    from backend.asr_quality import is_accuracy_mode
+
+    if not is_accuracy_mode() or max_speakers < 4 or not segments:
+        return segments
+    if _embedding_rescue_cache is None:
+        return segments
+
+    unique = len({s["speaker"] for s in segments})
+    if unique >= max_speakers:
+        return segments
+
+    labels, embeddings = _embedding_rescue_cache
+    import numpy as np
+
+    matrix = np.asarray(embeddings, dtype=float)
+    if matrix.ndim != 2 or len(labels) < 2:
+        return segments
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    unit = matrix / norms
+    similarity = unit @ unit.T
+    label_idx = {label: i for i, label in enumerate(labels)}
+    durations = _speaker_durations(segments)
+    dominant_label = _dominant_speaker_label(durations)
+    if dominant_label is None:
+        return segments
+
+    rescued, rescued_count = _rescue_brief_dominant_segments(
+        segments, dominant_label, label_idx, similarity, durations,
+    )
+    if rescued_count == 0:
+        return segments
+    return _merge_similar_speaker_clusters(rescued, max_speakers)
+
+
+def _intro_recovery_span_s() -> float:
+    return max(60.0, _env_float("DIARIZATION_INTRO_RECOVERY_SPAN_S", 240.0))
+
+
+def _intro_recovery_params() -> dict:
+    """Aggressive VBx params for the meeting intro / roll-call window."""
+    return {
+        "segmentation": {"min_duration_off": 0.03},
+        "clustering": {"threshold": 0.55, "Fa": 0.32, "Fb": 0.8},
+    }
+
+
+def _intro_recovery_end_s(audio_duration_s: float) -> float | None:
+    intro_end = min(_intro_recovery_span_s(), audio_duration_s)
+    if intro_end < 60.0 or audio_duration_s < intro_end + 30.0:
+        return None
+    return intro_end
+
+
+def _intro_window_looks_dominant(
+    intro_window: list[dict],
+    intro_durations: dict[str, float],
+) -> bool:
+    total_intro = sum(intro_durations.values()) or 1.0
+    dominant_share = (
+        max(intro_durations.values()) / total_intro if intro_durations else 0.0
+    )
+    max_intro_seg = _max_segment_duration(intro_window) if intro_window else 0.0
+    mega_t = _env_float("DIARIZATION_MEGA_TURN_RETRY_S", 45.0)
+    return dominant_share >= 0.38 or max_intro_seg >= mega_t * 0.85
+
+
+def _should_skip_intro_recovery(
+    segments: list[dict],
+    max_speakers: int,
+    intro_end: float,
+) -> bool:
+    from backend.asr_quality import is_accuracy_mode
+
+    if not _env_bool("DIARIZATION_INTRO_RECOVERY", True):
+        return True
+    if not is_accuracy_mode() or max_speakers < 8 or not segments:
+        return True
+    unique = len({s["speaker"] for s in segments})
+    intro_window = [seg for seg in segments if seg["start"] < intro_end - 0.01]
+    intro_durations = _speaker_durations(intro_window)
+    intro_dominant = _intro_window_looks_dominant(intro_window, intro_durations)
+    return unique >= max_speakers and not intro_dominant
+
+
+def _intro_recovery_kwargs(kwargs: dict, max_speakers: int) -> dict:
+    intro_kwargs = dict(kwargs)
+    extra = max(5, _overcluster_extra(max_speakers))
+    if max_speakers > 0:
+        intro_kwargs["num_speakers"] = max_speakers + extra
+        intro_kwargs.pop("max_speakers", None)
+    return intro_kwargs
+
+
+def _diarize_intro_window(
+    pipe,
+    audio_path: str,
+    intro_end: float,
+    intro_kwargs: dict,
+    adaptive_params: dict | None,
+    max_speakers: int,
+) -> list[dict]:
+    active_pipe = _reload_diarization_pipeline_for_refine(pipe)
+    _instantiate_pipeline_params(active_pipe, _intro_recovery_params(), "intro-recovery")
+    try:
+        intro_segments = _diarize_audio_span(
+            active_pipe, audio_path, 0.0, intro_end, intro_kwargs,
+        )
+        return _merge_similar_speaker_clusters(intro_segments, max_speakers)
+    finally:
+        if adaptive_params:
+            _instantiate_pipeline_params(active_pipe, adaptive_params, "adaptive-restore")
+
+
+def _build_intro_recovery_candidate(
+    segments: list[dict],
+    intro_segments: list[dict],
+    intro_end: float,
+    max_speakers: int,
+) -> list[dict]:
+    rebranded = [
+        {**seg, "speaker": f"INTRO_{idx}_{seg['speaker']}"}
+        for idx, seg in enumerate(intro_segments)
+    ]
+    interval = {"start": 0.0, "end": intro_end}
+    candidate = _replace_interval_segments(segments, interval, rebranded)
+    return _merge_similar_speaker_clusters(candidate, max_speakers)
+
+
+def _accept_intro_recovery_candidate(
+    segments: list[dict],
+    candidate: list[dict],
+    intro_segments: list[dict],
+    intro_end: float,
+    unique: int,
+    max_speakers: int,
+    audio_duration_s: float,
+) -> list[dict] | None:
+    from engines.diarization_sampling import score_segments
+
+    intro_unique = len({s["speaker"] for s in intro_segments})
+    main_intro = [seg for seg in segments if seg["start"] < intro_end - 0.01]
+    main_intro_unique = len({s["speaker"] for s in main_intro}) if main_intro else 0
+    if intro_unique <= main_intro_unique:
+        logger.info(
+            "Intro recovery did not increase intro-window speakers (%d -> %d).",
+            main_intro_unique,
+            intro_unique,
+        )
+        return None
+
+    old_score = score_segments(segments, audio_duration_s, max_speakers)
+    new_score = score_segments(candidate, audio_duration_s, max_speakers)
+    new_unique = len({s["speaker"] for s in candidate})
+    if new_score > old_score + 0.01 or new_unique > unique:
+        logger.info(
+            "Intro recovery accepted: speakers %d->%d score %.3f->%.3f.",
+            unique,
+            new_unique,
+            old_score,
+            new_score,
+        )
+        return candidate
+
+    logger.info("Intro recovery did not improve score; keeping first pass.")
+    return None
+
+
+def _recover_intro_speakers(
+    pipe,
+    audio_path: str,
+    segments: list[dict],
+    kwargs: dict,
+    adaptive_params: dict | None,
+    max_speakers: int,
+    audio_duration_s: float,
+) -> list[dict]:
+    """Re-diarize the intro window when large meetings miss brief voices."""
+    intro_end = _intro_recovery_end_s(audio_duration_s)
+    if intro_end is None or _should_skip_intro_recovery(segments, max_speakers, intro_end):
+        return segments
+
+    unique = len({s["speaker"] for s in segments})
+    logger.info(
+        "Intro speaker recovery: %d/%d speakers detected; re-diarizing 0-%.0fs.",
+        unique,
+        max_speakers,
+        intro_end,
+    )
+
+    intro_kwargs = _intro_recovery_kwargs(kwargs, max_speakers)
+    intro_segments = _diarize_intro_window(
+        pipe, audio_path, intro_end, intro_kwargs, adaptive_params, max_speakers,
+    )
+    if not intro_segments:
+        return segments
+
+    candidate = _build_intro_recovery_candidate(
+        segments, intro_segments, intro_end, max_speakers,
+    )
+    accepted = _accept_intro_recovery_candidate(
+        segments, candidate, intro_segments, intro_end, unique, max_speakers, audio_duration_s,
+    )
+    return accepted if accepted is not None else segments
 
 
 def _remap_speakers(segments: list[dict]) -> dict:
@@ -1888,10 +2922,15 @@ def _diarization_ui_override(
     seg_min_duration_off: float | None,
     clust_threshold: float | None,
     clust_min_size: int | None,
+    vbx_fa: float | None = None,
+    vbx_fb: float | None = None,
 ) -> bool:
     return any(
         value is not None
-        for value in (seg_threshold, seg_min_duration_off, clust_threshold, clust_min_size)
+        for value in (
+            seg_threshold, seg_min_duration_off, clust_threshold, clust_min_size,
+            vbx_fa, vbx_fb,
+        )
     )
 
 
@@ -1904,6 +2943,8 @@ def _configure_diarization_pipeline(
     clust_min_size: int | None,
     max_speakers: int,
     audio_duration_s: float,
+    vbx_fa: float | None = None,
+    vbx_fb: float | None = None,
 ) -> dict | None:
     if ui_override:
         _instantiate_pipeline_params(
@@ -1913,12 +2954,17 @@ def _configure_diarization_pipeline(
                 seg_min_duration_off,
                 clust_threshold,
                 clust_min_size,
+                vbx_fa,
+                vbx_fb,
             ),
             "UI override",
         )
         return None
 
     from backend.asr_quality import is_accuracy_mode
+
+    if _env_bool("DIARIZATION_LOCK_PARAMS", False):
+        return None
 
     adaptive_params: dict | None
     if is_accuracy_mode():
@@ -1975,7 +3021,9 @@ def _run_waveform_diarization_on_input(
             winner,
             score,
         )
-        segments = _execute_pyannote_pass(pipe, audio_input, kwargs)
+        segments = _merge_similar_speaker_clusters(
+            _execute_pyannote_pass(pipe, audio_input, kwargs), max_speakers,
+        )
     elif use_multi_sample:
         segments, winner, score = run_multi_sample_diarization(
             lambda params, label: _instantiate_pipeline_params(pipe, params, label),
@@ -1986,8 +3034,11 @@ def _run_waveform_diarization_on_input(
             param_filter=param_filter,
         )
         logger.info("Multi-sample diarization selected config %s (score=%.4f).", winner, score)
+        segments = _merge_similar_speaker_clusters(segments, max_speakers)
     else:
-        segments = _execute_pyannote_pass(pipe, audio_input, kwargs)
+        segments = _merge_similar_speaker_clusters(
+            _execute_pyannote_pass(pipe, audio_input, kwargs), max_speakers,
+        )
     return _maybe_retry_single_speaker(
         pipe, audio_input, kwargs, segments, adaptive_params,
         ui_override, num_speakers, max_speakers, audio_duration_s,
@@ -2078,16 +3129,15 @@ def _run_waveform_diarization(
             len(best_segments),
         )
 
-    return _refine_long_diarization_spans(
-        pipe, audio_path, best_segments, kwargs, adaptive_params,
-        max_speakers, audio_duration_s,
-    )
+    return best_segments
 
 
 def _finalize_diarization_segments(
     segments: list[dict],
     num_speakers: int,
     max_speakers: int,
+    *,
+    postprocess: bool = True,
 ) -> list[dict]:
     unique_raw = sorted({s["speaker"] for s in segments})
     logger.info(
@@ -2107,20 +3157,58 @@ def _finalize_diarization_segments(
             "Pyannote detected only 1 speaker but max_speakers=%d.",
             max_speakers,
         )
-    segments = _postprocess_diarization_segments(segments, max_speakers)
+    if postprocess:
+        segments = _postprocess_diarization_segments(segments, max_speakers)
     speaker_map = _remap_speakers(segments)
     logger.info("Diarization complete: %d segments, speaker map: %s", len(segments), speaker_map)
     return segments
+
+
+def _maybe_refine_short_audio_spans(
+    pipe,
+    audio_path: str,
+    segments: list[dict],
+    kwargs: dict,
+    adaptive_params: dict | None,
+    max_speakers: int,
+    audio_duration_s: float,
+) -> list[dict]:
+    """CPU mega-turn refine after recovery — targets merged same-speaker runs."""
+    if max(0, _env_int("DIARIZATION_MEGA_TURN_MAX_REFINES", 10)) == 0:
+        return segments
+    if not _env_bool("DIARIZATION_SHORT_AUDIO_MEGA_REFINE", False):
+        return segments
+    short_max_s = _env_float("DIARIZATION_MEGA_TURN_SHORT_AUDIO_S", 600.0)
+    if short_max_s > 0 and audio_duration_s >= short_max_s:
+        return segments
+    mega_threshold = min(
+        30.0,
+        max(18.0, _env_float("DIARIZATION_MEGA_TURN_RETRY_S", 45.0) * 0.85),
+    )
+    return _refine_long_diarization_spans(
+        pipe,
+        audio_path,
+        segments,
+        kwargs,
+        adaptive_params,
+        max_speakers,
+        audio_duration_s,
+        mega_turn_threshold_s=mega_threshold,
+        allow_short_audio=True,
+    )
 
 
 def diarize(
     audio_path: str, num_speakers: int = 0,
     max_speakers: int = 0,
     audio_duration_s: float = 0.0,
+    min_speakers_hint: int = 0,
     seg_threshold: float | None = None,
     seg_min_duration_off: float | None = None,
     clust_threshold: float | None = None,
     clust_min_size: int | None = None,
+    vbx_fa: float | None = None,
+    vbx_fb: float | None = None,
 ) -> list[dict]:
     """Run speaker diarization on audio file.
 
@@ -2136,6 +3224,7 @@ def diarize(
 
         ui_override = _diarization_ui_override(
             seg_threshold, seg_min_duration_off, clust_threshold, clust_min_size,
+            vbx_fa, vbx_fb,
         )
         adaptive_params = _configure_diarization_pipeline(
             pipe,
@@ -2146,10 +3235,18 @@ def diarize(
             clust_min_size,
             max_speakers,
             audio_duration_s,
+            vbx_fa,
+            vbx_fb,
         )
 
-        kwargs = _build_diarize_kwargs(num_speakers, max_speakers, audio_duration_s)
-        segment_min_s = max(0, _env_int("DIARIZATION_SEGMENT_LONG_AUDIO_MIN_S", 3600))
+        kwargs = _build_diarize_kwargs(
+            num_speakers, max_speakers, audio_duration_s, min_speakers_hint,
+        )
+        # Single-pass global clustering up to 2 h: segmented mode re-clusters
+        # each chunk independently and chains labels through overlap zones,
+        # which fragments/merges speakers on multi-speaker meetings. One pass
+        # over 2 h of 16 kHz mono fits comfortably in RAM/VRAM.
+        segment_min_s = max(0, _env_int("DIARIZATION_SEGMENT_LONG_AUDIO_MIN_S", 7200))
         use_segmented = (
             audio_duration_s > segment_min_s
             and _env_bool("DIARIZATION_SEGMENT_LONG_AUDIO", True)
@@ -2176,13 +3273,40 @@ def diarize(
                     "Skipping mega-turn diarization refine after segmented pass "
                     "(DIARIZATION_REFINE_AFTER_SEGMENTED=false).",
                 )
+            segments = _maybe_retry_dominant_diarization(
+                pipe,
+                audio_path,
+                segments,
+                kwargs,
+                adaptive_params,
+                max_speakers,
+                audio_duration_s,
+                min_speakers_hint,
+            )
         else:
             segments = _run_waveform_diarization(
                 pipe, audio_path, kwargs, audio_duration_s, max_speakers,
                 adaptive_params, ui_override, num_speakers,
             )
 
-        segments = _finalize_diarization_segments(segments, num_speakers, max_speakers)
+        segments = _recover_intro_speakers(
+            pipe, audio_path, segments, kwargs, adaptive_params,
+            max_speakers, audio_duration_s,
+        )
+        segments = _recover_brief_speakers(segments, max_speakers)
+        segments = _postprocess_diarization_segments(segments, max_speakers)
+        segments = _maybe_refine_short_audio_spans(
+            pipe,
+            audio_path,
+            segments,
+            kwargs,
+            adaptive_params,
+            max_speakers,
+            audio_duration_s,
+        )
+        segments = _finalize_diarization_segments(
+            segments, num_speakers, max_speakers, postprocess=False,
+        )
         _record_inference_device()
         vram_state.log_phase("diarize", before=False)
         return segments
@@ -2204,9 +3328,10 @@ def _maybe_retry_single_speaker(
 
     unique_raw = sorted({s["speaker"] for s in segments})
     skip_for_override = ui_override and not is_accuracy_mode()
+    exact = _env_bool("DIARIZATION_EXACT_NUM_SPEAKERS", False)
     if (
         skip_for_override
-        or num_speakers > 0
+        or (exact and num_speakers > 0)
         or len(unique_raw) != 1
         or max_speakers < 2
         or audio_duration_s < 5.0
@@ -2236,6 +3361,77 @@ def _maybe_retry_single_speaker(
         )
         return retry_segments
     logger.info("Diarization retry did not increase speaker count; keeping first pass.")
+    return segments
+
+
+def _maybe_retry_dominant_diarization(
+    pipe,
+    audio_path: str,
+    segments: list[dict],
+    kwargs: dict,
+    adaptive_params: dict | None,
+    max_speakers: int,
+    audio_duration_s: float,
+    min_speakers_hint: int = 0,
+) -> list[dict]:
+    """Re-run mega-turn refine when one speaker owns most of the timeline."""
+    from engines.diarization_sampling import score_segments
+
+    if max_speakers < 2 or not segments or audio_duration_s < 30.0:
+        return segments
+
+    dominance, unique = _dominant_speaker_share(segments)
+    min_expected = min_speakers_hint if min_speakers_hint > 0 else 2
+    ratio_threshold = _env_float("DIARIZATION_DOMINANCE_RETRY_RATIO", 0.82)
+    needs_retry = (
+        unique < min_expected
+        or (unique >= 2 and dominance > ratio_threshold)
+    )
+    if not needs_retry:
+        return segments
+
+    logger.warning(
+        "Diarization dominance retry: share=%.1f%% speakers=%d (threshold=%.0f%%, min=%d).",
+        dominance * 100.0,
+        unique,
+        ratio_threshold * 100.0,
+        min_expected,
+    )
+    aggressive_threshold = min(
+        30.0,
+        _env_float("DIARIZATION_MEGA_TURN_RETRY_S", 45.0) * 0.65,
+    )
+    refined = _refine_long_diarization_spans(
+        pipe,
+        audio_path,
+        segments,
+        kwargs,
+        adaptive_params,
+        max_speakers,
+        audio_duration_s,
+        mega_turn_threshold_s=aggressive_threshold,
+        allow_short_audio=True,
+    )
+    new_dominance, new_unique = _dominant_speaker_share(refined)
+    old_score = score_segments(segments, audio_duration_s, max_speakers)
+    new_score = score_segments(refined, audio_duration_s, max_speakers)
+    improved = (
+        new_unique > unique
+        or new_dominance < dominance - 0.03
+        or new_score > old_score + 0.02
+    )
+    if improved:
+        logger.info(
+            "Dominance retry accepted: speakers %d->%d share %.1f%%->%.1f%% score %.3f->%.3f.",
+            unique,
+            new_unique,
+            dominance * 100.0,
+            new_dominance * 100.0,
+            old_score,
+            new_score,
+        )
+        return refined
+    logger.info("Dominance retry did not improve diarization; keeping first pass.")
     return segments
 
 
@@ -2789,28 +3985,68 @@ def _collect_text_for_interval(
     consumed: dict[int, set[int]] | None = None,
 ) -> str:
     """Collect ASR text overlapping one diarization turn (exclusive unit assignment)."""
+    text, _, _ = _collect_text_and_bounds_for_interval(
+        timeline, iv_start, iv_end, consumed,
+    )
+    return text
+
+
+def _chunk_overlap_slice(
+    item: dict,
+    ti: int,
+    iv_start: float,
+    iv_end: float,
+    min_overlap_s: float,
+    consumed: dict[int, set[int]] | None,
+) -> tuple[tuple[float, str] | None, float | None, float | None]:
+    """Return (text part, bound_start, bound_end) for one timeline chunk."""
+    cs, ce, text = item["start"], item["end"], item["text"]
+    overlap_start = max(cs, iv_start)
+    overlap_end = min(ce, iv_end)
+    if overlap_end - overlap_start < min_overlap_s:
+        return None, None, None
+    unit_count = _text_unit_count(text)
+    if unit_count == 0:
+        return None, None, None
+    i0, i1 = _word_indices_for_overlap(cs, ce, overlap_start, overlap_end, unit_count)
+    if consumed is None:
+        sliced = _slice_text_for_interval(text, cs, ce, overlap_start, overlap_end)
+        if not sliced:
+            return None, None, None
+        return (overlap_start, sliced), overlap_start, overlap_end
+    sliced = _exclusive_words_for_overlap(text, consumed, ti, i0, i1)
+    if not sliced:
+        return None, None, None
+    word_start = cs + (i0 / max(1, unit_count)) * (ce - cs)
+    word_end = cs + (i1 / max(1, unit_count)) * (ce - cs)
+    return (overlap_start, sliced), word_start, word_end
+
+
+def _collect_text_and_bounds_for_interval(
+    timeline: list[dict],
+    iv_start: float,
+    iv_end: float,
+    consumed: dict[int, set[int]] | None = None,
+) -> tuple[str, float | None, float | None]:
+    """Collect ASR text and timestamp bounds from overlapping timeline chunks."""
     min_overlap_s = _env_float("DIARIZATION_MIN_OVERLAP_S", 0.04)
     parts: list[tuple[float, str]] = []
+    bound_start: float | None = None
+    bound_end: float | None = None
     for ti, item in enumerate(timeline):
-        cs, ce, text = item["start"], item["end"], item["text"]
-        overlap_start = max(cs, iv_start)
-        overlap_end = min(ce, iv_end)
-        if overlap_end - overlap_start < min_overlap_s:
+        part, chunk_start, chunk_end = _chunk_overlap_slice(
+            item, ti, iv_start, iv_end, min_overlap_s, consumed,
+        )
+        if part is None:
             continue
-        unit_count = _text_unit_count(text)
-        if unit_count == 0:
-            continue
-        i0, i1 = _word_indices_for_overlap(cs, ce, overlap_start, overlap_end, unit_count)
-        if consumed is None:
-            sliced = _slice_text_for_interval(text, cs, ce, overlap_start, overlap_end)
-            if sliced:
-                parts.append((overlap_start, sliced))
-            continue
-        sliced = _exclusive_words_for_overlap(text, consumed, ti, i0, i1)
-        if sliced:
-            parts.append((overlap_start, sliced))
+        parts.append(part)
+        if chunk_start is not None:
+            bound_start = chunk_start if bound_start is None else min(bound_start, chunk_start)
+        if chunk_end is not None:
+            bound_end = chunk_end if bound_end is None else max(bound_end, chunk_end)
     parts.sort(key=lambda pair: pair[0])
-    return " ".join(fragment for _, fragment in parts).strip()
+    text_out = " ".join(fragment for _, fragment in parts).strip()
+    return text_out, bound_start, bound_end
 
 
 def _turns_for_transcript(
@@ -2948,14 +4184,16 @@ def _assign_speakers_by_turns(
     lines: list[str] = []
     consumed: dict[int, set[int]] = {}
     for turn in turns:
-        text = _collect_text_for_interval(
+        text, ts_start, ts_end = _collect_text_and_bounds_for_interval(
             timeline, turn["start"], turn["end"], consumed,
         )
+        line_start = ts_start if ts_start is not None else turn["start"]
+        line_end = ts_end if ts_end is not None else turn["end"]
         _append_turn_line(
             lines,
             turn["speaker"],
-            turn["start"],
-            turn["end"],
+            line_start,
+            line_end,
             text,
         )
 
@@ -2995,8 +4233,35 @@ def _assignment_is_imbalanced(
     if total <= 0:
         return False
     dominance = max(counts.values()) / total
-    threshold = _env_float("DIARIZATION_ASSIGN_IMBALANCE_RATIO", 0.78)
+    threshold = _env_float("DIARIZATION_ASSIGN_IMBALANCE_RATIO", 0.65)
     return dominance > threshold
+
+
+def _assignment_underuses_speakers(
+    lines: list[str],
+    diarization_segments: list[dict],
+) -> bool:
+    """True when diarization found several voices but text sits on too few labels."""
+    diar_speakers = {seg["speaker"] for seg in diarization_segments}
+    if len(diar_speakers) < 3:
+        return False
+    counts = _speaker_char_balance(lines)
+    min_chars = max(20, _env_int("DIARIZATION_ASSIGN_MIN_SPEAKER_CHARS", 20))
+    active = sum(1 for count in counts.values() if count >= min_chars)
+    ratio = active / len(diar_speakers)
+    threshold = _env_float("DIARIZATION_ASSIGN_SPEAKER_USE_RATIO", 0.70)
+    return ratio < threshold
+
+
+def _should_use_chunk_assignment(
+    lines: list[str],
+    diarization_segments: list[dict],
+    max_speakers: int,
+) -> bool:
+    return (
+        _assignment_is_imbalanced(lines, diarization_segments, max_speakers)
+        or _assignment_underuses_speakers(lines, diarization_segments)
+    )
 
 
 def _assign_speakers_by_chunks(
@@ -3072,9 +4337,9 @@ def assign_speakers(
     lines = _assign_speakers_by_turns(
         result, diarization_segments, max_speakers, audio_duration_s,
     )
-    if _assignment_is_imbalanced(lines, diarization_segments, max_speakers):
+    if _should_use_chunk_assignment(lines, diarization_segments, max_speakers):
         logger.warning(
-            "Turn-centric speaker assignment imbalanced (speakers=%s); "
+            "Turn-centric speaker assignment poor (speakers=%s); "
             "retrying chunk-centric split.",
             _speaker_char_balance(lines),
         )

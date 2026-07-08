@@ -24,44 +24,49 @@ def _install_root() -> str:
 
 
 _root = _install_root()
-_model_root = os.getenv("APP_MODEL_ROOT") or os.path.join(_root, "models")
-if not os.path.isabs(_model_root):
-    _model_root = os.path.normpath(os.path.join(_root, _model_root))
-_hf_home = os.path.join(_model_root, "hf_cache")
-os.environ.setdefault("APP_MODEL_ROOT", _model_root)
-os.environ.setdefault("HF_HOME", _hf_home)
-os.environ.setdefault("HF_HUB_CACHE", os.path.join(_hf_home, "hub"))
-os.environ.setdefault("HUGGINGFACE_HUB_CACHE", os.path.join(_hf_home, "hub"))
-os.environ.setdefault("TORCH_HOME", os.path.join(_model_root, "torch"))
-os.environ.setdefault("OV_CACHE_DIR", os.path.join(_model_root, "ov_cache"))
-
-for _cache_dir in [
-    os.environ["APP_MODEL_ROOT"],
-    os.environ["HF_HOME"],
-    os.environ["HF_HUB_CACHE"],
-    os.environ["TORCH_HOME"],
-    os.environ["OV_CACHE_DIR"],
-]:
-    os.makedirs(_cache_dir, exist_ok=True)
-
 for _env_name in (".env", ".env.production"):
     _env_path = os.path.join(_root, _env_name)
     if os.path.isfile(_env_path):
         try:
             from dotenv import load_dotenv
 
-            load_dotenv(_env_path, override=_env_name == ".env")
+            load_dotenv(_env_path, override=False)
         except ImportError:
             break
 
 try:
-    from engines.model_cache import apply_runtime_cache_env_defaults, consolidate_misplaced_hub_caches
+    from engines.model_cache import (
+        apply_runtime_cache_env_defaults,
+        configure_project_cache_paths,
+        consolidate_misplaced_hub_caches,
+    )
     from engines.openvino_compat import apply_openvino_whisper_compat
 
+    configure_project_cache_paths(_root)
     apply_runtime_cache_env_defaults()
     consolidate_misplaced_hub_caches(_root)
     apply_openvino_whisper_compat()
 except ImportError:
+    _model_root = os.getenv("APP_MODEL_ROOT") or os.path.join(_root, "models")
+    if not os.path.isabs(_model_root):
+        _model_root = os.path.normpath(os.path.join(_root, _model_root))
+    _hf_home = os.path.join(_model_root, "hf_cache")
+    os.environ.setdefault("APP_MODEL_ROOT", _model_root)
+    os.environ.setdefault("HF_HOME", _hf_home)
+    os.environ.setdefault("HF_HUB_CACHE", os.path.join(_hf_home, "hub"))
+    os.environ.setdefault("HUGGINGFACE_HUB_CACHE", os.path.join(_hf_home, "hub"))
+    os.environ.setdefault("TRANSFORMERS_CACHE", os.path.join(_hf_home, "hub"))
+    os.environ.setdefault("TORCH_HOME", os.path.join(_model_root, "torch"))
+    os.environ.setdefault("OV_CACHE_DIR", os.path.join(_model_root, "ov_cache"))
+
+    for _cache_dir in [
+        os.environ["APP_MODEL_ROOT"],
+        os.environ["HF_HOME"],
+        os.environ["HF_HUB_CACHE"],
+        os.environ["TORCH_HOME"],
+        os.environ["OV_CACHE_DIR"],
+    ]:
+        os.makedirs(_cache_dir, exist_ok=True)
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
     os.environ.setdefault("APP_AUTO_DOWNLOAD_MISSING_MODELS", "false")

@@ -33,6 +33,7 @@ from backend.services.media_pipeline import (
     clear_diarization_model,
     diarize_audio,
     enhance_audio,
+    enhance_audio_for_asr,
     normalize_media,
     stage_audio_for_inference,
 )
@@ -203,28 +204,15 @@ def _run_diarization(
         logger.info("Diarization finished: segments=%d", len(segments))
         return segments
     except Exception as exc:  # pylint: disable=broad-exception-caught
-        msg = str(exc)
-        if (
-            "is not in the local cache" in msg
-            or "offline" in msg.lower()
-            or "local_files_only" in msg.lower()
-        ):
-            logger.warning(
-                "Diarization skipped (offline cache missing): %s",
-                msg,
-            )
-            return None
         logger.exception("Diarization failed: %s", exc)
         return None
     finally:
         _phase_teardown("diarize", aggressive=True)
-        _debug_vram_snapshot("after-diarization", "H2")
         from engines.diarization import release_after_job
 
         release_after_job()
         clear_accelerator_cache()
         gc.collect()
-        _debug_vram_snapshot("after-diarization-release", "H2")
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -238,6 +226,10 @@ def _resolve_enhance(enhance: bool, diarization: bool) -> bool:
     if enhance:
         return True
     return diarization and _env_bool("AUDIO_ENHANCE_WHEN_DIARIZATION", False)
+
+
+def _enhance_asr_only() -> bool:
+    return _env_bool("AUDIO_ENHANCE_ASR_ONLY", False)
 
 
 def _success_result(
@@ -348,9 +340,12 @@ def _prepare_selected_asr_model(selected: list[str], *, after_diarization: bool 
     selected_engine = selected[0]
     cuda_ok = True
     try:
-        from backend.vram_state import cuda_device_healthy
+        from backend.vram_state import ensure_cuda_healthy_or_restart
 
-        cuda_ok = cuda_device_healthy()
+        # Fail-fast + self-heal: a dead CUDA context (host GPU reset / WSL2
+        # contention) cannot be rebuilt in-process, so this restarts the
+        # service to get a fresh context instead of limping into a doomed load.
+        cuda_ok = ensure_cuda_healthy_or_restart(f"{selected_engine} ASR load")
     except ImportError:
         pass
     if (
@@ -510,12 +505,15 @@ def _apply_enhancement(
     enhance: bool,
     progress: JobProgress | None,
     temp_files: list[str],
+    *,
+    asr_only: bool = False,
 ) -> str:
     if not enhance:
         return process_path
     if progress is not None:
         progress.set_phase("enhance", "Enhancing audio\u2026", 18)
-    enhanced_path = enhance_audio(process_path)
+    enhance_fn = enhance_audio_for_asr if asr_only else enhance_audio
+    enhanced_path = enhance_fn(process_path)
     if enhanced_path != process_path:
         temp_files.append(enhanced_path)
     return enhanced_path
@@ -540,42 +538,6 @@ def _unload_asr_for_diarization() -> None:
     except (ImportError, RuntimeError, OSError):
         pass
     clear_accelerator_cache()
-    _debug_vram_snapshot("after-asr-unload-for-diarization", "H1")
-
-
-def _debug_vram_snapshot(stage: str, hypothesis_id: str) -> None:
-    # #region agent log
-    try:
-        import json
-        import time
-
-        from backend.paths import app_root
-
-        data: dict = {"stage": stage}
-        try:
-            import torch
-
-            if torch.cuda.is_available():
-                data["cuda_allocated_mb"] = round(torch.cuda.memory_allocated() / (1024 ** 2), 1)
-                data["cuda_reserved_mb"] = round(torch.cuda.memory_reserved() / (1024 ** 2), 1)
-                props = torch.cuda.get_device_properties(0)
-                data["cuda_total_mb"] = round(props.total_memory / (1024 ** 2), 1)
-        except (ImportError, RuntimeError, OSError):
-            pass
-        payload = {
-            "sessionId": "cebbe8",
-            "runId": "oom-fix",
-            "hypothesisId": hypothesis_id,
-            "location": "backend/pipeline.py",
-            "message": "vram snapshot",
-            "data": data,
-            "timestamp": int(time.time() * 1000),
-        }
-        with (app_root() / "debug-cebbe8.log").open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
-    except OSError:
-        pass
-    # #endregion
 
 
 def _maybe_diarize(
@@ -588,27 +550,157 @@ def _maybe_diarize(
     if not diarization:
         return None
     _unload_asr_for_diarization()
+    try:
+        from backend import vram_state
+
+        vram_state.ensure_cuda_healthy_or_restart("diarization")
+        vram_state.teardown(aggressive=False)
+    except ImportError:
+        pass
     if progress is not None:
         progress.set_phase("diarize", "Running speaker diarization\u2026", 32)
-    return _run_diarization(process_path, diarization, speaker_limit, diarize_kwargs=diarize_kwargs)
+    segments = _run_diarization(process_path, diarization, speaker_limit, diarize_kwargs=diarize_kwargs)
+    if segments is not None:
+        logger.info("Unloading diarization model before ASR to free GPU VRAM.")
+        try:
+            from backend.model_registry import unload_diarization_model
+            from backend import vram_state
+
+            unload_diarization_model()
+            vram_state.teardown(aggressive=True)
+            vram_state.apply_cuda_memory_fraction()
+        except ImportError:
+            clear_accelerator_cache()
+    return segments
+
+
+def _prepare_job_enhance_flags(
+    ctx: TranscriptionStageContext,
+    speaker_limit: int,
+) -> tuple[bool, bool]:
+    """Resolve enhance / adaptive-enhance flags and apply duration profiles."""
+    enhance = _resolve_enhance(ctx.enhance, ctx.diarization)
+    adaptive_enhance = _env_bool("AUDIO_ENHANCE_ADAPTIVE", False) and ctx.diarization
+    from backend.asr_quality import (
+        apply_enhance_profile,
+        apply_two_speaker_overrides,
+        enhance_asr_only_enabled,
+    )
+
+    if not (enhance or adaptive_enhance):
+        return enhance, adaptive_enhance
+    probe_duration_s = audio_duration_seconds(ctx.media_path)
+    apply_enhance_profile(probe_duration_s, speaker_limit)
+    apply_two_speaker_overrides(speaker_limit)
+    if adaptive_enhance and not enhance:
+        enhance = _resolve_enhance(False, ctx.diarization) or enhance_asr_only_enabled()
+    return enhance, adaptive_enhance
+
+
+def _normalize_and_stage_audio(
+    ctx: TranscriptionStageContext,
+    *,
+    enhance: bool,
+    adaptive_enhance: bool,
+    temp_files: list[str],
+) -> tuple[str, float]:
+    """Normalize, optionally enhance, and stage audio for inference."""
+    from backend.asr_quality import enhance_asr_only_enabled
+
+    ctx.phase("normalize", "Normalizing media\u2026", 8)
+    process_path = normalize_media(ctx.media_path, ctx.job_id)
+    if process_path != ctx.media_path:
+        temp_files.append(process_path)
+    logger.info("Job %s normalized media path: %s", ctx.job_id, process_path)
+    _check_cancel(ctx.cancel_event)
+
+    audio_duration_s = audio_duration_seconds(process_path)
+    if enhance or adaptive_enhance:
+        from backend.asr_quality import apply_short_audio_asr_overrides
+
+        apply_short_audio_asr_overrides(audio_duration_s)
+
+    enhance_before_diar = enhance and not enhance_asr_only_enabled()
+    process_path = _apply_enhancement(
+        process_path, enhance_before_diar, ctx.progress, temp_files,
+    )
+    if enhance_before_diar:
+        logger.info("Job %s enhanced audio path: %s", ctx.job_id, process_path)
+    _check_cancel(ctx.cancel_event)
+    staged = stage_audio_for_inference(process_path, ctx.job_id)
+    if staged != process_path:
+        temp_files.append(staged)
+        process_path = staged
+    if ctx.progress is not None:
+        ctx.progress.set_audio_duration(audio_duration_s)
+    logger.info("Job %s audio duration: %.2fs", ctx.job_id, audio_duration_s)
+    return process_path, audio_duration_s
+
+
+def _run_transcription_asr_phase(
+    ctx: TranscriptionStageContext,
+    process_path: str,
+    selected: list[str],
+    speaker_limit: int,
+    diar_segments: list[dict] | None,
+    temp_files: list[str],
+) -> tuple[dict[str, dict], int]:
+    """Prepare ASR models and transcribe all selected engines."""
+    from backend.asr_quality import enhance_asr_only_enabled
+
+    if enhance_asr_only_enabled() and ctx.diarization:
+        asr_path = _apply_enhancement(
+            process_path, True, ctx.progress, temp_files, asr_only=True,
+        )
+        if asr_path != process_path:
+            process_path = asr_path
+            logger.info("Job %s ASR-only enhanced path: %s", ctx.job_id, process_path)
+
+    if ctx.progress is not None:
+        ctx.progress.set_phase("prepare", "Preparing ASR model\u2026", 40)
+    _prepare_selected_asr_model(selected, after_diarization=diar_segments is not None)
+    if ctx.progress is not None:
+        ctx.progress.set_phase("asr_prepare", "Loading ASR model on GPU\u2026", 45)
+
+    def _window_progress(current: int, total: int) -> None:
+        if ctx.progress is not None:
+            ctx.progress.set_asr_window(current, total)
+
+    ctx.phase("asr", "Transcribing on GPU\u2026", 45)
+    results, workers = _run_asr_engines(
+        ctx.job_id,
+        selected,
+        process_path,
+        ctx.language,
+        diar_segments,
+        ctx.cancel_event,
+        window_progress=_window_progress,
+        max_speakers=speaker_limit,
+        output_name=ctx.meta.output_name,
+    )
+    return results, workers, process_path
 
 
 def _execute_transcription_stages(
     ctx: TranscriptionStageContext,
-) -> tuple[str, list[str], int, dict, int, float, list[str]]:
+) -> tuple[str, list[str], int, dict, int, float, list[str], list[dict] | None]:
     """Normalize, diarize, transcribe; return job artifacts or raise on cancel."""
     if ctx.progress is not None:
         ctx.progress.set_job_id(ctx.job_id)
-    enhance = _resolve_enhance(ctx.enhance, ctx.diarization)
     logger.info(
-        "Job %s started: source=%s engines=%s language=%s diarization=%s enhance=%s",
+        "Job %s started: source=%s engines=%s language=%s diarization=%s",
         ctx.job_id,
         ctx.media_path,
         ctx.selected_engines,
         ctx.language,
         ctx.diarization,
-        enhance,
     )
+    try:
+        from backend import vram_state
+
+        vram_state.prepare_exclusive_gpu_job(unload_models=True)
+    except ImportError:
+        pass
     if ctx.manifest_sync:
         ctx.manifest_sync({
             "status": "running",
@@ -622,29 +714,19 @@ def _execute_transcription_stages(
         archived = copy_input_file(ctx.media_path, ctx.job_id, ctx.meta.source_filename)
         if archived:
             logger.info("Job %s archived upload: %s", ctx.job_id, archived)
-    ctx.phase("normalize", "Normalizing media\u2026", 8)
-    process_path = normalize_media(ctx.media_path, ctx.job_id)
-    if process_path != ctx.media_path:
-        temp_files.append(process_path)
-    logger.info("Job %s normalized media path: %s", ctx.job_id, process_path)
-    _check_cancel(ctx.cancel_event)
-    process_path = _apply_enhancement(process_path, enhance, ctx.progress, temp_files)
-    if enhance:
-        logger.info("Job %s enhanced audio path: %s", ctx.job_id, process_path)
-    _check_cancel(ctx.cancel_event)
-    staged = stage_audio_for_inference(process_path, ctx.job_id)
-    if staged != process_path:
-        temp_files.append(staged)
-        process_path = staged
-    audio_duration_s = audio_duration_seconds(process_path)
-    if ctx.progress is not None:
-        ctx.progress.set_audio_duration(audio_duration_s)
-    logger.info("Job %s audio duration: %.2fs", ctx.job_id, audio_duration_s)
+
+    speaker_limit = _speaker_limit(ctx.diarization, ctx.max_speakers)
+    enhance, adaptive_enhance = _prepare_job_enhance_flags(ctx, speaker_limit)
+    process_path, audio_duration_s = _normalize_and_stage_audio(
+        ctx,
+        enhance=enhance,
+        adaptive_enhance=adaptive_enhance,
+        temp_files=temp_files,
+    )
     from backend.asr_performance import apply_performance_policy
 
     apply_performance_policy(audio_duration_s, diarization=ctx.diarization)
     selected = _selected_engines(ctx.selected_engines, ctx.language)
-    speaker_limit = _speaker_limit(ctx.diarization, ctx.max_speakers)
     logger.info("Job %s selected engines after policy: %s", ctx.job_id, selected)
 
     diar_segments = _maybe_diarize(
@@ -652,32 +734,15 @@ def _execute_transcription_stages(
     )
     _check_cancel(ctx.cancel_event)
 
-    if ctx.progress is not None:
-        ctx.progress.set_phase("prepare", "Preparing ASR model\u2026", 40)
-    _prepare_selected_asr_model(selected, after_diarization=diar_segments is not None)
-    if ctx.progress is not None:
-        ctx.progress.set_phase("asr_prepare", "Loading ASR model on GPU\u2026", 45)
-
-    def _window_progress(current: int, total: int) -> None:
-        if ctx.progress is not None:
-            ctx.progress.set_asr_window(current, total)
-
-    ctx.phase("asr", "Transcribing on GPU\u2026", 45)
-    _debug_vram_snapshot("before-asr", "H3")
-    results, workers = _run_asr_engines(
-        ctx.job_id,
-        selected,
-        process_path,
-        ctx.language,
-        diar_segments,
-        ctx.cancel_event,
-        window_progress=_window_progress,
-        max_speakers=speaker_limit,
-        output_name=ctx.meta.output_name,
+    results, workers, process_path = _run_transcription_asr_phase(
+        ctx, process_path, selected, speaker_limit, diar_segments, temp_files,
     )
     ctx.phase("finalize", "Saving transcript\u2026", 96)
     _clear_asr_models(selected)
-    return process_path, selected, speaker_limit, results, workers, audio_duration_s, temp_files
+    return (
+        process_path, selected, speaker_limit, results, workers,
+        audio_duration_s, temp_files, diar_segments,
+    )
 
 
 def run_transcription_job(
@@ -762,6 +827,7 @@ def _run_transcription_job_impl(
             workers,
             audio_duration_s,
             temp_files,
+            diar_segments,
         ) = _execute_transcription_stages(
             TranscriptionStageContext(
                 job_id=job_id,
@@ -833,4 +899,8 @@ def _run_transcription_job_impl(
         "target_elapsed_s": target_elapsed_s,
         "target_met": target_met,
         "results": results,
+        # Raw speaker turns (post merge/cap) — lets callers score speaker
+        # count and boundary fidelity at the diarization layer, where they
+        # are defined, instead of on merged transcript lines.
+        "diarization_segments": diar_segments,
     }

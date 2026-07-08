@@ -6,6 +6,8 @@ import gc
 import logging
 import os
 import re
+import zlib
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -14,6 +16,7 @@ logger = logging.getLogger(__name__)
 
 _JOB_CANCELLED_MSG = "Job cancelled by user."
 _NO_SPEECH_MSG = "(no speech detected)"
+_PIPE_CHUNK_AUTO = object()
 
 
 def is_cuda_oom(exc: Exception) -> bool:
@@ -64,6 +67,8 @@ def is_cuda_unknown_error(exc: Exception) -> bool:
             "cuda error: unknown",
             "cudaerrorunknown",
             "cuda error",
+            "cuda driver error",
+            "device not ready",
             "unknown error",
             "device-side assert",
             "illegal memory access",
@@ -135,17 +140,21 @@ def _is_windowed_asr(audio_duration_s: float, window_duration_s: float) -> bool:
 
 def _vram_batch_boost(batch: int, window_duration_s: float = 0.0) -> int:
     """Raise batch when free VRAM headroom allows (8 GB class with ASR resident)."""
-    if _strict_memory_mode() and window_duration_s >= 90:
-        return batch
+    del window_duration_s
     try:
         from backend.vram_state import snapshot
 
         snap = snapshot()
         max_8gb = max(1, _env_int("ASR_8GB_MAX_BATCH_SIZE", 1))
         target = min(max_8gb, max(batch, _env_int("ASR_CUDA_BATCH_SIZE", max_8gb)))
-        min_free = _env_int("ASR_BATCH_MIN_FREE_MB", 5000)
-        if snap.get("free_mb", 0) >= min_free:
+        # After Whisper-large loads on 8 GB, ~1.5–2.5 GB free is normal; 5000 MB
+        # was unreachable so batch never scaled above 1.
+        min_free = _env_int("ASR_BATCH_MIN_FREE_MB", 1200)
+        free_mb = snap.get("free_mb", 0)
+        if free_mb >= min_free:
             return target
+        if free_mb >= min_free // 2 and max_8gb >= 2:
+            return min(target, max(batch, 2))
     except ImportError:
         pass
     return batch
@@ -183,8 +192,6 @@ def _strict_8gb_batch_cap(
 ) -> int:
     if windowed:
         batch = min(batch, max_8gb)
-        if window_duration_s >= 180:
-            return 1
         return _vram_batch_boost(batch, window_duration_s)
     if max_8gb > 1 and _env_bool("ASR_BATCH_DURATION_CAP", True):
         if audio_duration_s >= 180 or window_duration_s >= 120:
@@ -343,10 +350,25 @@ def _retry_pipe_on_cuda_unknown(
     runtime: WhisperRuntime,
     retry_chunk_s: int,
 ) -> tuple[dict, Any]:
-    """Recover a corrupted CUDA context and retry with conservative settings."""
-    pipe = _recover_cuda_context(runtime, pipe)
-    result = run_pipe(pipe, audio_input, language, True, 1, retry_chunk_s)
-    return result, pipe
+    """Recover a corrupted CUDA context and retry with conservative settings.
+
+    If recovery fails again with cudaErrorUnknown, the context is dead and
+    cannot be rebuilt in-process; request a process restart (a no-op that
+    re-raises when CUDA_AUTO_RESTART is disabled) so a supervisor brings the
+    service back with a fresh GPU context.
+    """
+    try:
+        pipe = _recover_cuda_context(runtime, pipe)
+        result = run_pipe(pipe, audio_input, language, True, 1, retry_chunk_s)
+        return result, pipe
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        if is_cuda_unknown_error(exc):
+            from backend import vram_state
+
+            vram_state.request_cuda_restart(
+                f"{runtime.engine_name} CUDA context lost mid-transcription",
+            )
+        raise
 
 
 def run_pipe_with_oom_retry(
@@ -358,11 +380,14 @@ def run_pipe_with_oom_retry(
     batch_size: int,
     runtime: WhisperRuntime,
     audio_duration_s: float = 0.0,
-    chunk_length_s: int | None = None,
+    chunk_length_s: int | None | object = _PIPE_CHUNK_AUTO,
     window_index: int = 0,
 ) -> tuple[dict, Any]:
     """Run the HF pipeline; retry on CUDA OOM or unknown driver errors."""
-    chunk_s = chunk_length_s if chunk_length_s is not None else _pipe_chunk_length(runtime, audio_duration_s)
+    if chunk_length_s is _PIPE_CHUNK_AUTO:
+        chunk_s = _pipe_chunk_length(runtime, audio_duration_s)
+    else:
+        chunk_s = chunk_length_s
     retry_chunk_s = runtime.retry_chunk_length_s()
     active_pipe = pipe
 
@@ -426,6 +451,9 @@ def _effective_long_form_window_s(
     window_s = runtime.long_form_window_s(audio_duration_s)
     if not diarization_active:
         return window_s
+    fast_window = _env_int("ASR_DIAR_WINDOWED_WINDOW_S", 0)
+    if fast_window > 0:
+        return fast_window
     cap = max(30, _env_int("DIARIZATION_MAX_ASR_WINDOW_S", 300))
     if window_s > cap:
         logger.info(
@@ -528,6 +556,10 @@ def _turn_guided_asr_enabled(diarization_active: bool) -> bool:
 
 
 def _chunk_length_for_turn(dur_s: float, runtime: WhisperRuntime) -> int | None:
+    from backend.asr_quality import is_accuracy_mode
+
+    if is_accuracy_mode():
+        return None
     if dur_s < 20.0:
         return None
     chunk_s = runtime.chunk_length_s()
@@ -554,35 +586,34 @@ def format_turn_guided_transcript(chunks: list[dict]) -> str:
     return clean_transcript_lines("\n".join(lines))
 
 
-def _extract_turn_text(
-    result: dict,
+def _text_from_timestamped_chunks(
+    chunks: list[dict],
     *,
-    turn_start: float = 0.0,
-    turn_end: float = 0.0,
-    slice_offset: float = 0.0,
-    turn_dur: float = 0.0,
+    turn_start: float,
+    turn_end: float,
+    slice_offset: float,
 ) -> str:
-    chunks = result.get("chunks") or []
-    if chunks and turn_end > turn_start:
-        margin = max(0.0, _env_float("ASR_TURN_BOUNDARY_MARGIN_S", 0.08))
-        keep_start = turn_start + margin
-        keep_end = turn_end - margin
-        parts: list[str] = []
-        for chunk in chunks:
-            text = (chunk.get("text") or "").strip()
-            if not text:
+    """Collect chunk text whose midpoint falls inside the turn window."""
+    margin = max(0.0, _env_float("ASR_TURN_BOUNDARY_MARGIN_S", 0.08))
+    keep_start = turn_start + margin
+    keep_end = turn_end - margin
+    parts: list[str] = []
+    for chunk in chunks:
+        text = (chunk.get("text") or "").strip()
+        if not text:
+            continue
+        ts = chunk.get("timestamp")
+        if ts and ts[0] is not None:
+            abs_start = slice_offset + float(ts[0])
+            abs_end = slice_offset + float(ts[1]) if ts[1] is not None else abs_start
+            mid = (abs_start + abs_end) / 2.0
+            if mid < keep_start or mid > keep_end:
                 continue
-            ts = chunk.get("timestamp")
-            if ts and ts[0] is not None:
-                abs_start = slice_offset + float(ts[0])
-                abs_end = slice_offset + float(ts[1]) if ts[1] is not None else abs_start
-                mid = (abs_start + abs_end) / 2.0
-                if mid < keep_start or mid > keep_end:
-                    continue
-            parts.append(text)
-        if parts:
-            return " ".join(parts).strip()
+        parts.append(text)
+    return " ".join(parts).strip()
 
+
+def _fallback_result_text(result: dict, chunks: list[dict]) -> str:
     text = (result.get("text") or "").strip()
     if text:
         return text
@@ -591,6 +622,26 @@ def _extract_turn_text(
         for chunk in chunks
         if (chunk.get("text") or "").strip()
     ).strip()
+
+
+def _extract_turn_text(
+    result: dict,
+    *,
+    turn_start: float = 0.0,
+    turn_end: float = 0.0,
+    slice_offset: float = 0.0,
+) -> str:
+    chunks = result.get("chunks") or []
+    if chunks and turn_end > turn_start:
+        filtered = _text_from_timestamped_chunks(
+            chunks,
+            turn_start=turn_start,
+            turn_end=turn_end,
+            slice_offset=slice_offset,
+        )
+        if filtered:
+            return filtered
+    return _fallback_result_text(result, chunks)
 
 
 def _turn_audio_window(
@@ -603,10 +654,7 @@ def _turn_audio_window(
     turn_start = float(turn["start"])
     turn_end = float(turn["end"])
     pad = _env_float("ASR_TURN_PAD_S", 0.20 if is_accuracy_mode() else 0.0)
-    trim = _env_float(
-        "ASR_TURN_BOUNDARY_TRIM_S",
-        0.0 if is_accuracy_mode() else 0.0,
-    )
+    trim = _env_float("ASR_TURN_BOUNDARY_TRIM_S", 0.0)
 
     slice_start = max(0.0, turn_start - pad)
     slice_end = turn_end + pad
@@ -623,6 +671,243 @@ def _turn_audio_window(
     return slice_start, slice_end, turn_start, turn_end
 
 
+def _text_compression_ratio(text: str) -> float:
+    raw = text.encode("utf-8")
+    if not raw:
+        return 0.0
+    return len(raw) / max(1, len(zlib.compress(raw)))
+
+
+def _has_repeated_ngram(text: str, n: int = 4, min_repeats: int = 3) -> bool:
+    words = text.split()
+    if len(words) < n * min_repeats:
+        return False
+    ngrams = [" ".join(words[i : i + n]) for i in range(len(words) - n + 1)]
+    return max(Counter(ngrams).values()) >= min_repeats
+
+
+def _reject_hallucinated_turn(text: str, turn_duration_s: float) -> bool:
+    """Return True when turn output looks like a Whisper loop hallucination."""
+    if not text.strip():
+        return False
+    if not _env_bool("ASR_REJECT_HALLUCINATED_TURNS", True):
+        return False
+    max_ratio = _env_float("ASR_TURN_MAX_COMPRESSION_RATIO", 2.0)
+    max_chars_s = _env_float("ASR_TURN_MAX_CHARS_PER_S", 40.0)
+    min_chars_ratio = max(80, _env_int("ASR_HALLUCINATION_MIN_CHARS", 80))
+    min_chars_rate = max(120, _env_int("ASR_HALLUCINATION_RATE_MIN_CHARS", 120))
+    if (
+        turn_duration_s < 3.0
+        and len(text) >= min_chars_ratio
+        and _text_compression_ratio(text) > max_ratio
+    ):
+        return True
+    if (
+        turn_duration_s < 5.0
+        and len(text) >= min_chars_rate
+        and len(text) / max(0.1, turn_duration_s) > max_chars_s
+    ):
+        return True
+    ngram_size = max(2, _env_int("ASR_HALLUCINATION_NGRAM_SIZE", 4))
+    min_words_ngram = max(12, _env_int("ASR_HALLUCINATION_MIN_WORDS", 12))
+    words = text.split()
+    if len(words) >= min_words_ngram and _has_repeated_ngram(text, n=ngram_size):
+        return True
+    return False
+
+
+def _run_turn_inference(
+    audio_path: str,
+    slice_start: float,
+    slice_dur: float,
+    *,
+    language: str,
+    ts_mode: Any,
+    pipe: Any,
+    run_pipe: Callable[..., dict],
+    runtime: WhisperRuntime,
+    window_index: int,
+) -> dict:
+    from engines.audio_io import load_audio_slice
+
+    audio_input = load_audio_slice(audio_path, slice_start, slice_dur)
+    try:
+        out, _pipe = run_pipe_with_oom_retry(
+            run_pipe,
+            pipe,
+            audio_input,
+            language,
+            ts_mode,
+            1,
+            runtime,
+            audio_duration_s=slice_dur,
+            chunk_length_s=_chunk_length_for_turn(slice_dur, runtime),
+            window_index=window_index,
+        )
+        return out
+    finally:
+        del audio_input
+        if slice_dur > 300:
+            runtime.clear_cuda_cache()
+
+
+@dataclass(frozen=True)
+class _TurnDecodeParams:
+    turn: dict
+    index: int
+    audio_path: str
+    language: str
+    ts_mode: Any
+    pipe: Any
+    run_pipe: Callable[..., dict]
+    runtime: WhisperRuntime
+    audio_duration_s: float
+    slice_start: float
+    slice_dur: float
+    turn_start: float
+    turn_end: float
+
+
+def _retry_turn_without_hallucination(params: _TurnDecodeParams) -> str | None:
+    """Re-decode a turn at temperature 0 after hallucination rejection."""
+    dur = params.turn["end"] - params.turn["start"]
+    saved_temp = os.environ.get("ASR_TEMPERATURE")
+    saved_pad = os.environ.get("ASR_TURN_PAD_S")
+    os.environ["ASR_TEMPERATURE"] = "0.0"
+    retry_slice_start = params.slice_start
+    retry_slice_dur = params.slice_dur
+    retry_turn_start = params.turn_start
+    retry_turn_end = params.turn_end
+    if dur < 2.0:
+        os.environ["ASR_TURN_PAD_S"] = "0.0"
+        retry_slice_start, retry_slice_end, retry_turn_start, retry_turn_end = (
+            _turn_audio_window(params.turn, params.audio_duration_s)
+        )
+        retry_slice_dur = retry_slice_end - retry_slice_start
+    try:
+        result = _run_turn_inference(
+            params.audio_path,
+            retry_slice_start,
+            retry_slice_dur,
+            language=params.language,
+            ts_mode=params.ts_mode,
+            pipe=params.pipe,
+            run_pipe=params.run_pipe,
+            runtime=params.runtime,
+            window_index=params.index,
+        )
+        retry_text = _extract_turn_text(
+            result,
+            turn_start=retry_turn_start,
+            turn_end=retry_turn_end,
+            slice_offset=retry_slice_start,
+        )
+    finally:
+        if saved_temp is None:
+            os.environ.pop("ASR_TEMPERATURE", None)
+        else:
+            os.environ["ASR_TEMPERATURE"] = saved_temp
+        if saved_pad is None:
+            os.environ.pop("ASR_TURN_PAD_S", None)
+        else:
+            os.environ["ASR_TURN_PAD_S"] = saved_pad
+    if retry_text and not _reject_hallucinated_turn(retry_text, dur):
+        return retry_text
+    return None
+
+
+def _strip_leading_filler_bleed(text: str) -> str:
+    """Drop short ASR bleed words duplicated from the prior turn boundary."""
+    for prefix in ("สวย ด้วย", "ด้วย", "ครับ", "นะครับ"):
+        if text.startswith(prefix + " "):
+            return text[len(prefix) + 1:].strip()
+        if text == prefix:
+            return ""
+    return text
+
+
+def _trim_turn_bleed(prev: str, cur: str) -> str:
+    """Drop duplicated prefix on cur when it repeats the end of prev."""
+    prev_words = prev.split()
+    cur_words = cur.split()
+    max_words = min(len(prev_words), len(cur_words), 8)
+    for size in range(max_words, 0, -1):
+        if prev_words[-size:] == cur_words[:size]:
+            return " ".join(cur_words[size:]).strip()
+    max_chars = min(len(prev), len(cur), 48)
+    for size in range(max_chars, 2, -1):
+        suffix = prev[-size:]
+        if cur.startswith(suffix):
+            return cur[size:].strip()
+    return cur
+
+
+def _line_timestamp_bounds(
+    result: dict,
+    *,
+    slice_offset: float,
+    turn_start: float,
+    turn_end: float,
+    fallback_start: float,
+    fallback_end: float,
+) -> tuple[float, float]:
+    """Use first/last decoded word inside the turn when word timestamps exist."""
+    if not _env_bool("ASR_WORD_TIMESTAMPS_WITH_DIARIZATION", False):
+        return fallback_start, fallback_end
+    word_starts: list[float] = []
+    word_ends: list[float] = []
+    for chunk in result.get("chunks") or []:
+        ts = chunk.get("timestamp")
+        if not ts or ts[0] is None:
+            continue
+        abs_start = slice_offset + float(ts[0])
+        abs_end = slice_offset + float(ts[1]) if ts[1] is not None else abs_start
+        if abs_end < turn_start or abs_start > turn_end:
+            continue
+        word_starts.append(abs_start)
+        word_ends.append(abs_end)
+    if not word_starts:
+        return fallback_start, fallback_end
+    start = max(turn_start, min(word_starts))
+    end = min(turn_end, max(word_ends))
+    # Match _fmt_ts (truncate to whole seconds) for line output consistency.
+    start_i, end_i = int(start), int(end)
+    if end_i <= start_i:
+        return int(fallback_start), max(int(fallback_start) + 1, int(fallback_end))
+    return start_i, end_i
+
+
+def _turn_line_timestamp_bounds(
+    turn: dict,
+    result: dict,
+    *,
+    slice_offset: float,
+    turn_start: float,
+    turn_end: float,
+) -> tuple[int, int]:
+    """Display timestamps for one turn-guided line (reference parity uses diar bounds)."""
+    from backend.asr_quality import is_accuracy_mode
+
+    if _env_bool(
+        "ASR_TURN_USE_DIAR_TIMESTAMPS",
+        is_accuracy_mode() or _env_bool("ASR_TURN_GUIDED", True),
+    ):
+        start = int(turn["start"])
+        end = int(turn["end"])
+        if end <= start:
+            end = start + max(1, int(round(turn["end"] - turn["start"])))
+        return start, end
+    start, end = _line_timestamp_bounds(
+        result,
+        slice_offset=slice_offset,
+        turn_start=turn_start,
+        turn_end=turn_end,
+        fallback_start=turn["start"],
+        fallback_end=turn["end"],
+    )
+    return int(start), int(end)
+
+
 def _transcribe_single_turn(
     turn: dict,
     index: int,
@@ -634,7 +919,6 @@ def _transcribe_single_turn(
     runtime: WhisperRuntime,
     audio_duration_s: float = 0.0,
 ) -> dict | None:
-    from engines.audio_io import load_audio_slice
     from backend import vram_state
 
     dur = turn["end"] - turn["start"]
@@ -646,39 +930,87 @@ def _transcribe_single_turn(
     slice_dur = slice_end - slice_start
     if slice_dur < _env_float("ASR_TURN_GUIDED_MIN_TURN_S", 0.4):
         return None
-    vram_state.log_phase(f"{runtime.engine_name}_turn_{index}", before=True)
-    audio_input = load_audio_slice(audio_path, slice_start, slice_dur)
-    chunk_s = _chunk_length_for_turn(slice_dur, runtime)
-    try:
-        result, _pipe = run_pipe_with_oom_retry(
-            run_pipe,
-            pipe,
-            audio_input,
-            language,
-            ts_mode,
-            1,
-            runtime,
-            audio_duration_s=slice_dur,
-            chunk_length_s=chunk_s,
-            window_index=index,
+    from engines.whisper_utils import WHISPER_MAX_CHUNK_S
+
+    if slice_dur > WHISPER_MAX_CHUNK_S:
+        logger.warning(
+            "%s turn %d: slice %.1fs exceeds Whisper ceiling; clamping to %ds.",
+            runtime.engine_name,
+            index,
+            slice_dur,
+            WHISPER_MAX_CHUNK_S,
         )
-    finally:
-        del audio_input
-        if slice_dur > 120:
-            runtime.clear_cuda_cache()
-            gc.collect()
+        slice_dur = WHISPER_MAX_CHUNK_S
+    vram_state.log_phase(f"{runtime.engine_name}_turn_{index}", before=True)
+
+    result = _run_turn_inference(
+        audio_path,
+        slice_start,
+        slice_dur,
+        language=language,
+        ts_mode=ts_mode,
+        pipe=pipe,
+        run_pipe=run_pipe,
+        runtime=runtime,
+        window_index=index,
+    )
     text = _extract_turn_text(
         result,
         turn_start=turn_start,
         turn_end=turn_end,
         slice_offset=slice_start,
     )
+    if text and _reject_hallucinated_turn(text, dur):
+        retry_min_s = _env_float("ASR_HALLUCINATION_RETRY_MIN_DURATION_S", 1.5)
+        if dur < retry_min_s:
+            logger.warning(
+                "%s turn %d: rejected hallucinated output on %.1fs turn; skipping.",
+                runtime.engine_name,
+                index,
+                dur,
+            )
+            vram_state.log_phase(f"{runtime.engine_name}_turn_{index}", before=False)
+            return None
+        logger.warning(
+            "%s turn %d: rejected hallucinated output (%d chars, %.1fs); retrying.",
+            runtime.engine_name,
+            index,
+            len(text),
+            dur,
+        )
+        text = _retry_turn_without_hallucination(
+            _TurnDecodeParams(
+                turn=turn,
+                index=index,
+                audio_path=audio_path,
+                language=language,
+                ts_mode=ts_mode,
+                pipe=pipe,
+                run_pipe=run_pipe,
+                runtime=runtime,
+                audio_duration_s=audio_duration_s,
+                slice_start=slice_start,
+                slice_dur=slice_dur,
+                turn_start=turn_start,
+                turn_end=turn_end,
+            ),
+        )
+        if not text:
+            vram_state.log_phase(f"{runtime.engine_name}_turn_{index}", before=False)
+            return None
     vram_state.log_phase(f"{runtime.engine_name}_turn_{index}", before=False)
     if not text:
         return None
+    line_start, line_end = _turn_line_timestamp_bounds(
+        turn,
+        result,
+        slice_offset=slice_start,
+        turn_start=turn_start,
+        turn_end=turn_end,
+    )
     return {
         "text": text,
-        "timestamp": (turn["start"], turn["end"]),
+        "timestamp": (line_start, line_end),
         "speaker": turn["speaker"],
     }
 
@@ -693,69 +1025,42 @@ def _dedupe_adjacent_turn_bleed(chunks: list[dict]) -> list[dict]:
         cur = (out[idx].get("text") or "").strip()
         if not prev or not cur:
             continue
-        prev_words = prev.split()
-        cur_words = cur.split()
-        best_words = 0
-        max_words = min(len(prev_words), len(cur_words), 8)
-        for size in range(max_words, 0, -1):
-            if prev_words[-size:] == cur_words[:size]:
-                best_words = size
-                break
-        if best_words:
-            trimmed = " ".join(cur_words[best_words:]).strip()
+        trimmed = _trim_turn_bleed(prev, cur)
+        trimmed = _strip_leading_filler_bleed(trimmed)
+        if trimmed != cur:
             out[idx]["text"] = trimmed
-            continue
-        max_chars = min(len(prev), len(cur), 48)
-        for size in range(max_chars, 2, -1):
-            if prev[-size:] == cur[:size]:
-                out[idx]["text"] = cur[size:].strip()
-                break
     return [chunk for chunk in out if (chunk.get("text") or "").strip()]
 
 
-_CONTINUATION_HEADS = frozenset({
-    "ด้วย", "และ", "เพราะ", "มัน", "เพจ", "ค่า", "ทริป", "หา", "ไม่", "ส่วน",
-    "เยอะเลย", "ค่าเดินทางไปได้เยอะเลย", "ทริปแค่ไม่กี่วัน",
-})
-_SENTENCE_START_RE = re.compile(
-    r"^(เรา|ผม|ฉัน|พวก|เห็น|โห|ตกลง|เฮ้ย|ถ้า|ไป|จริง|นั่น|เอา|เดี๋ยว|ระหว่าง|งั้น|แต่|กาญจนบุรี|เขา|ทะเล|ทุกคน|ทั้ง|โชค)",
-)
+def _speaker_chunk_gap_s(prev: dict, chunk: dict) -> float:
+    prev_ts = prev.get("timestamp") or (0.0, 0.0)
+    cur_ts = chunk.get("timestamp") or (0.0, 0.0)
+    return float(cur_ts[0] or 0.0) - float(prev_ts[1] or prev_ts[0] or 0.0)
 
 
-def _looks_like_sentence_start(words: list[str]) -> bool:
-    if not words:
-        return True
-    joined = " ".join(words[:3])
-    if joined in _CONTINUATION_HEADS:
-        return False
-    first = words[0]
-    if first in _CONTINUATION_HEADS:
-        return False
-    if _SENTENCE_START_RE.match(first):
-        return True
-    if len(first) <= 2 and len(words) > 1:
-        return False
-    return len(first) >= 5
+def _combine_speaker_chunk_text(prev: dict, chunk: dict) -> None:
+    prev_ts = prev.get("timestamp") or (0.0, 0.0)
+    cur_ts = chunk.get("timestamp") or (0.0, 0.0)
+    prev_text = (prev.get("text") or "").strip()
+    cur_text = (chunk.get("text") or "").strip()
+    prev["text"] = f"{prev_text} {cur_text}".strip()
+    prev["timestamp"] = (prev_ts[0], cur_ts[1] if cur_ts[1] is not None else cur_ts[0])
 
 
-def _rebalance_turn_fragments(chunks: list[dict]) -> list[dict]:
-    """Move leading continuation fragments from turn N back onto turn N-1."""
-    if len(chunks) < 2:
+def _merge_consecutive_speaker_chunks(chunks: list[dict]) -> list[dict]:
+    """Merge adjacent turn chunks for the same speaker when diar left a short gap."""
+    max_gap_s = _env_float("ASR_TURN_OUTPUT_MERGE_GAP_S", 0.0)
+    if max_gap_s <= 0 or not chunks:
         return chunks
-    out: list[dict] = [dict(chunk) for chunk in chunks]
-    for idx in range(1, len(out)):
-        prev_words = (out[idx - 1].get("text") or "").split()
-        cur_words = (out[idx].get("text") or "").split()
-        if not prev_words or not cur_words:
+    merged: list[dict] = [dict(chunks[0])]
+    for chunk in chunks[1:]:
+        prev = merged[-1]
+        same_speaker = (chunk.get("speaker") or "") == (prev.get("speaker") or "")
+        if not same_speaker or _speaker_chunk_gap_s(prev, chunk) > max_gap_s:
+            merged.append(dict(chunk))
             continue
-        moved = 0
-        while cur_words and moved < 6 and not _looks_like_sentence_start(cur_words):
-            prev_words.append(cur_words.pop(0))
-            moved += 1
-        if moved:
-            out[idx - 1]["text"] = " ".join(prev_words).strip()
-            out[idx]["text"] = " ".join(cur_words).strip()
-    return [chunk for chunk in out if (chunk.get("text") or "").strip()]
+        _combine_speaker_chunk_text(prev, chunk)
+    return merged
 
 
 def run_turn_guided_asr(
@@ -804,7 +1109,7 @@ def run_turn_guided_asr(
             window_progress(index, total)
 
     output_chunks = _dedupe_adjacent_turn_bleed(output_chunks)
-    output_chunks = _rebalance_turn_fragments(output_chunks)
+    output_chunks = _merge_consecutive_speaker_chunks(output_chunks)
     return format_turn_guided_transcript(output_chunks)
 
 
@@ -831,8 +1136,6 @@ def format_asr_result(
             max_speakers=max_speakers,
             audio_duration_s=audio_duration_s,
         )
-        import re
-
         ts_re = re.compile(r"\[\d{2}:\d{2}:\d{2} → \d{2}:\d{2}:\d{2}\] \[SPEAKER_\d+\]:")
         for line in text.splitlines():
             if "[SPEAKER_" in line and not ts_re.match(line.strip()):
@@ -870,7 +1173,24 @@ def transcribe_whisper_audio(
     chunk_s = _pipe_chunk_length(runtime, audio_duration_s)
     min_chunk_dur = _min_chunked_duration_s()
     diarization_active = diarization_segments is not None
-    if diarization_active and _turn_guided_asr_enabled(True):
+    use_turn_guided = (
+        diarization_active
+        and _turn_guided_asr_enabled(True)
+    )
+    if use_turn_guided:
+        from backend.asr_performance import should_use_windowed_diar_asr
+
+        if should_use_windowed_diar_asr(
+            audio_duration_s, diarization_segments, max_speakers,
+        ):
+            logger.info(
+                "%s using windowed ASR + turn-centric speaker assignment "
+                "(audio=%.0fs, faster than per-turn passes).",
+                runtime.engine_name,
+                audio_duration_s,
+            )
+            use_turn_guided = False
+    if use_turn_guided:
         return run_turn_guided_asr(
             audio_path,
             language,

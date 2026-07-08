@@ -18,11 +18,11 @@ class TestPerformanceTarget(unittest.TestCase):
     def test_short_audio_ten_minute_cap(self) -> None:
         self.assertAlmostEqual(performance_target_seconds(210.0), 600.0)
 
-    def test_twenty_minute_audio_thirty_minute_cap(self) -> None:
-        self.assertAlmostEqual(performance_target_seconds(20 * 60), 1800.0)
+    def test_twenty_minute_audio_half_realtime(self) -> None:
+        self.assertAlmostEqual(performance_target_seconds(20 * 60), 10 * 60)
 
-    def test_seventy_seven_minute_audio_quarter_realtime(self) -> None:
-        self.assertAlmostEqual(performance_target_seconds(77 * 60), 77 * 60 / 4.0)
+    def test_ninety_minute_audio_half_realtime(self) -> None:
+        self.assertAlmostEqual(performance_target_seconds(90 * 60), 45 * 60)
 
 
 class TestAdaptiveBeams(unittest.TestCase):
@@ -49,21 +49,25 @@ class TestApplyPolicy(unittest.TestCase):
             "ASR_ADAPTIVE_PERFORMANCE": "true",
             "ASR_NUM_BEAMS_MAX": "8",
             "ASR_NUM_BEAMS_MIN": "4",
+            "ASR_QUALITY_PROFILE": "high",
         }
         with patch.dict(os.environ, env, clear=True):
             applied = apply_performance_policy(210.0, diarization=True)
             self.assertIn("ASR_NUM_BEAMS", applied)
             self.assertEqual(applied["ASR_NUM_BEAMS"], "8")
-        self.assertEqual(adaptive_turn_merge_gap_s(210.0), 0.5)
+            self.assertEqual(adaptive_turn_merge_gap_s(210.0), 0.35)
 
     def test_long_audio_policy(self) -> None:
-        env = {"ASR_ADAPTIVE_PERFORMANCE": "true", "ASR_TARGET_LONG_AUDIO_S": "3600"}
+        env = {
+            "ASR_ADAPTIVE_PERFORMANCE": "true",
+            "ASR_TARGET_LONG_AUDIO_S": "3600",
+            "ASR_DIAR_WINDOWED_FAST": "false",
+        }
         with patch.dict(os.environ, env, clear=True):
             applied = apply_performance_policy(77 * 60, diarization=True)
-        self.assertEqual(applied.get("ASR_TURN_GUIDED"), "false")
-        self.assertEqual(applied.get("ASR_NUM_BEAMS"), "1")
-        self.assertEqual(applied.get("ASR_LONG_FORM_WINDOW_S"), "2400")
-        self.assertEqual(applied.get("DIARIZATION_MAX_ASR_WINDOW_S"), "2400")
+        self.assertEqual(applied.get("ASR_TURN_GUIDED"), "true")
+        self.assertEqual(applied.get("ASR_NUM_BEAMS"), "4")
+        self.assertNotIn("ASR_LONG_FORM_WINDOW_S", applied)
 
     def test_disabled_when_flag_off(self) -> None:
         with patch.dict(os.environ, {"ASR_ADAPTIVE_PERFORMANCE": "false"}, clear=False):

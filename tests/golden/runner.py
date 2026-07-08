@@ -6,7 +6,7 @@ import os
 import time
 from pathlib import Path
 
-from tests.golden.accuracy import accuracy_report
+from tests.golden.accuracy import accuracy_report, count_speaker_lines, unique_speakers_in_window
 from tests.golden.config import (
     apply_golden_env,
     apply_production_perf_env,
@@ -101,6 +101,85 @@ def _stage_audio_for_inference(audio_path: Path) -> str:
     return str(dest)
 
 
+def _score_named_reference(
+    fixture: GoldenFixture,
+    expected_text: str,
+    actual_text: str,
+    performance_met: bool,
+) -> tuple[dict, bool]:
+    """Score a named-speaker meeting fixture on speakers + timestamps."""
+    from tests.golden.meeting_eval import (
+        evaluate_meeting_diarization,
+        parse_hypothesis_lines_with_text,
+        parse_hypothesis_transcript,
+        parse_named_reference,
+        parse_reference_turns_with_text,
+    )
+
+    ref_turns = parse_named_reference(
+        expected_text, total_duration_s=fixture.audio_duration_s()
+    )
+    ref_text_turns = parse_reference_turns_with_text(
+        expected_text, total_duration_s=fixture.audio_duration_s()
+    )
+    hyp_segments = parse_hypothesis_transcript(actual_text)
+    hyp_text_segments = parse_hypothesis_lines_with_text(actual_text)
+    meeting = evaluate_meeting_diarization(
+        ref_turns,
+        hyp_segments,
+        ref_text_turns=ref_text_turns,
+        hyp_text_segments=hyp_text_segments,
+    )
+
+    # Verified on tests/309.m4a: tiered VBx Fa + intro recovery targets 10–11/11
+    # speakers; two ultra-brief voices may remain below embedding resolution.
+    count_tol = int(os.getenv("GOLDEN_MEETING_SPEAKER_TOLERANCE", "0"))
+    time_acc_min = float(os.getenv("GOLDEN_MEETING_TIME_ACC", "0.85"))
+    turn_acc_min = float(os.getenv("GOLDEN_MEETING_TURN_ACC", "0.90"))
+    boundary_1s_min = float(os.getenv("GOLDEN_MEETING_BOUNDARY_1S", "0.70"))
+    boundary_median_max = float(os.getenv("GOLDEN_MEETING_BOUNDARY_MEDIAN_S", "1.0"))
+    turn_text_min = float(os.getenv("GOLDEN_MEETING_TURN_TEXT_ACC", "0.85"))
+
+    count_ok = meeting["detected_speakers"] == meeting["expected_speakers"]
+    if count_tol > 0:
+        count_ok = abs(
+            meeting["detected_speakers"] - meeting["expected_speakers"]
+        ) <= count_tol
+    time_ok = meeting["speaker_time_accuracy"] >= time_acc_min
+    turn_ok = meeting["turn_accuracy"] >= turn_acc_min
+    boundary_ok = meeting.get("boundary_within_1s", 0.0) >= boundary_1s_min
+    median_ok = meeting.get("boundary_median_s", 999.0) <= boundary_median_max
+    text_ok = meeting.get("turn_text_accuracy", 0.0) >= turn_text_min
+    passed = (
+        performance_met
+        and count_ok
+        and time_ok
+        and turn_ok
+        and boundary_ok
+        and median_ok
+        and text_ok
+    )
+
+    summary = {
+        key: meeting[key]
+        for key in (
+            "expected_speakers", "detected_speakers", "speaker_count_match",
+            "speaker_time_accuracy", "turn_accuracy", "coverage",
+            "boundary_median_s", "boundary_within_1s", "boundary_within_2s",
+            "boundary_within_3s", "turn_text_accuracy",
+        )
+    }
+    summary["meeting_checks"] = {
+        "count_ok": count_ok,
+        "time_ok": time_ok,
+        "turn_ok": turn_ok,
+        "boundary_ok": boundary_ok,
+        "median_ok": median_ok,
+        "text_ok": text_ok,
+    }
+    return {"meeting": summary}, passed
+
+
 def run_golden_fixture(
     fixture: GoldenFixture | None = None,
     *,
@@ -189,8 +268,11 @@ def run_golden_fixture(
 
         diarize_kwargs["reference_segments"] = load_reference_segments(fixture.expected)
         os.environ["ASR_TURN_GUIDED"] = "true"
-    elif fixture.max_speakers > 0:
-        diarize_kwargs["num_speakers"] = fixture.max_speakers
+    elif fixture.expected_speakers > 0 and not fixture.named_reference:
+        # Named-reference meetings must NOT force min_speakers: community-1
+        # falls back to a blind KMeans re-partition when VBx finds fewer
+        # clusters, which destroys attribution. Tuned VBx finds the count.
+        diarize_kwargs["min_speakers"] = fixture.expected_speakers
 
     result = run_transcription_job(
         media_path=_stage_audio_for_inference(fixture.audio),
@@ -237,6 +319,11 @@ def run_golden_fixture(
 
     report = accuracy_report(expected_text, actual_text) if expected_text else {
         "accuracy": None,
+        "content": None,
+        "content_accuracy": None,
+        "timestamp_accuracy": None,
+        "speaker_sequence": None,
+        "mismatched_lines": None,
         "line_best_match": None,
         "time_aligned": None,
         "corpus_similarity": None,
@@ -253,14 +340,47 @@ def run_golden_fixture(
     content = report.get("content_accuracy")
     speaker = report.get("speaker_sequence")
     timestamp = report.get("timestamp_accuracy")
-    if fixture.requires_accuracy() and threshold is not None and score is not None:
+    if fixture.named_reference and expected_text:
+        meeting_report, passed = _score_named_reference(
+            fixture, expected_text, actual_text, performance_met,
+        )
+        report = {**report, **meeting_report}
+    elif fixture.requires_accuracy() and threshold is not None and score is not None:
         content_ok = (content or 0.0) >= golden_accuracy_threshold()
         speaker_ok = (speaker or 0.0) >= golden_speaker_threshold()
         timestamp_ok = (timestamp or 0.0) >= golden_timestamp_threshold()
-        passed = content_ok and speaker_ok and timestamp_ok and performance_met
+        mismatched = int(report.get("mismatched_lines") or 0)
+        mismatched_max = int(os.getenv("GOLDEN_SAMPLE01_MISMATCHED_MAX", "0"))
+        line_ok = mismatched <= mismatched_max if fixture.name == "sample01" else True
+        strict_min = float(os.getenv("GOLDEN_STRICT_THRESHOLD", "0.95"))
+        strict = float(report.get("strict_accuracy") or 0.0)
+        passed = (
+            content_ok and speaker_ok and timestamp_ok and line_ok
+            and strict >= strict_min and performance_met
+        )
     else:
         line_count = int(report.get("actual_lines") or 0)
-        passed = performance_met and line_count >= 20 and len(actual_text) >= 500
+        actual_spk = count_speaker_lines(actual_text)
+        unique_count = len(actual_spk)
+        speaker_ok = True
+        if fixture.expected_speakers > 0:
+            speaker_ok = unique_count >= fixture.expected_speakers
+        if speaker_ok and fixture.min_speakers_first_minute > 0:
+            first_min = unique_speakers_in_window(actual_text, 60.0)
+            speaker_ok = len(first_min) >= fixture.min_speakers_first_minute
+        passed = (
+            performance_met
+            and line_count >= 20
+            and len(actual_text) >= 500
+            and speaker_ok
+        )
+        report["actual_speakers"] = actual_spk
+        if fixture.min_speakers_first_minute > 0:
+            report["first_minute_speakers"] = sorted(
+                unique_speakers_in_window(actual_text, 60.0)
+            )
+        if not speaker_ok:
+            report["speaker_check_failed"] = True
 
     debug_log(
         hypothesis_id="H1-H5",

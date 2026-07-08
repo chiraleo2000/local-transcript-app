@@ -9,6 +9,10 @@ from backend.asr_performance import performance_target_seconds
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
+_SM_KMUTT = (
+    REPO_ROOT / "tests" / "SM-พี่วีระ x รองยุ่น ศรชล x ดร เบิร์ด kmutt.m4a"
+)
+
 
 @dataclass(frozen=True)
 class GoldenFixture:
@@ -17,9 +21,14 @@ class GoldenFixture:
     expected: Path | None
     output: Path
     max_speakers: int = 0
+    expected_speakers: int = 0
+    min_speakers_first_minute: int = 0
     accuracy_threshold: float | None = 0.95
     check_performance: bool = True
     production_mode: bool = False
+    # Named-speaker meeting reference (HH:MM:SS + Thai name headers) scored
+    # with tests/golden/meeting_eval.py instead of the [SPEAKER_XX] scorer.
+    named_reference: bool = False
 
     def requires_accuracy(self) -> bool:
         return self.accuracy_threshold is not None and self.expected is not None
@@ -60,7 +69,8 @@ FIXTURES: dict[str, GoldenFixture] = {
         expected=REPO_ROOT / "tests" / "test-sample01.txt",
         output=REPO_ROOT / "tests" / "output" / "test-sample01_actual.txt",
         max_speakers=4,
-        accuracy_threshold=0.90,
+        expected_speakers=4,
+        accuracy_threshold=0.95,
         check_performance=True,
         production_mode=False,
     ),
@@ -69,7 +79,8 @@ FIXTURES: dict[str, GoldenFixture] = {
         audio=REPO_ROOT / "tests" / "Recording 172.wav",
         expected=None,
         output=REPO_ROOT / "tests" / "output" / "Recording_172_actual.txt",
-        max_speakers=0,
+        max_speakers=2,
+        expected_speakers=2,
         accuracy_threshold=None,
         check_performance=True,
         production_mode=True,
@@ -79,25 +90,70 @@ FIXTURES: dict[str, GoldenFixture] = {
         audio=REPO_ROOT / "tests" / "Recording 19.wav",
         expected=None,
         output=REPO_ROOT / "tests" / "output" / "Recording_19_actual.txt",
-        max_speakers=0,
+        max_speakers=2,
+        expected_speakers=2,
         accuracy_threshold=None,
         check_performance=True,
         production_mode=True,
     ),
-    "sample47": GoldenFixture(
-        name="sample47",
-        audio=REPO_ROOT / "tests" / "47.m4a",
+    "recording6250": GoldenFixture(
+        name="recording6250",
+        audio=REPO_ROOT / "tests" / "Recording 6250.wav",
+        expected=REPO_ROOT / "tests" / "Recording_6250_transcript.txt",
+        output=REPO_ROOT / "tests" / "output" / "Recording_6250_actual.txt",
+        max_speakers=2,
+        expected_speakers=2,
+        accuracy_threshold=0.95,
+        check_performance=True,
+        production_mode=True,
+    ),
+    "sm_kmutt": GoldenFixture(
+        name="sm_kmutt",
+        audio=_SM_KMUTT,
         expected=None,
-        output=REPO_ROOT / "tests" / "output" / "47_actual.txt",
-        max_speakers=0,
+        output=REPO_ROOT / "tests" / "output" / "SM_kmutt_actual.txt",
+        max_speakers=4,
+        expected_speakers=4,
+        min_speakers_first_minute=2,
         accuracy_threshold=None,
         check_performance=True,
         production_mode=True,
+    ),
+    "recording47": GoldenFixture(
+        name="recording47",
+        audio=REPO_ROOT / "tests" / "Recording 47.wav",
+        expected=None,
+        output=REPO_ROOT / "tests" / "output" / "Recording_47_actual.txt",
+        max_speakers=5,
+        expected_speakers=5,
+        accuracy_threshold=None,
+        check_performance=True,
+        production_mode=True,
+    ),
+    # 89.7-min 11-speaker Thai meeting (ศรชล x มจธ). Named-speaker reference;
+    # scored on speaker count / attribution / boundary alignment.
+    "meeting309": GoldenFixture(
+        name="meeting309",
+        audio=REPO_ROOT / "tests" / "309.m4a",
+        expected=REPO_ROOT / "tests" / "309.txt",
+        output=REPO_ROOT / "tests" / "output" / "309_actual.txt",
+        max_speakers=11,
+        expected_speakers=11,
+        accuracy_threshold=None,
+        check_performance=True,
+        production_mode=True,
+        named_reference=True,
     ),
 }
 
 ACCURACY_FIXTURES = ("sample01",)
-LONG_PERF_FIXTURES = ("recording172", "recording19", "sample47")
+LONG_PERF_FIXTURES = (
+    "recording172",
+    "recording19",
+    "sm_kmutt",
+    "recording47",
+    "meeting309",
+)
 
 
 def active_fixture(name: str | None = None) -> GoldenFixture:

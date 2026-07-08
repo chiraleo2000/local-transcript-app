@@ -117,6 +117,16 @@ def enhance_audio(audio_path: str) -> str:
     return enhanced_path
 
 
+def enhance_audio_for_asr(audio_path: str) -> str:
+    """Enhance a copy for ASR when diarization uses the unenhanced path."""
+    from engines.preprocess import enhance_audio_for_asr as _enhance_asr
+
+    enhanced_path = _enhance_asr(audio_path)
+    if enhanced_path != audio_path and os.path.isfile(enhanced_path):
+        logger.info("ASR-only audio enhancement complete: %s", enhanced_path)
+    return enhanced_path
+
+
 def _stage_audio_enabled() -> bool:
     return os.getenv("AUDIO_STAGE_TO_TMP", "").strip().lower() in {
         "1", "true", "yes", "on",
@@ -206,6 +216,8 @@ def diarize_audio(
 
     kwargs = dict(diarize_kwargs or {})
     reference = kwargs.pop("reference_segments", None)
+    min_speakers_hint = int(kwargs.pop("min_speakers", 0) or 0)
+    num_speakers = int(kwargs.pop("num_speakers", 0) or 0)
     if reference:
         segments = [dict(seg) for seg in reference]
         logger.info(
@@ -214,8 +226,16 @@ def diarize_audio(
         )
         return segments
 
-    kwargs.setdefault("audio_duration_s", audio_duration_s)
-    return diarize(audio_path, max_speakers=max_speakers, **kwargs)
+    kwargs_duration = float(kwargs.pop("audio_duration_s", 0.0) or 0.0)
+    duration = kwargs_duration if kwargs_duration > 0 else audio_duration_s
+    return diarize(
+        audio_path,
+        num_speakers=num_speakers,
+        max_speakers=max_speakers,
+        min_speakers_hint=min_speakers_hint,
+        audio_duration_s=duration,
+        **kwargs,
+    )
 
 
 def clear_diarization_model() -> None:

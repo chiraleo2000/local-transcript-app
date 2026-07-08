@@ -25,8 +25,11 @@ load_dotenv(os.path.join(PROJECT_ROOT, ".env.production"), override=False)
 from backend.paths import app_root, resolve_path
 from engines.model_cache import (
     apply_runtime_cache_env_defaults,
+    configure_project_cache_paths,
     configured_asr_model_ids,
+    configured_diarization_model_id,
     consolidate_misplaced_hub_caches,
+    diarization_pipeline_dependencies,
     env_bool,
     has_cached_model_file,
     missing_cached_models,
@@ -38,13 +41,6 @@ logging.basicConfig(
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
-
-OPTIONAL_DIARIZATION_MODELS = (
-    "pyannote/speaker-diarization-community-1",
-    "pyannote/segmentation-3.0",
-    "pyannote/wespeaker-voxceleb-resnet34-LM",
-    "pyannote/speaker-diarization-3.1",
-)
 
 
 def _manifest_path() -> Path:
@@ -79,29 +75,9 @@ def _manifest_required_models(manifest: dict) -> list[str]:
 
 def _configure_cache_paths() -> str:
     """Point Hugging Face caches at the project-local models directory."""
-    model_root = os.getenv("APP_MODEL_ROOT") or str(app_root() / "models")
-    if not os.path.isabs(model_root):
-        model_root = str(resolve_path(model_root))
-    hf_home = os.path.join(model_root, "hf_cache")
-    hub_cache = os.path.join(hf_home, "hub")
-
-    os.environ["APP_MODEL_ROOT"] = model_root
-    os.environ["HF_HOME"] = hf_home
-    os.environ["HF_HUB_CACHE"] = hub_cache
-    os.environ["HUGGINGFACE_HUB_CACHE"] = hub_cache
-    os.environ.setdefault("TORCH_HOME", os.path.join(model_root, "torch"))
-    os.environ.setdefault("OV_CACHE_DIR", os.path.join(model_root, "ov_cache"))
+    paths = configure_project_cache_paths(PROJECT_ROOT)
     os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
-
-    for cache_dir in (
-        model_root,
-        hf_home,
-        hub_cache,
-        os.environ["TORCH_HOME"],
-        os.environ["OV_CACHE_DIR"],
-    ):
-        os.makedirs(cache_dir, exist_ok=True)
-    return hub_cache
+    return paths["HF_HUB_CACHE"]
 
 
 def main() -> int:
@@ -124,7 +100,9 @@ def main() -> int:
 
     require_diarization = env_bool("APP_REQUIRE_DIARIZATION_MODELS", False)
     if require_diarization:
-        required.extend(OPTIONAL_DIARIZATION_MODELS[:3])
+        diarization_model = configured_diarization_model_id()
+        required.append(diarization_model)
+        required.extend(diarization_pipeline_dependencies(diarization_model))
 
     missing = missing_cached_models(required)
     if missing:
@@ -142,7 +120,10 @@ def main() -> int:
     for model_id in required:
         logger.info("%s cache OK.", model_id)
 
-    diarization_missing = missing_cached_models(OPTIONAL_DIARIZATION_MODELS)
+    diarization_model = configured_diarization_model_id()
+    diarization_missing = missing_cached_models(
+        (diarization_model, *diarization_pipeline_dependencies(diarization_model))
+    )
     if diarization_missing and not require_diarization:
         logger.warning(
             "Optional diarization models missing (%s); ASR works offline without speaker labels.",

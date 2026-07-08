@@ -151,11 +151,18 @@ def tune_window_bounds(audio_duration_s: float) -> tuple[float, float] | None:
         return None
     max_tune_s = _env_float("DIARIZATION_MULTI_SAMPLE_TUNE_MAX_S", 150.0)
     tune_dur = min(max_tune_s, max(60.0, audio_duration_s * 0.12))
-    tune_start = min(
-        max(30.0, audio_duration_s * 0.06),
-        max(0.0, audio_duration_s - tune_dur - 45.0),
-    )
-    return tune_start, tune_start + tune_dur
+    tune_start_env = os.getenv("DIARIZATION_MULTI_SAMPLE_TUNE_START_S", "").strip()
+    if tune_start_env:
+        tune_start = max(0.0, _env_float("DIARIZATION_MULTI_SAMPLE_TUNE_START_S", 0.0))
+    else:
+        tune_start = min(
+            max(30.0, audio_duration_s * 0.06),
+            max(0.0, audio_duration_s - tune_dur - 45.0),
+        )
+    tune_end = min(audio_duration_s, tune_start + tune_dur)
+    if tune_end - tune_start < 60.0:
+        return None
+    return tune_start, tune_end
 
 
 def _base_seg_threshold(audio_duration_s: float) -> float:
@@ -179,7 +186,39 @@ def _curated_accuracy_configs(max_speakers: int) -> list[tuple[str, dict]]:
 
     community-1 ignores segmentation.threshold; vary clustering threshold,
     min_duration_off, and min_cluster_size so each pass can score differently.
+    For meeting-scale speaker counts the decisive VBx knob is Fa: the model
+    default 0.07 merges brief speakers away, so candidates must vary Fa or
+    every pass collapses identically (measured on the 309 meeting fixture).
     """
+    if max_speakers >= 11:
+        fa_combos = [
+            (0.58, 0.03, 0.25),
+            (0.60, 0.04, 0.25),
+            (0.55, 0.03, 0.30),
+            (0.60, 0.04, 0.22),
+            (0.65, 0.04, 0.28),
+        ]
+    elif max_speakers >= 6:
+        fa_combos = [
+            (0.60, 0.04, 0.20),
+            (0.60, 0.04, 0.15),
+            (0.65, 0.04, 0.25),
+            (0.55, 0.05, 0.20),
+            (0.60, 0.03, 0.07),
+        ]
+    else:
+        fa_combos = []
+    if fa_combos:
+        return [
+            (
+                f"meeting_clust={clust_t:.2f}_off={min_off:.2f}_fa={fa:.2f}",
+                {
+                    "segmentation": {"min_duration_off": min_off},
+                    "clustering": {"threshold": clust_t, "Fa": fa, "Fb": 0.8},
+                },
+            )
+            for clust_t, min_off, fa in fa_combos
+        ]
     if max_speakers == 2:
         combos = [
             (0.40, 0.03, 2),
@@ -266,6 +305,8 @@ def _params_key(params: dict) -> tuple:
         round(float(seg.get("min_duration_off", -1)), 3),
         round(float(clust.get("threshold", -1)), 3),
         int(clust.get("min_cluster_size", -1)),
+        round(float(clust.get("Fa", -1)), 3),
+        round(float(clust.get("Fb", -1)), 3),
     )
 
 

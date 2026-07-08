@@ -329,3 +329,8 @@ def preprocess_audio(audio_path: str) -> str:
     out_kb = os.path.getsize(final_path) // 1024
     logger.info("Preprocessing done in %.2fs  (%d KB → %d KB)", elapsed, in_kb, out_kb)
     return final_path
+
+
+def enhance_audio_for_asr(audio_path: str) -> str:
+    """Enhance audio for the ASR stage when diarization keeps the raw path."""
+    return preprocess_audio(audio_path)

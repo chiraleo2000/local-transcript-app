@@ -95,5 +95,5 @@ def test_recording19_meets_performance_target():
 @pytest.mark.golden
 @pytest.mark.gpu
 @pytest.mark.slow
-def test_sample47_meets_performance_target():
-    _run_perf("sample47")
+def test_recording47_meets_performance_target():
+    _run_perf("recording47")

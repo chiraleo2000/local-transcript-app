@@ -38,25 +38,14 @@ apply_cpu_thread_limits()
 _model_root = os.getenv("APP_MODEL_ROOT") or str(_install_root / "models")
 if not os.path.isabs(_model_root):
     _model_root = str(resolve_path(_model_root))
-_HF_HOME = os.path.join(_model_root, "hf_cache")
-os.environ.setdefault("APP_MODEL_ROOT", _model_root)
-os.environ.setdefault("HF_HOME", _HF_HOME)
-os.environ.setdefault("HF_HUB_CACHE", os.path.join(_HF_HOME, "hub"))
-os.environ.setdefault("HUGGINGFACE_HUB_CACHE", os.path.join(_HF_HOME, "hub"))
-os.environ.setdefault("TORCH_HOME", os.path.join(_model_root, "torch"))
-os.environ.setdefault("OV_CACHE_DIR", os.path.join(_model_root, "ov_cache"))
 
-for _cache_dir in [
-    os.environ["APP_MODEL_ROOT"],
-    os.environ["HF_HOME"],
-    os.environ["HF_HUB_CACHE"],
-    os.environ["TORCH_HOME"],
-    os.environ["OV_CACHE_DIR"],
-]:
-    os.makedirs(_cache_dir, exist_ok=True)
+from engines.model_cache import (
+    apply_runtime_cache_env_defaults,
+    configure_project_cache_paths,
+    consolidate_misplaced_hub_caches,
+)
 
-from engines.model_cache import apply_runtime_cache_env_defaults, consolidate_misplaced_hub_caches
-
+configure_project_cache_paths(_install_root, model_root=_model_root)
 apply_runtime_cache_env_defaults()
 consolidate_misplaced_hub_caches(_install_root)
 
@@ -278,84 +267,101 @@ def _gradio_transcribe_concurrency() -> int:
         return 8
 
 
+def _is_eager_preload_mode(mode: str | None = None) -> bool:
+    if mode is None:
+        mode = os.getenv("ASR_PRELOAD_MODE", "eager").strip().lower()
+    return mode in {"eager", "preload", "true", "1"}
+
+
+def _resolve_preload_engines() -> list[str]:
+    configured = os.getenv("ASR_PRELOAD_ENGINES", "").strip()
+    if configured:
+        return [part.strip() for part in configured.split(",") if part.strip()]
+    # When running cache-first (kept resident) on OpenVINO/CPU, preload both engines
+    # so switching is instant.
+    try:
+        hw = detect_hardware()
+    except Exception:  # pylint: disable=broad-exception-caught
+        hw = {}
+    keep_preloaded = os.getenv("ASR_KEEP_PRELOADED", "false").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+    if keep_preloaded and hw.get("backend") == "openvino":
+        return [ENGINE_TYPHOON, ENGINE_PATHUMMA]
+    return default_asr_engines()
+
+
+def _mark_engines_available(engines: list[str]) -> None:
+    for engine in engines:
+        _load_status[engine] = "available"
+
+
+def _preload_asr_engine(engine: str) -> bool:
+    try:
+        _load_status[engine] = "loading..."
+        load_model(engine)
+        _load_status[engine] = "ready"
+        logger.info("%s loaded.", engine)
+        return True
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        _load_status[engine] = f"FAILED: {exc}"
+        logger.exception("%s load failed: %s", engine, exc)
+        return False
+
+
+def _try_preload_diarization() -> None:
+    mode = os.getenv("DIARIZATION_PRELOAD_MODE", "eager").strip().lower()
+    if not _is_eager_preload_mode(mode):
+        return
+    try:
+        from engines.diarization import load_model as load_diarization_model
+        from engines.model_cache import configured_diarization_model_id, has_cached_pipeline
+
+        diarization_model = configured_diarization_model_id()
+        if not has_cached_pipeline(diarization_model):
+            logger.warning(
+                "Skipping diarization preload; model %s is not cached yet.",
+                diarization_model,
+            )
+            return
+        logger.info("Preloading pyannote diarization model...")
+        load_diarization_model()
+        logger.info("Pyannote diarization loaded.")
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        logger.warning("Pyannote diarization preload skipped: %s", exc)
+
+
 def _preload_models() -> None:
     """Preload the configured ASR model at startup by default."""
-    preload_mode = os.getenv("ASR_PRELOAD_MODE", "eager").strip().lower()
-    if preload_mode not in {"eager", "preload", "true", "1"}:
-        for engine in ALL_ENGINES:
-            _load_status[engine] = "available"
+    if not _is_eager_preload_mode():
+        _mark_engines_available(ALL_ENGINES)
         _models_ready.set()
         logger.info("ASR preload skipped; models are available on demand.")
         return
 
-    configured = os.getenv("ASR_PRELOAD_ENGINES", "").strip()
-    if configured:
-        preload_engines = [part.strip() for part in configured.split(",") if part.strip()]
-    else:
-        # When running cache-first (kept resident) on OpenVINO/CPU, preload both engines
-        # so switching is instant.
-        try:
-            hw = detect_hardware()
-        except Exception:  # pylint: disable=broad-exception-caught
-            hw = {}
-        if os.getenv("ASR_KEEP_PRELOADED", "false").strip().lower() in {"1", "true", "yes", "on"} and hw.get("backend") == "openvino":
-            preload_engines = [ENGINE_TYPHOON, ENGINE_PATHUMMA]
-        else:
-            preload_engines = default_asr_engines()
+    preload_engines = _resolve_preload_engines()
     warmed_engines = [engine_for_preload(engine) for engine in preload_engines]
     skipped = [e for e in ALL_ENGINES if e not in warmed_engines]
-    for engine in skipped:
-        _load_status[engine] = "available"
+    _mark_engines_available(skipped)
     if skipped:
         logger.info(
             "ASR eager preload limited to %s; others available on demand.",
             ", ".join(warmed_engines),
         )
 
-    preload_failed = False
     asr_ready = False
-
-    def _load(engine: str) -> None:
-        nonlocal preload_failed, asr_ready
-        try:
-            _load_status[engine] = "loading..."
-            load_model(engine)
-            _load_status[engine] = "ready"
-            asr_ready = True
-            logger.info("%s loaded.", engine)
-        except Exception as exc:  # pylint: disable=broad-exception-caught
-            preload_failed = True
-            _load_status[engine] = f"FAILED: {exc}"
-            logger.exception("%s load failed: %s", engine, exc)
-
+    preload_failed = False
     for engine in preload_engines:
-        _load(engine_for_preload(engine))
+        if _preload_asr_engine(engine_for_preload(engine)):
+            asr_ready = True
+        else:
+            preload_failed = True
 
     if not asr_ready:
         logger.error("No ASR engine preloaded; upload remains disabled until model cache is fixed.")
         return
 
-    diarization_preload_mode = os.getenv("DIARIZATION_PRELOAD_MODE", "eager").strip().lower()
-    if diarization_preload_mode in {"eager", "preload", "true", "1"}:
-        try:
-            from engines.diarization import load_model as load_diarization_model
-            from engines.model_cache import has_cached_model_file
-
-            diarization_model = os.getenv(
-                "DIARIZATION_MODEL_ID",
-                "pyannote/speaker-diarization-community-1",
-            )
-            if not has_cached_model_file(diarization_model):
-                logger.warning(
-                    "Skipping diarization preload; model %s is not cached yet.",
-                    diarization_model,
-                )
-            else:
-                logger.info("Preloading pyannote diarization model...")
-                load_diarization_model()
-                logger.info("Pyannote diarization loaded.")
-        except Exception as exc:  # pylint: disable=broad-exception-caught
-            logger.warning("Pyannote diarization preload skipped: %s", exc)
+    _try_preload_diarization()
 
     if preload_failed:
         logger.warning("Some optional models failed preload; continuing with available engines.")

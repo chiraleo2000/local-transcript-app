@@ -47,6 +47,7 @@ def ensure_app_dirs() -> None:
     os.environ.setdefault("HF_HOME", str(HF_CACHE_DIR))
     os.environ.setdefault("HF_HUB_CACHE", str(HF_CACHE_DIR / "hub"))
     os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(HF_CACHE_DIR / "hub"))
+    os.environ.setdefault("TRANSFORMERS_CACHE", str(HF_CACHE_DIR / "hub"))
     os.environ.setdefault("TORCH_HOME", str(MODEL_DIR / "torch"))
     os.environ.setdefault("OV_CACHE_DIR", str(OV_CACHE_DIR))
 

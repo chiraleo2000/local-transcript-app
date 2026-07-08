@@ -37,9 +37,10 @@ COPY engines/ engines/
 COPY backend/ backend/
 COPY torchcodec/ torchcodec/
 COPY scripts/ scripts/
+COPY tests/ tests/
 COPY app.py .
 COPY sitecustomize.py .
-COPY .env* ./
+# Runtime env comes from docker-compose env_file / environment (not baked into image).
 
 ENV PYTHONPATH=/app \
     APP_MODEL_ROOT=/app/models \
@@ -53,7 +54,11 @@ ENV PYTHONPATH=/app \
     OV_CACHE_DIR=/app/models/ov_cache \
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-RUN sed -i 's/\r$//' scripts/docker_entrypoint.sh && chmod +x scripts/docker_entrypoint.sh
+# Run as non-root (Sonar docker:S6471); bind-mounted volumes remain writable on Windows hosts.
+RUN sed -i 's/\r$//' scripts/docker_entrypoint.sh && chmod +x scripts/docker_entrypoint.sh \
+    && groupadd -r appuser && useradd -r -g appuser -d /app -s /sbin/nologin appuser \
+    && chown -R appuser:appuser /app
+USER appuser
 
 # Gradio listens on 7896 inside the container (host maps 7987:7896 in compose)
 EXPOSE 7896
