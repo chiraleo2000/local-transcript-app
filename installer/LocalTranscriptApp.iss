@@ -3,15 +3,12 @@
 ; Build flow:
 ;   1. Build the standalone GUI executable:
 ;        python -m PyInstaller --noconfirm --clean LocalTranscriptApp.spec
-;      Output: dist\LocalTranscriptApp\LocalTranscriptApp.exe plus _internal\
 ;   2. Pre-cache gated models into .\models\ on the BUILD machine using a
-;      valid HF_TOKEN, then strip the token from .env.production. The
-;      installer copies the resulting cache as part of the payload so end
-;      users never need a Hugging Face token.
-;   3. Materialize Hugging Face snapshot links for Inno Setup:
-;        powershell -ExecutionPolicy Bypass -File scripts\materialize_hf_cache_for_inno.ps1
-;   4. Compile this script with Inno Setup Compiler (iscc) to produce
-;      LocalTranscriptAppSetup.exe.
+;      valid HF_TOKEN when needed, then materialize the HF cache for Inno.
+;   3. Compile this script with Inno Setup Compiler (iscc).
+;
+; The wizard collects optional HF_TOKEN + resource settings and writes them
+; into {app}\.env after files are installed.
 
 #define MyAppName "Local Transcript App"
 #define MyAppVersion "1.2.6"
@@ -26,7 +23,7 @@ AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
 DefaultDirName={autopf}\LocalTranscriptApp
 DefaultGroupName={#MyAppName}
-OutputDir=..\release\v1.0.0
+OutputDir=..\release\v1.2.6
 OutputBaseFilename=LocalTranscriptAppSetup
 Compression=none
 SolidCompression=no
@@ -39,17 +36,13 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 
 [Files]
-; GUI application produced by PyInstaller onedir mode.
 Source: "..\dist\LocalTranscriptApp\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
-; Production env template (no HF_TOKEN; offline cache-first).
 Source: "..\.env.production"; DestDir: "{app}"; DestName: ".env"; Flags: onlyifdoesntexist
-; Pre-cached HF model payload (gated models bundled at build time — no token needed at runtime).
-; Do not ship models\_archive or generated OpenVINO caches; they can be huge and stale.
 Source: "{#ModelStageRoot}\models\hf_cache\*"; DestDir: "{app}\models\hf_cache"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#ModelStageRoot}\models\torch\*"; DestDir: "{app}\models\torch"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
-; Optional: ship source for advanced users / offline diagnostics.
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\RELEASE_NOTES.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\installer\write_runtime_env.py"; DestDir: "{app}\installer"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"
@@ -61,3 +54,74 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; WorkingDir: "{app}"; Flags: postinstall skipifsilent nowait
+
+[Code]
+var
+  TokenPage: TInputQueryWizardPage;
+  ResourcePage: TInputQueryWizardPage;
+
+procedure InitializeWizard;
+begin
+  TokenPage := CreateInputQueryPage(wpSelectTasks,
+    'Hugging Face token',
+    'Optional when models are already bundled under models\hf_cache.',
+    'Enter a Hugging Face token only if you need to download gated models (Typhoon / pyannote). Leave blank for offline packs.');
+  TokenPage.Add('HF_TOKEN:', False);
+
+  ResourcePage := CreateInputQueryPage(TokenPage.ID,
+    'Resource settings',
+    'Minimum host: 4 CPU threads / 8 GB RAM. NVIDIA CUDA still needs ≥ 8 GB VRAM.',
+    'Tune CPU threads and optional backend force. Empty backend = auto-detect.');
+  ResourcePage.Add('APP_CPU_THREADS (0 = auto):', False);
+  ResourcePage.Add('APP_FORCE_BACKEND (cuda|rocm|openvino|directml|cpu):', False);
+  ResourcePage.Add('OV_DEVICE (GPU|NPU|CPU):', False);
+  ResourcePage.Add('MIN_SYSTEM_RAM_MB:', False);
+  ResourcePage.Add('MIN_CPU_THREADS:', False);
+  ResourcePage.Values[0] := '0';
+  ResourcePage.Values[2] := 'GPU';
+  ResourcePage.Values[3] := '8192';
+  ResourcePage.Values[4] := '4';
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  ResultCode: Integer;
+  Cmd, Token, Threads, Backend, OvDevice, MinRam, MinCpu: string;
+begin
+  if CurStep <> ssPostInstall then
+    Exit;
+
+  Token := Trim(TokenPage.Values[0]);
+  Threads := Trim(ResourcePage.Values[0]);
+  Backend := Trim(ResourcePage.Values[1]);
+  OvDevice := Trim(ResourcePage.Values[2]);
+  MinRam := Trim(ResourcePage.Values[3]);
+  MinCpu := Trim(ResourcePage.Values[4]);
+  if Threads = '' then Threads := '0';
+  if MinRam = '' then MinRam := '8192';
+  if MinCpu = '' then MinCpu := '4';
+
+  Cmd := '"' + ExpandConstant('{app}\{#MyAppExeName}') + '"';
+  { Prefer bundled Python helper via the app folder — fall back to rewriting .env in Pascal if python missing. }
+  if FileExists(ExpandConstant('{app}\installer\write_runtime_env.py')) then
+  begin
+    if Exec('python',
+      '"' + ExpandConstant('{app}\installer\write_runtime_env.py') + '"' +
+      ' --env-path "' + ExpandConstant('{app}\.env') + '"' +
+      ' --hf-token "' + Token + '"' +
+      ' --cpu-threads "' + Threads + '"' +
+      ' --force-backend "' + Backend + '"' +
+      ' --ov-device "' + OvDevice + '"' +
+      ' --min-ram-mb "' + MinRam + '"' +
+      ' --min-cpu-threads "' + MinCpu + '"' +
+      ' --min-vram-mb "8192"' +
+      ' --ui-max-jobs "1"' +
+      ' --ui-gradio-concurrency "4"',
+      ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    begin
+      Log(Format('write_runtime_env.py exit=%d', [ResultCode]));
+    end
+    else
+      Log('python not found; .env left as shipped template — edit manually.');
+  end;
+end;

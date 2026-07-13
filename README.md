@@ -3,7 +3,51 @@
 GPU-accelerated local audio/video transcription with speaker diarization.  
 No cloud APIs. No telemetry. All processing stays on your machine.
 
-**Version 1.2.6**
+**Version 1.2.6** — see [RELEASE_NOTES.md](RELEASE_NOTES.md)
+
+---
+
+## Before you deploy (config checklist)
+
+Do this **before** Docker or the installer:
+
+1. **Copy env template**
+   ```bat
+   copy .env.example .env
+   ```
+2. **Hugging Face token** (needed only if `models/` is empty — gated Typhoon / pyannote):
+   ```dotenv
+   HF_TOKEN=hf_your_token_here
+   ```
+   Accept model terms on Hugging Face, then bootstrap once: `python scripts/bootstrap_models.py`
+3. **Resource floor** (defaults match minimum hosts):
+   ```dotenv
+   MIN_CPU_THREADS=4
+   MIN_SYSTEM_RAM_MB=8192
+   MIN_NVIDIA_VRAM_MB=8192
+   APP_CPU_THREADS=0
+   ```
+   `APP_CPU_THREADS=0` = auto-detect. OpenVINO Docker defaults to **4** threads; GPU Docker defaults to **16** (override with `$env:APP_CPU_THREADS`).
+4. **Pick backend** (optional — leave unset for auto-detect):
+   ```dotenv
+   # APP_FORCE_BACKEND=cuda|rocm|openvino|directml|cpu
+   OV_DEVICE=GPU
+   ```
+5. **Workstation / LAN** (optional):
+   ```dotenv
+   UI_MAX_CONCURRENT_JOBS=1
+   UI_GRADIO_TRANSCRIBE_CONCURRENCY=4
+   UI_HISTORY_PER_CLIENT_IP=true
+   GRADIO_AUTH_USER=
+   GRADIO_AUTH_PASSWORD=
+   ```
+6. **Deploy**
+   - NVIDIA: `docker compose -f docker-compose.gpu.yml up -d --build` → http://localhost:7988  
+   - OpenVINO / Intel / AMD AI / ARM: `docker compose -f docker-compose.openvino.yml up -d --build` → http://localhost:7987  
+   - Native installer: `installer\install.bat --hf-token hf_xxx` or `./installer/install.sh --hf-token hf_xxx`  
+   - Public proxy: [`deploy/README.md`](deploy/README.md)
+
+`docker-compose.*.yml` **overrides** many `.env` keys for production safety. Put secrets (`HF_TOKEN`) in `.env`; tune runtime policy in compose or via installer flags.
 
 ---
 
@@ -228,13 +272,38 @@ local-transcript-app/
 
 ## Configuration (`.env`)
 
-Copy `.env.example` to `.env` and edit before first run.
+Copy `.env.example` to `.env` and complete the [Before you deploy](#before-you-deploy-config-checklist) checklist first.
 
-### Required
+### Required (when models are not pre-bundled)
 
 ```dotenv
-HF_TOKEN=hf_your_token_here     # Required for gated models (Typhoon Whisper, pyannote)
+HF_TOKEN=hf_your_token_here     # Gated models: Typhoon Whisper, pyannote
 ```
+
+### Resource settings (installer writes these)
+
+```dotenv
+MIN_CPU_THREADS=4
+MIN_SYSTEM_RAM_MB=8192
+MIN_NVIDIA_VRAM_MB=8192
+APP_CPU_THREADS=0                 # 0 = auto-detect logical CPUs
+# APP_FORCE_BACKEND=openvino      # optional force
+OV_DEVICE=GPU
+UI_MAX_CONCURRENT_JOBS=1
+UI_GRADIO_TRANSCRIBE_CONCURRENCY=4
+```
+
+Installer examples:
+
+```bat
+installer\install.bat --hf-token hf_xxx --cpu-threads 4 --force-backend openvino --ov-device GPU
+```
+
+```bash
+./installer/install.sh --hf-token hf_xxx --cpu-threads 4 --force-backend openvino --ov-device GPU
+```
+
+The Inno Setup GUI wizard also prompts for token + resource fields and runs `installer/write_runtime_env.py`.
 
 ### ASR
 
@@ -467,17 +536,13 @@ The CUDA runtime uses a strict 8 GB-class policy. On GPUs up to `ASR_8GB_CLASS_M
 
 ## Windows Quick Start For Normal Users
 
-The target release is a single Windows installer `.exe`. The installer flow is planned to:
+Use the GUI installer (Inno Setup) or `installer\install.bat`:
 
-1. Install the app files.
-2. Check hardware and choose CUDA/OpenVINO/CPU backend.
-3. Create local folders under the app path.
-4. Download/export required models into `models/`.
-5. Write `config/app_config.json`.
-6. Create Start Menu/Desktop shortcuts.
-7. Launch the local Gradio app.
+1. Install app files + models (offline pack) or pass `--hf-token` to bootstrap later.
+2. Wizard / flags write `HF_TOKEN` and resource knobs into `.env` (`MIN_*`, `APP_CPU_THREADS`, optional `APP_FORCE_BACKEND`).
+3. Launch from Start Menu / Desktop shortcut (`run.bat` / `LocalTranscriptApp.exe`).
 
-Until the installer build is finalized, use the developer setup flow below.
+Until the `.exe` build is finalized, prefer `installer\install.bat` or the developer setup below.
 
 ## Developer Setup On Windows
 

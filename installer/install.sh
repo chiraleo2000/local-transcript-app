@@ -2,15 +2,17 @@
 # ---------------------------------------------------------------------------
 # Local Transcript App — Linux installer (GUI launcher, no Docker required)
 # ---------------------------------------------------------------------------
-# Installs the app under $HOME/.local/share/local-transcript-app, sets up a
-# venv, installs Python deps, registers a Desktop entry that launches the
-# pywebview GUI, and creates a `local-transcript-app` shim in ~/.local/bin.
+# Installs under $HOME/.local/share/local-transcript-app, sets up a venv,
+# writes .env with HF token + resource settings, and registers a Desktop entry.
 #
 # Usage:
 #   chmod +x install.sh
-#   ./install.sh                     # default install
-#   ./install.sh --prefix /opt/lta   # custom prefix
+#   ./install.sh
+#   ./install.sh --prefix /opt/lta --hf-token hf_xxx --cpu-threads 4
+#   ./install.sh --force-backend openvino --ov-device GPU
 #   ./install.sh --uninstall
+#
+# Env fallbacks: HF_TOKEN, APP_CPU_THREADS, APP_FORCE_BACKEND, OV_DEVICE
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
@@ -22,6 +24,15 @@ PREFIX="${DEFAULT_PREFIX}"
 DO_UNINSTALL=0
 SKIP_DEPS=0
 WITH_ROCM=0
+HF_TOKEN_ARG="${HF_TOKEN:-}"
+CPU_THREADS_ARG="${APP_CPU_THREADS:-0}"
+FORCE_BACKEND_ARG="${APP_FORCE_BACKEND:-}"
+OV_DEVICE_ARG="${OV_DEVICE:-}"
+MIN_RAM_ARG=8192
+MIN_CPU_ARG=4
+MIN_VRAM_ARG=8192
+UI_MAX_JOBS_ARG=1
+UI_CONCURRENCY_ARG=4
 
 print() { printf '\033[1;36m[install]\033[0m %s\n' "$*"; }
 warn()  { printf '\033[1;33m[warn]\033[0m %s\n' "$*" >&2; }
@@ -29,12 +40,19 @@ die()   { printf '\033[1;31m[error]\033[0m %s\n' "$*" >&2; exit 1; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --prefix)     PREFIX="$2"; shift 2 ;;
-    --uninstall)  DO_UNINSTALL=1; shift ;;
-    --skip-deps)  SKIP_DEPS=1; shift ;;
-    --with-rocm)  WITH_ROCM=1; shift ;;
+    --prefix)            PREFIX="$2"; shift 2 ;;
+    --uninstall)         DO_UNINSTALL=1; shift ;;
+    --skip-deps)         SKIP_DEPS=1; shift ;;
+    --with-rocm)         WITH_ROCM=1; shift ;;
+    --hf-token)          HF_TOKEN_ARG="$2"; shift 2 ;;
+    --cpu-threads)       CPU_THREADS_ARG="$2"; shift 2 ;;
+    --force-backend)     FORCE_BACKEND_ARG="$2"; shift 2 ;;
+    --ov-device)         OV_DEVICE_ARG="$2"; shift 2 ;;
+    --min-ram-mb)        MIN_RAM_ARG="$2"; shift 2 ;;
+    --min-cpu-threads)   MIN_CPU_ARG="$2"; shift 2 ;;
+    --min-vram-mb)       MIN_VRAM_ARG="$2"; shift 2 ;;
     -h|--help)
-      sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
       exit 0 ;;
     *) die "Unknown option: $1" ;;
   esac
@@ -53,7 +71,6 @@ if [[ "${DO_UNINSTALL}" -eq 1 ]]; then
   exit 0
 fi
 
-# --- prerequisites ---------------------------------------------------------
 command -v python3 >/dev/null 2>&1 || die "python3 not found. Install Python 3.10+ first."
 PY_MAJ=$(python3 -c 'import sys; print(sys.version_info[0])')
 PY_MIN=$(python3 -c 'import sys; print(sys.version_info[1])')
@@ -70,22 +87,43 @@ print "  source : ${SRC_DIR}"
 print "  prefix : ${PREFIX}"
 
 mkdir -p "${PREFIX}"
-# Copy source tree (skip large/local-only dirs).
 rsync -a --delete \
   --exclude 'venv/' --exclude '.venv/' \
   --exclude '__pycache__/' --exclude '*.pyc' \
   --exclude 'build/' --exclude 'dist/' \
   --exclude 'storage/jobs/' --exclude 'storage/transcripts/' --exclude 'storage/logs/' --exclude 'storage/audio/' \
-  --exclude '.git/' \
+  --exclude '.git/' --exclude 'release/' \
   --exclude '.env' \
   "${SRC_DIR}/" "${PREFIX}/"
 
-# Ship the no-token runtime config as the active .env.
 if [[ -f "${PREFIX}/.env.production" && ! -f "${PREFIX}/.env" ]]; then
   cp "${PREFIX}/.env.production" "${PREFIX}/.env"
 fi
+if [[ ! -f "${PREFIX}/.env" && -f "${PREFIX}/.env.example" ]]; then
+  cp "${PREFIX}/.env.example" "${PREFIX}/.env"
+fi
 
-# --- venv + deps ------------------------------------------------------------
+print "Writing HF token + resource settings into .env"
+WRITE_ENV="${PREFIX}/installer/write_runtime_env.py"
+[[ -f "${WRITE_ENV}" ]] || WRITE_ENV="${SRC_DIR}/installer/write_runtime_env.py"
+python3 "${WRITE_ENV}" \
+  --env-path "${PREFIX}/.env" \
+  --hf-token "${HF_TOKEN_ARG}" \
+  --cpu-threads "${CPU_THREADS_ARG}" \
+  --force-backend "${FORCE_BACKEND_ARG}" \
+  --ov-device "${OV_DEVICE_ARG}" \
+  --min-ram-mb "${MIN_RAM_ARG}" \
+  --min-cpu-threads "${MIN_CPU_ARG}" \
+  --min-vram-mb "${MIN_VRAM_ARG}" \
+  --ui-max-jobs "${UI_MAX_JOBS_ARG}" \
+  --ui-gradio-concurrency "${UI_CONCURRENCY_ARG}"
+
+if [[ -z "${HF_TOKEN_ARG}" ]]; then
+  warn "No HF_TOKEN set. Required only if models/ is missing — accept gated model terms, then re-run with --hf-token or edit ${PREFIX}/.env"
+else
+  print "HF_TOKEN written to .env"
+fi
+
 if [[ "${SKIP_DEPS}" -eq 0 ]]; then
   print "Creating virtualenv"
   python3 -m venv "${PREFIX}/venv"
@@ -103,7 +141,6 @@ else
   warn "--skip-deps set; venv not created. You must provide a working Python env at ${PREFIX}/venv."
 fi
 
-# --- launcher shim ---------------------------------------------------------
 mkdir -p "$(dirname "${BIN_LINK}")"
 cat > "${BIN_LINK}" <<EOF
 #!/usr/bin/env bash
@@ -113,7 +150,6 @@ exec "${PREFIX}/venv/bin/python" "${PREFIX}/launcher.py" "\$@"
 EOF
 chmod +x "${BIN_LINK}"
 
-# --- desktop entry ---------------------------------------------------------
 mkdir -p "$(dirname "${DESKTOP_FILE}")"
 cat > "${DESKTOP_FILE}" <<EOF
 [Desktop Entry]
@@ -134,9 +170,7 @@ command -v update-desktop-database >/dev/null 2>&1 && \
 print "Installation complete."
 print "  Launch from your application menu: ${APP_NAME}"
 print "  Or run from terminal: ${APP_ID}"
+print "  Config: ${PREFIX}/.env  (token + MIN_* / APP_CPU_THREADS / APP_FORCE_BACKEND)"
 print ""
-print "First-run notes:"
-print "  - Offline Model Pack: if models/ shipped with this release, no HF token is needed."
-print "  - If models are missing, set HF_TOKEN and run:"
-print "      ${PREFIX}/venv/bin/python ${PREFIX}/scripts/bootstrap_models.py"
-print "  - Force a backend with APP_FORCE_BACKEND=cuda|rocm|openvino|directml|cpu"
+print "If models/ is missing, bootstrap once:"
+print "  ${PREFIX}/venv/bin/python ${PREFIX}/scripts/bootstrap_models.py"
