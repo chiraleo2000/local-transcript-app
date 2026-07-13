@@ -510,10 +510,10 @@ local-transcript-app/
   engines/                       # Model implementation compatibility layer
   scripts/
     bootstrap_models.py          # Model download/export bootstrap
-  installer/                     # Windows installer specs/scripts
+  installer/                     # install.bat / install.sh / Inno + write_runtime_env.py
   storage/                       # Created at runtime; user transcripts/jobs/logs
   models/                        # Created at runtime; model/cache folders
-  RUN_INSTRUCTIONS.md            # Practical run guide
+  RELEASE_NOTES.md               # Current release notes (single file)
 ```
 
 ## Hardware Policy
