@@ -270,6 +270,13 @@ def should_clear_models_after_job() -> bool:
     return _env_bool("ASR_CLEAR_VRAM_AFTER_JOB", False)
 
 
+def should_warm_start_gpu_job() -> bool:
+    """Skip full model unload at job start when weights stay resident between jobs."""
+    return _env_bool("ASR_KEEP_PRELOADED", False) and not _env_bool(
+        "ASR_CLEAR_VRAM_AFTER_JOB", False
+    )
+
+
 def diarization_wants_cuda() -> bool:
     """True when diarization is configured to prefer CUDA (ignores transient free VRAM)."""
     requested = os.getenv("DIARIZATION_DEVICE", "auto").strip().lower()

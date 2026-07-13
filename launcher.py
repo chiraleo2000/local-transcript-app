@@ -70,7 +70,7 @@ VENV_PYTHON_NIX = os.path.join(HERE, "venv", "bin", "python")
 APP_PY = os.path.join(HERE, "app.py")
 COMPOSE_GPU = os.path.join(HERE, "docker-compose.gpu.yml")
 COMPOSE_OPENVINO = os.path.join(HERE, "docker-compose.openvino.yml")
-COMPOSE_CPU = os.path.join(HERE, "docker-compose.yml")
+COMPOSE_CPU = COMPOSE_OPENVINO
 APP_URL = "http://127.0.0.1:7896"
 READY_URL = f"{APP_URL}/startup-events"
 

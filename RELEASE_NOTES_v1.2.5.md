@@ -19,7 +19,6 @@ Enterprise GPU Docker acceptance, offline-only model policy, cal15 sample01 base
 - Models load strictly from local `./models/` — no Hugging Face Hub downloads at deploy or runtime
 - `APP_REQUIRE_DIARIZATION_MODELS=true` in GPU compose; diarization models must be cached before acceptance runs
 - `scripts/_bootstrap.py` sets offline cache defaults; `scripts/ensure_model_cache.py` preflight in Docker validation
-- Offline loaders in diarization sweep/probe scripts (`scripts/sweep_309_vbx.py`, `scripts/probe_309_centroids.py`)
 
 ## ASR and diarization improvements
 
@@ -40,6 +39,28 @@ Enterprise GPU Docker acceptance, offline-only model policy, cal15 sample01 base
 - `MIN_NVIDIA_VRAM_MB=8192` — 8 GB VRAM minimum for NVIDIA GPU profile
 - `ASR_CUDA_MEMORY_FRACTION=0.92` with batch=1, beams=6, single concurrent job
 
+## Offline slim pack (GitHub release assets)
+
+Source + preloaded HF models (Typhoon, Pathumma, pyannote). OpenVINO `ov_cache` is omitted to keep the download smaller.
+
+- `install.bat` / `install.sh` — Windows / Linux installers
+- `LocalTranscriptApp-v1.2.5-offline.zip.001` … — split zip parts (GitHub 2 GiB limit)
+- `join_offline_zip.ps1` / `join_offline_zip.sh` — recombine parts
+- `SHA256SUMS.txt` / `README_OFFLINE_PACK.md`
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\join_offline_zip.ps1
+# Extract, then run installer\install.bat
+```
+
+```bash
+chmod +x join_offline_zip.sh && ./join_offline_zip.sh
+unzip LocalTranscriptApp-v1.2.5-offline.zip
+cd LocalTranscriptApp-v1.2.5 && ./installer/install.sh
+```
+
+No Hugging Face token needed for CUDA/GPU offline use. For OpenVINO, export IR once after install.
+
 ## Deploy
 
 ```powershell
@@ -49,6 +70,6 @@ docker compose -f docker-compose.gpu.yml up -d --build
 # Run acceptance (requires cached models under ./models/)
 python scripts/run_docker_acceptance.py --tag release
 
-# OpenVINO (v1.2.4 profile, port 7987)
-docker compose -f docker-compose.profiles.yml --profile openvino up -d --build
+# OpenVINO / CPU (port 7987)
+docker compose -f docker-compose.openvino.yml up -d --build
 ```

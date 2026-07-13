@@ -25,6 +25,7 @@ from backend.services.asr_local import (
     should_clear_models_after_job,
     should_unload_asr_for_diarization,
     should_unload_on_cancel,
+    should_warm_start_gpu_job,
     transcribe_engine,
     unload_model,
 )
@@ -63,6 +64,7 @@ class JobMeta:
     display_name: str = ""
     source_filename: str = ""
     output_name: str | None = None
+    client_ip: str = ""
 
 
 @dataclass
@@ -698,7 +700,11 @@ def _execute_transcription_stages(
     try:
         from backend import vram_state
 
-        vram_state.prepare_exclusive_gpu_job(unload_models=True)
+        # Warm start keeps preloaded ASR/diar weights; staging still unloads ASR
+        # before CUDA diarization inside the pipeline when needed.
+        vram_state.prepare_exclusive_gpu_job(
+            unload_models=not should_warm_start_gpu_job(),
+        )
     except ImportError:
         pass
     if ctx.manifest_sync:
@@ -708,6 +714,7 @@ def _execute_transcription_stages(
             "display_name": ctx.meta.display_name,
             "source_filename": ctx.meta.source_filename,
             "source_path": ctx.media_path,
+            "client_ip": ctx.meta.client_ip,
         })
     temp_files: list[str] = []
     if ctx.meta.source_filename:
@@ -745,6 +752,29 @@ def _execute_transcription_stages(
     )
 
 
+def _acquire_gpu_job_slot(
+    cancel_event: threading.Event | None,
+    progress: JobProgress | None,
+) -> None:
+    """Wait for a GPU pipeline slot; update queue status and honor cancel."""
+    while True:
+        _check_cancel(cancel_event)
+        if _job_semaphore.acquire(blocking=False):
+            return
+        if progress is not None:
+            ahead = max(0, active_job_count() - _max_concurrent_jobs())
+            slots = _max_concurrent_jobs()
+            progress.set_phase(
+                "queued",
+                (
+                    f"Queued — {ahead} job(s) ahead "
+                    f"({slots} GPU slot{'s' if slots != 1 else ''})…"
+                ),
+                1.0,
+            )
+        time.sleep(0.4)
+
+
 def run_transcription_job(
     media_path: str,
     selected_engines: list[str],
@@ -761,7 +791,8 @@ def run_transcription_job(
     """Run the full local transcript pipeline and persist outputs."""
     register_job_started()
     try:
-        with _job_semaphore:
+        _acquire_gpu_job_slot(cancel_event, progress)
+        try:
             return _run_transcription_job_impl(
                 media_path,
                 selected_engines,
@@ -774,6 +805,8 @@ def run_transcription_job(
                 progress,
                 meta or JobMeta(),
             )
+        finally:
+            _job_semaphore.release()
     finally:
         register_job_finished()
 
@@ -885,6 +918,7 @@ def _run_transcription_job_impl(
         "total_elapsed_s": total_elapsed_s,
         "target_elapsed_s": target_elapsed_s,
         "target_met": target_met,
+        "client_ip": meta.client_ip,
         "results": results,
     }
     manifest_path = write_job_record(job_id, manifest)

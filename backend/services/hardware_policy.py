@@ -28,9 +28,12 @@ def _env_int(name: str, default: int) -> int:
 
 
 # Minimum VRAM required to enable the CUDA backend in release/offline mode.
-# 8GB class GPUs are the minimum supported target.
+# 8GB class GPUs are the minimum supported NVIDIA target.
 MIN_NVIDIA_VRAM_MB = _env_int("MIN_NVIDIA_VRAM_MB", 8192)
-MIN_SYSTEM_RAM_MB = _env_int("MIN_SYSTEM_RAM_MB", 16000)
+# Minimum host RAM for OpenVINO/CPU/DirectML deployments (Intel/AMD/ARM).
+MIN_SYSTEM_RAM_MB = _env_int("MIN_SYSTEM_RAM_MB", 8192)
+# Minimum logical CPU threads recommended (4 cores / 4 threads).
+MIN_CPU_THREADS = _env_int("MIN_CPU_THREADS", 4)
 _hw_cache: list[dict] = []
 
 
@@ -38,7 +41,7 @@ def _check_system_ram() -> dict:
     """Detect total system RAM for CPU-mode eligibility warning."""
     result = {"system_ram_mb": 0, "system_ram_ok": False}
     try:
-        import psutil
+        import psutil  # type: ignore[import-not-found,import-untyped]
 
         total = psutil.virtual_memory().total
         result["system_ram_mb"] = int(total // (1024 * 1024))
@@ -46,6 +49,16 @@ def _check_system_ram() -> dict:
     except (ImportError, OSError, AttributeError) as exc:
         logger.debug("psutil RAM probe failed: %s", exc)
     return result
+
+
+def _check_cpu_threads() -> dict:
+    """Detect logical CPU thread count for minimum-host warnings."""
+    detected = max(1, os.cpu_count() or 1)
+    return {
+        "cpu_threads": detected,
+        "cpu_threads_ok": detected >= MIN_CPU_THREADS,
+        "min_cpu_threads": MIN_CPU_THREADS,
+    }
 
 
 def _check_torch() -> dict:
@@ -60,7 +73,7 @@ def _check_torch() -> dict:
         "rocm_version": None,
     }
     try:
-        import torch
+        import torch  # type: ignore[import-not-found]
 
         result["torch_version"] = torch.__version__
         # ROCm PyTorch exposes the same torch.cuda.* API but reports torch.version.hip.
@@ -105,7 +118,7 @@ def _check_openvino() -> dict:
         "npu": False,
     }
     try:
-        from openvino import Core, get_version
+        from openvino import Core, get_version  # type: ignore[import-not-found]
 
         devices = Core().available_devices
         result.update({
@@ -181,7 +194,11 @@ def _openvino_gpu_first(
             "using OpenVINO CPU fallback.",
         )
     if has_amd_gpu:
-        return "CPU", f"{prefix}AMD GPU detected; using OpenVINO CPU fallback in v1."
+        return (
+            "CPU",
+            f"{prefix}AMD GPU without OpenVINO GPU device; using OpenVINO CPU "
+            "(prefer DirectML on Windows or ROCm on Linux when available).",
+        )
     return "CPU", f"{prefix}OpenVINO CPU selected (no GPU/NPU available)."
 
 
@@ -223,6 +240,80 @@ def _select_openvino_device(
     )
 
 
+def _try_forced_backend(
+    force: str,
+    torch_info: dict,
+    ov_info: dict,
+    dml_info: dict,
+    has_amd_gpu: bool,
+) -> tuple[str, str, str] | None:
+    """Return a forced backend selection when APP_FORCE_BACKEND is set and available."""
+    if force == "cuda" and torch_info["cuda"]:
+        return "cuda", "cuda", "NVIDIA CUDA forced by APP_FORCE_BACKEND."
+    if force == "rocm" and torch_info["rocm"]:
+        return "rocm", "cuda", "AMD ROCm forced by APP_FORCE_BACKEND."
+    if force == "openvino" and ov_info["openvino_version"]:
+        device, reason = _select_openvino_device(torch_info, ov_info, has_amd_gpu)
+        return "openvino", device, f"{reason} (forced)"
+    if force == "directml" and dml_info["directml"]:
+        return "directml", "directml", "DirectML forced by APP_FORCE_BACKEND."
+    if force == "cpu":
+        return "cpu", "cpu", "CPU forced by APP_FORCE_BACKEND."
+    return None
+
+
+def _auto_select_backend(
+    torch_info: dict,
+    ov_info: dict,
+    dml_info: dict,
+    has_amd_gpu: bool,
+    nvidia_vram_ok: bool,
+) -> tuple[str, str, str]:
+    """Pick backend by preference when no APP_FORCE_BACKEND override applies."""
+    if torch_info["cuda"] and nvidia_vram_ok:
+        return (
+            "cuda",
+            "cuda",
+            f"NVIDIA CUDA selected; VRAM meets the {MIN_NVIDIA_VRAM_MB} MB minimum.",
+        )
+    if torch_info["rocm"]:
+        return (
+            "rocm",
+            "cuda",  # ROCm uses torch.cuda.* API; engines treat it like CUDA
+            f"AMD ROCm selected (HIP {torch_info['rocm_version']}); using PyTorch HIP backend.",
+        )
+    plat = _check_platform()
+    if plat["is_arm"] and ov_info["openvino_version"]:
+        device, reason = _select_openvino_device(torch_info, ov_info, has_amd_gpu)
+        return "openvino", device, f"{reason} ARM64 host prefers OpenVINO."
+    if ov_info["openvino_version"] and (ov_info["npu"] or ov_info["gpu"]):
+        device, reason = _select_openvino_device(torch_info, ov_info, has_amd_gpu)
+        return "openvino", device, reason
+    if dml_info["directml"]:
+        return (
+            "directml",
+            "directml",
+            "DirectML selected; using Windows AMD/Intel GPU via torch-directml.",
+        )
+    if ov_info["openvino_version"]:
+        device, reason = _select_openvino_device(torch_info, ov_info, has_amd_gpu)
+        return "openvino", device, reason
+    if torch_info["cuda"]:
+        return (
+            "cpu",
+            "cpu",
+            f"NVIDIA GPU has less than {MIN_NVIDIA_VRAM_MB} MB VRAM and "
+            "no other accelerator available; using CPU.",
+        )
+    if has_amd_gpu:
+        return (
+            "cpu",
+            "cpu",
+            "AMD GPU detected but no DirectML/ROCm/OpenVINO backend available; using CPU.",
+        )
+    return "cpu", "cpu", "No GPU acceleration detected; using CPU."
+
+
 def _select_backend(
     torch_info: dict,
     ov_info: dict,
@@ -243,71 +334,14 @@ def _select_backend(
         torch_info["cuda"] and torch_info["cuda_vram_mb"] >= MIN_NVIDIA_VRAM_MB
     )
     force = os.getenv("APP_FORCE_BACKEND", "").strip().lower()
-
-    if force == "cuda" and torch_info["cuda"]:
-        return "cuda", "cuda", "NVIDIA CUDA forced by APP_FORCE_BACKEND.", nvidia_vram_ok
-    if force == "rocm" and torch_info["rocm"]:
-        return "rocm", "cuda", "AMD ROCm forced by APP_FORCE_BACKEND.", nvidia_vram_ok
-    if force == "openvino" and ov_info["openvino_version"]:
-        device, reason = _select_openvino_device(torch_info, ov_info, has_amd_gpu)
-        return "openvino", device, f"{reason} (forced)", nvidia_vram_ok
-    if force == "directml" and dml_info["directml"]:
-        return "directml", "directml", "DirectML forced by APP_FORCE_BACKEND.", nvidia_vram_ok
-    if force == "cpu":
-        return "cpu", "cpu", "CPU forced by APP_FORCE_BACKEND.", nvidia_vram_ok
-
-    if torch_info["cuda"] and nvidia_vram_ok:
-        return (
-            "cuda",
-            "cuda",
-            f"NVIDIA CUDA selected; VRAM meets the {MIN_NVIDIA_VRAM_MB} MB minimum.",
-            nvidia_vram_ok,
-        )
-    if torch_info["rocm"]:
-        return (
-            "rocm",
-            "cuda",  # ROCm uses torch.cuda.* API; engines treat it like CUDA
-            f"AMD ROCm selected (HIP {torch_info['rocm_version']}); using PyTorch HIP backend.",
-            nvidia_vram_ok,
-        )
-    plat = _check_platform()
-    if plat["is_arm"] and ov_info["openvino_version"]:
-        device, reason = _select_openvino_device(torch_info, ov_info, has_amd_gpu)
-        return (
-            "openvino",
-            device,
-            f"{reason} ARM64 host prefers OpenVINO.",
-            nvidia_vram_ok,
-        )
-    if ov_info["openvino_version"] and (ov_info["npu"] or ov_info["gpu"]):
-        device, reason = _select_openvino_device(torch_info, ov_info, has_amd_gpu)
-        return "openvino", device, reason, nvidia_vram_ok
-    if dml_info["directml"]:
-        return (
-            "directml",
-            "directml",
-            "DirectML selected; using Windows AMD/Intel GPU via torch-directml.",
-            nvidia_vram_ok,
-        )
-    if ov_info["openvino_version"]:
-        device, reason = _select_openvino_device(torch_info, ov_info, has_amd_gpu)
-        return "openvino", device, reason, nvidia_vram_ok
-    if torch_info["cuda"]:
-        return (
-            "cpu",
-            "cpu",
-            f"NVIDIA GPU has less than {MIN_NVIDIA_VRAM_MB} MB VRAM and "
-            "no other accelerator available; using CPU.",
-            nvidia_vram_ok,
-        )
-    if has_amd_gpu:
-        return (
-            "cpu",
-            "cpu",
-            "AMD GPU detected but no DirectML/ROCm/OpenVINO backend available; using CPU.",
-            nvidia_vram_ok,
-        )
-    return "cpu", "cpu", "No GPU acceleration detected; using CPU.", nvidia_vram_ok
+    forced = _try_forced_backend(force, torch_info, ov_info, dml_info, has_amd_gpu)
+    if forced is not None:
+        backend, device, reason = forced
+        return backend, device, reason, nvidia_vram_ok
+    backend, device, reason = _auto_select_backend(
+        torch_info, ov_info, dml_info, has_amd_gpu, nvidia_vram_ok
+    )
+    return backend, device, reason, nvidia_vram_ok
 
 
 def detect_hardware(refresh: bool = False) -> dict:
@@ -319,6 +353,7 @@ def detect_hardware(refresh: bool = False) -> dict:
     ov_info = _check_openvino()
     dml_info = _check_directml()
     ram_info = _check_system_ram()
+    cpu_info = _check_cpu_threads()
     plat_info = _check_platform()
     ffmpeg_path = shutil.which("ffmpeg")
     has_amd_gpu = _detect_amd_gpu()
@@ -330,11 +365,16 @@ def detect_hardware(refresh: bool = False) -> dict:
         has_amd_gpu,
     )
 
-    # Warn-only policy: append RAM warning to reason when CPU-bound and under-spec.
-    if selected_backend == "cpu" and not ram_info["system_ram_ok"] and ram_info["system_ram_mb"]:
+    # Warn-only policy when host is under the documented 4-thread / 8 GB floor.
+    if not ram_info["system_ram_ok"] and ram_info["system_ram_mb"]:
         backend_reason = (
             f"{backend_reason} WARNING: system RAM {ram_info['system_ram_mb']} MB "
-            f"is below recommended {MIN_SYSTEM_RAM_MB} MB; CPU mode may be slow or OOM."
+            f"is below minimum {MIN_SYSTEM_RAM_MB} MB; may be slow or OOM."
+        )
+    if not cpu_info["cpu_threads_ok"]:
+        backend_reason = (
+            f"{backend_reason} WARNING: {cpu_info['cpu_threads']} CPU threads "
+            f"(minimum {MIN_CPU_THREADS} recommended)."
         )
 
     info = {
@@ -342,6 +382,7 @@ def detect_hardware(refresh: bool = False) -> dict:
         **ov_info,
         **dml_info,
         **ram_info,
+        **cpu_info,
         **plat_info,
         "ffmpeg": ffmpeg_path,
         "amd_gpu": has_amd_gpu,
@@ -360,31 +401,31 @@ def detect_hardware(refresh: bool = False) -> dict:
     return info
 
 
-def hardware_summary() -> str:
-    """Return a Markdown summary of the selected hardware backend."""
-    hw = detect_hardware()
+def _vram_policy_lines(hw: dict) -> list[str]:
+    """Append NVIDIA VRAM status and low-VRAM policy notes when CUDA is present."""
+    if not hw["cuda"]:
+        return []
     lines = [
-        "### Hardware Status",
-        f"- **Selected backend:** {hw['backend'].upper()} / {hw['selected_device']}",
-        f"- **Reason:** {hw['backend_reason']}",
-        f"- **PyTorch:** {hw['torch_version'] or 'not installed'}",
+        f"- **NVIDIA GPU:** {hw['cuda_device_name']} "
+        f"({hw['cuda_vram_mb']} MB VRAM; minimum {hw['min_nvidia_vram_mb']} MB)"
     ]
-    if hw["cuda"]:
+    try:
+        class_limit = int(os.getenv("ASR_8GB_CLASS_MAX_MB", "9000"))
+    except ValueError:
+        class_limit = 9000
+    hard_safe = os.getenv("ASR_HARD_MEMORY_SAFE", "true").strip().lower()
+    if hard_safe in {"1", "true", "yes", "on"} and hw["cuda_vram_mb"] <= class_limit:
         lines.append(
-            f"- **NVIDIA GPU:** {hw['cuda_device_name']} "
-            f"({hw['cuda_vram_mb']} MB VRAM; minimum {hw['min_nvidia_vram_mb']} MB)"
+            "- **VRAM policy:** strict low-VRAM mode; "
+            "preloaded ASR models retained for reuse, "
+            "CPU diarization by default"
         )
-        try:
-            class_limit = int(os.getenv("ASR_8GB_CLASS_MAX_MB", "9000"))
-        except ValueError:
-            class_limit = 9000
-        if os.getenv("ASR_HARD_MEMORY_SAFE", "true").strip().lower() in {"1", "true", "yes", "on"}:
-            if hw["cuda_vram_mb"] <= class_limit:
-                lines.append(
-                    "- **VRAM policy:** strict low-VRAM mode; "
-                    "preloaded ASR models retained for reuse, "
-                    "CPU diarization by default"
-                )
+    return lines
+
+
+def _accelerator_summary_lines(hw: dict) -> list[str]:
+    """Build Markdown lines for optional accelerators (ROCm, DirectML, AMD probe)."""
+    lines: list[str] = []
     if hw.get("rocm"):
         lines.append(
             f"- **AMD ROCm:** detected (HIP {hw.get('rocm_version', 'unknown')})"
@@ -395,15 +436,46 @@ def hardware_summary() -> str:
         )
     if hw["amd_gpu"]:
         lines.append("- **AMD GPU:** detected via system probe")
-    lines.extend([
+    return lines
+
+
+def _host_resource_lines(hw: dict) -> list[str]:
+    """Build Markdown lines for CPU arch/threads and system RAM."""
+    lines: list[str] = []
+    arch = hw.get("cpu_arch") or "unknown"
+    lines.append(f"- **CPU arch:** {arch}" + (" (ARM)" if hw.get("is_arm") else ""))
+    threads = hw.get("cpu_threads") or 0
+    if threads:
+        thr_note = (
+            "OK"
+            if hw.get("cpu_threads_ok")
+            else f"below minimum {hw.get('min_cpu_threads', MIN_CPU_THREADS)}"
+        )
+        lines.append(f"- **CPU threads:** {threads} ({thr_note})")
+    ram_mb = hw.get("system_ram_mb") or 0
+    if ram_mb:
+        ram_note = (
+            "OK"
+            if hw.get("system_ram_ok")
+            else f"below minimum {hw.get('min_system_ram_mb', MIN_SYSTEM_RAM_MB)} MB"
+        )
+        lines.append(f"- **System RAM:** {ram_mb} MB ({ram_note})")
+    return lines
+
+
+def hardware_summary() -> str:
+    """Return a Markdown summary of the selected hardware backend."""
+    hw = detect_hardware()
+    lines = [
+        "### Hardware Status",
+        f"- **Selected backend:** {hw['backend'].upper()} / {hw['selected_device']}",
+        f"- **Reason:** {hw['backend_reason']}",
+        f"- **PyTorch:** {hw['torch_version'] or 'not installed'}",
+        *_vram_policy_lines(hw),
+        *_accelerator_summary_lines(hw),
         f"- **OpenVINO:** {hw['openvino_version'] or 'not installed'}",
         f"- **OpenVINO devices:** {', '.join(hw['available_devices']) or 'none'}",
         f"- **FFmpeg:** {'available' if hw['ffmpeg'] else 'NOT FOUND'}",
-    ])
-    arch = hw.get("cpu_arch") or "unknown"
-    lines.append(f"- **CPU arch:** {arch}" + (" (ARM)" if hw.get("is_arm") else ""))
-    ram_mb = hw.get("system_ram_mb") or 0
-    if ram_mb:
-        ram_note = "OK" if hw.get("system_ram_ok") else f"below recommended {hw.get('min_system_ram_mb', MIN_SYSTEM_RAM_MB)} MB"
-        lines.append(f"- **System RAM:** {ram_mb} MB ({ram_note})")
+        *_host_resource_lines(hw),
+    ]
     return "\n".join(lines)

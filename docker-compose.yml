@@ -1,9 +1,0 @@
-# Generic compose — prefer docker-compose.gpu.yml (NVIDIA, port 7988)
-# or docker-compose.openvino.yml (OpenVINO/CPU, port 7987).
-# This file mirrors the OpenVINO profile for backward compatibility.
-services:
-  transcription:
-    extends:
-      file: docker-compose.openvino.yml
-      service: transcription
-    container_name: transcription-service

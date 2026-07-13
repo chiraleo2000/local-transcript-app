@@ -1,5 +1,7 @@
-# OpenVINO / CPU AI compose — Intel Core Ultra (NPU/GPU), AMD AI CPU, ARM64.
-# No NVIDIA GPU required. OV_DEVICE=GPU (GPU-first; falls back to CPU if no GPU visible).
+# OpenVINO / CPU AI compose — Intel Core Ultra (NPU/GPU), Intel Arc/iGPU,
+# AMD AI CPU, AMD GPU (via DirectML on Windows host / OV CPU in container),
+# ARM64 (Apple Silicon / Ampere). Minimum host: 4 CPU threads, 8 GB RAM.
+# No NVIDIA GPU required. OV_DEVICE=GPU (GPU-first; falls back to CPU if no GPU).
 #
 #   docker compose -f docker-compose.openvino.yml up -d --build
 # UI: http://localhost:7987
@@ -14,21 +16,24 @@ services:
     image: local-transcript-app-openvino
     container_name: transcription-service-openvino
     restart: unless-stopped
-    shm_size: "4gb"
+    shm_size: "2gb"
     ports:
       - "7987:7896"
     env_file:
       - .env
     environment:
-      - APP_VERSION=1.2.4
+      - APP_VERSION=1.2.6
       - GRADIO_SERVER_NAME=0.0.0.0
       - GRADIO_SERVER_PORT=7896
-      - APP_CPU_THREADS=16
-      - OMP_NUM_THREADS=16
-      - MKL_NUM_THREADS=16
-      - OPENBLAS_NUM_THREADS=16
-      - NUMEXPR_NUM_THREADS=16
+      # Default 4 threads (min spec); override APP_CPU_THREADS for bigger hosts.
+      - APP_CPU_THREADS=${APP_CPU_THREADS:-4}
+      - OMP_NUM_THREADS=${APP_CPU_THREADS:-4}
+      - MKL_NUM_THREADS=${APP_CPU_THREADS:-4}
+      - OPENBLAS_NUM_THREADS=${APP_CPU_THREADS:-4}
+      - NUMEXPR_NUM_THREADS=${APP_CPU_THREADS:-4}
       - TOKENIZERS_PARALLELISM=false
+      - MIN_SYSTEM_RAM_MB=8192
+      - MIN_CPU_THREADS=4
       - PYTHONPATH=/app
       - HF_HUB_DISABLE_TELEMETRY=1
       - GRADIO_ANALYTICS_ENABLED=false
@@ -47,14 +52,17 @@ services:
       - OV_DEVICE=GPU
       - APP_SUPPRESS_WARNING_LOGS=false
       - PYTHONUNBUFFERED=1
-      # --- ASR (OpenVINO) ---
+      # --- ASR (OpenVINO; beams 4 for 8 GB RAM hosts) ---
       - ASR_PARALLEL_MODE=sequential
       - ASR_HARD_MEMORY_SAFE=true
       - ASR_8GB_QUALITY_MODE=true
       - ASR_DEFAULT_ENGINES=Auto
       - ASR_AUTO_POLICY=quality
       - ASR_QUALITY_PROFILE=high
-      - ASR_NUM_BEAMS=8
+      - ASR_NUM_BEAMS=4
+      - ASR_NUM_BEAMS_MAX=4
+      - ASR_NUM_BEAMS_MIN=4
+      - ASR_FAST_MODE=true
       - ASR_SUPPRESS_HALLUCINATIONS=true
       - ASR_LOGPROB_THRESHOLD=-0.6
       - ASR_NO_SPEECH_THRESHOLD=0.5
@@ -76,8 +84,11 @@ services:
       - TYPHOON_WORD_TIMESTAMPS_ON_8GB=false
       - PATHUMMA_WORD_TIMESTAMPS_ON_8GB=false
       - ASR_UNLOAD_FOR_DIARIZATION=false
-      - UI_MAX_CONCURRENT_JOBS=2
+      - UI_MAX_CONCURRENT_JOBS=1
       - UI_GRADIO_TRANSCRIBE_CONCURRENCY=4
+      - UI_QUEUE_MAX_SIZE=16
+      - UI_HISTORY_PER_CLIENT_IP=true
+      - UI_CANCEL_FREES_GPU_FOR_QUEUE=true
       # Audio enhancement is CPU-only on this profile.
       - AUDIO_ENHANCE_USE_GPU=false
       - AUDIO_ENHANCE_DEFAULT=true

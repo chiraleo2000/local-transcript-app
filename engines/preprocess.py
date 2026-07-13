@@ -143,7 +143,7 @@ def _ffmpeg_stage(audio_path: str, out_path: str) -> bool:
         return False
 
     filters = _ffmpeg_filter_chain()
-    threads = max(1, int(os.getenv("APP_CPU_THREADS", "16") or "16"))
+    threads = max(1, int(os.getenv("APP_CPU_THREADS", "0") or "0") or (os.cpu_count() or 4))
     cmd = [
         _FFMPEG_EXE, "-y",
         "-threads", str(threads),

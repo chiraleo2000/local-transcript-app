@@ -47,3 +47,11 @@ def test_gpu_requested_but_only_cpu_visible():
         )
     assert device == "CPU"
     assert "no OpenVINO GPU visible" in reason
+
+
+def test_min_system_ram_floor_at_least_8gb():
+    assert hp.MIN_SYSTEM_RAM_MB >= 8192
+
+
+def test_min_cpu_threads_floor_at_least_4():
+    assert hp.MIN_CPU_THREADS >= 4

@@ -20,10 +20,20 @@ _pull_backup/
 storage/
 config/
 
-# Release binaries
+# Release binaries / offline packs (large; do not commit)
 release/**/*.exe
 release/**/*.zip
+release/**/*.zip.*
+release/**/_stage/
 debug-*.log
+
+# Local runtime caches (never commit)
+.cache/
+.nv/
+intel/
+coverage.xml
+.coverage
+htmlcov/
 
 # Large local test media (optional — copy into tests/ for E2E)
 tests/*.m4a

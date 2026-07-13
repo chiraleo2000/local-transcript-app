@@ -14,7 +14,7 @@
 ;      LocalTranscriptAppSetup.exe.
 
 #define MyAppName "Local Transcript App"
-#define MyAppVersion "1.2.4"
+#define MyAppVersion "1.2.6"
 #define MyAppPublisher "Local Transcript App"
 #define MyAppExeName "LocalTranscriptApp.exe"
 #define ModelStageRoot "C:\lta-installer-stage-real"

@@ -116,12 +116,9 @@ if [ "${1:-}" = "docker" ]; then
     if docker run --rm --gpus all nvidia/cuda:13.0.0-runtime-ubuntu24.04 nvidia-smi &>/dev/null; then
         echo "      NVIDIA GPU available — using CUDA compose."
         COMPOSE_FILES="-f docker-compose.gpu.yml"
-    elif [[ -f docker-compose.openvino.yml ]]; then
-        echo "      No NVIDIA GPU in Docker — using OpenVINO/CPU AI compose."
-        COMPOSE_FILES="-f docker-compose.openvino.yml"
     else
-        echo "      GPU not available — using generic CPU compose."
-        COMPOSE_FILES="-f docker-compose.yml"
+        echo "      No NVIDIA GPU in Docker — using OpenVINO/CPU compose."
+        COMPOSE_FILES="-f docker-compose.openvino.yml"
         echo "      To enable NVIDIA GPU: install nvidia-container-toolkit and restart Docker."
     fi
 

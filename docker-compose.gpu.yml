@@ -7,6 +7,9 @@
 #   docker compose -f docker-compose.gpu.yml up -d
 # UI: http://localhost:7988
 #
+# Public / LAN: put nginx or Windows IIS in front of localhost:7988
+# (see deploy/README.md). GPU path does not need models/ov_cache (OpenVINO-only).
+#
 # OpenVINO / CPU: docker-compose.openvino.yml (port 7987)
 services:
   transcription:
@@ -28,18 +31,27 @@ services:
     # Values below override .env — prevents stale local .env breaking GPU deploy.
     environment:
       # --- App / runtime ---
-      - APP_VERSION=1.2.5
+      - APP_VERSION=1.2.6
       - GRADIO_SERVER_PORT=7896
       - GRADIO_SERVER_NAME=0.0.0.0
+      # Public reverse-proxy (nginx / IIS) — leave empty for root at :7988
+      - GRADIO_ROOT_PATH=${GRADIO_ROOT_PATH:-}
+      - GRADIO_MAX_FILE_SIZE=${GRADIO_MAX_FILE_SIZE:-512mb}
+      - GRADIO_AUTH_USER=${GRADIO_AUTH_USER:-}
+      - GRADIO_AUTH_PASSWORD=${GRADIO_AUTH_PASSWORD:-}
+      - APP_PUBLIC_BASE_URL=${APP_PUBLIC_BASE_URL:-}
       - PYTHONPATH=/app
       - PYTHONUNBUFFERED=1
       - APP_SUPPRESS_WARNING_LOGS=false
-      - APP_CPU_THREADS=16
-      - OMP_NUM_THREADS=16
-      - MKL_NUM_THREADS=16
-      - OPENBLAS_NUM_THREADS=16
-      - NUMEXPR_NUM_THREADS=16
+      - APP_CPU_THREADS=${APP_CPU_THREADS:-16}
+      - OMP_NUM_THREADS=${APP_CPU_THREADS:-16}
+      - MKL_NUM_THREADS=${APP_CPU_THREADS:-16}
+      - OPENBLAS_NUM_THREADS=${APP_CPU_THREADS:-16}
+      - NUMEXPR_NUM_THREADS=${APP_CPU_THREADS:-16}
       - TOKENIZERS_PARALLELISM=false
+      - MIN_SYSTEM_RAM_MB=8192
+      - MIN_CPU_THREADS=4
+      - MIN_NVIDIA_VRAM_MB=8192
       - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:128
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
@@ -67,7 +79,7 @@ services:
       - DIARIZATION_GPU_CO_RESIDENT=false
       - DIARIZATION_PRELOAD_DEVICE=cuda
       - DIARIZATION_PRELOAD_MODE=eager
-      - DIARIZATION_KEEP_PRELOADED=false
+      - DIARIZATION_KEEP_PRELOADED=true
       - DIARIZATION_CUDA_MIN_VRAM_MB=6000
       - DIARIZATION_CUDA_MIN_FREE_MB=768
       - DIARIZATION_CUDA_RUN_MIN_FREE_MB=512
@@ -120,8 +132,9 @@ services:
       - ASR_UNLOAD_FOR_DIARIZATION=true
       - ASR_KEEP_PRELOADED=true
       - ASR_PRELOAD_MODE=eager
-      - ASR_CLEAR_VRAM_ON_MEDIA_CHANGE=true
-      - ASR_CLEAR_VRAM_AFTER_JOB=true
+      # Keep warm weights when switching uploads (multi-user / back-to-back jobs).
+      - ASR_CLEAR_VRAM_ON_MEDIA_CHANGE=false
+      - ASR_CLEAR_VRAM_AFTER_JOB=false
       - ASR_CLEAR_VRAM_BETWEEN_ENGINES=false
       - ASR_DEFAULT_ENGINES=Auto
       - ASR_AUTO_POLICY=quality
@@ -156,9 +169,9 @@ services:
       - ASR_CUDA_MEMORY_FRACTION=0.92
       - ASR_CUDA_MEMORY_FRACTION_MAX=0.92
       - ASR_CO_RESIDENT_MIN_FREE_MB=512
-      - ASR_NUM_BEAMS=6
-      - ASR_NUM_BEAMS_MAX=6
-      # Long audio floors to beam_min; turn-guided ASR is accuracy-first on 8 GB.
+      # Beams 4: faster decode than 5/6; keep merge gap + max turn locked for accuracy.
+      - ASR_NUM_BEAMS=4
+      - ASR_NUM_BEAMS_MAX=4
       - ASR_NUM_BEAMS_MIN=4
       - ASR_SUPPRESS_HALLUCINATIONS=true
       - ASR_REJECT_HALLUCINATED_TURNS=true
@@ -203,7 +216,8 @@ services:
       - ASR_TIMESTAMP_AUDIO_END_TOLERANCE_S=30
       - ASR_MAX_CHUNK_CHARS_PER_SECOND=35
       - ASR_UNLOAD_ON_CANCEL=false
-      - ASR_FAST_MODE=false
+      # Lighter CUDA teardown between diar→ASR (no quality change).
+      - ASR_FAST_MODE=true
 
       # Copy normalized audio to /tmp before ASR (fast on Windows Docker bind mounts)
       - AUDIO_STAGE_TO_TMP=true
@@ -218,13 +232,18 @@ services:
       - AUDIO_ENHANCE_LOUDNORM_I=-14
       - AUDIO_ENHANCE_ATEMPO=1.0
 
-      # --- UI ---
+      # --- UI (workstation: 1 GPU slot + up to 4 queued Gradio handlers) ---
       - UI_PREVIEW_MAX_MB=32
       - UI_PREVIEW_MAX_DURATION_S=300
       - UI_TRANSCRIPT_MAX_CHARS=100000
       - UI_TRANSCRIPT_MAX_LINES=500
+      # 8 GB: keep GPU jobs at 1 (2–4 parallel Whisper+diar will OOM). Raise only on 16 GB+.
       - UI_MAX_CONCURRENT_JOBS=1
-      - UI_GRADIO_TRANSCRIBE_CONCURRENCY=1
+      # Up to 4 users can submit; extras wait in Gradio/GPU queue with cancel support.
+      - UI_GRADIO_TRANSCRIBE_CONCURRENCY=4
+      - UI_QUEUE_MAX_SIZE=16
+      - UI_HISTORY_PER_CLIENT_IP=true
+      - UI_CANCEL_FREES_GPU_FOR_QUEUE=true
       - UI_CANCEL_JOIN_TIMEOUT_S=120
 
     volumes:

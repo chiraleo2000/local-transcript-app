@@ -20,6 +20,18 @@ def cancel_join_timeout_s() -> float:
         return 120.0
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def should_free_gpu_for_queue_on_cancel() -> bool:
+    """Clear accelerator cache on cancel so the next queued job can start cleanly."""
+    return _env_bool("UI_CANCEL_FREES_GPU_FOR_QUEUE", True)
+
+
 def cancel_tab_job(
     runtime: dict,
     *,
@@ -27,7 +39,7 @@ def cancel_tab_job(
     tracker: JobProgress | None = None,
     message: str = "Cancelled.",
 ) -> None:
-    """Signal cancel, wait for the worker, and optionally unload pipeline models."""
+    """Signal cancel, wait for the worker, and free VRAM for queued jobs when configured."""
     runtime["cancel_event"].set()
     worker = runtime.get("worker")
     if worker is not None and worker.is_alive():
@@ -37,10 +49,18 @@ def cancel_tab_job(
                 "Cancel join timed out after %.0fs; worker may still hold VRAM.",
                 cancel_join_timeout_s(),
             )
-    if unload_models if unload_models is not None else should_unload_on_cancel():
+    do_unload = (
+        unload_models if unload_models is not None else should_unload_on_cancel()
+    )
+    if do_unload:
         from backend.pipeline import unload_all_pipeline_models
 
         unload_all_pipeline_models()
+    elif should_free_gpu_for_queue_on_cancel():
+        from backend.services.asr_local import clear_accelerator_cache
+
+        clear_accelerator_cache()
+        logger.info("Cancel freed GPU cache for queued jobs (models kept warm).")
     if tracker is not None:
         tracker.fail(message)
     clear_active_job(runtime)

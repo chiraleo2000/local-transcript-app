@@ -3,7 +3,7 @@
 GPU-accelerated local audio/video transcription with speaker diarization.  
 No cloud APIs. No telemetry. All processing stays on your machine.
 
-**Version 1.0.0**
+**Version 1.2.6**
 
 ---
 
@@ -18,6 +18,7 @@ No cloud APIs. No telemetry. All processing stays on your machine.
 - **Docker GPU mode** — NVIDIA CUDA 13 + PyTorch; models cached in `./models/`
 - **Strict 8 GB VRAM policy** — safe on RTX 4060 Laptop (8 GB); one model at a time, sequential engines, capped chunk size
 - **OOM-safe long jobs** — disk-window ASR streaming (one slice in RAM), iterative CUDA chunk halving, UI transcript line/char caps, co-resident GPU preload with phase teardown
+- **Public/LAN reverse proxy** — nginx or Windows IIS in front of Docker `:7988` (see [`deploy/README.md`](deploy/README.md))
 
 ---
 
@@ -28,6 +29,9 @@ No cloud APIs. No telemetry. All processing stays on your machine.
 | Direct Python / GUI (`run.bat`, `launcher.py`) | `http://localhost:7896` | `GRADIO_SERVER_PORT=7896` |
 | Docker NVIDIA GPU | `http://localhost:7988` | `docker-compose.gpu.yml` |
 | Docker OpenVINO / CPU | `http://localhost:7987` | `docker-compose.openvino.yml` |
+| Public / LAN (nginx or IIS) | your hostname | Reverse-proxy to `127.0.0.1:7988` — [`deploy/README.md`](deploy/README.md) |
+
+`models/ov_cache` is **OpenVINO-only**. GPU Docker does not need it.
 
 ---
 
@@ -178,7 +182,7 @@ Each engine tab shows:
 - **Output name** — custom download filename (defaults to uploaded file stem)
 - **Download .txt** — save the transcript
 
-The **Previous transcripts** panel lists past jobs from `storage/jobs/` — load into the editor or download without re-running ASR. Refresh the page during a long job to recover live progress (same browser tab).
+The **Previous transcripts** panel lists past jobs from `storage/jobs/` — load into the editor or download without re-running ASR. On workstation deployments with `UI_HISTORY_PER_CLIENT_IP=true`, the list is filtered by client IP (`X-Forwarded-For` behind nginx/IIS). Refresh the page during a long job to recover live progress (same browser tab).
 
 Job metadata is saved to `storage/jobs/` as JSON (status: running → completed/cancelled/failed).
 
@@ -194,8 +198,7 @@ local-transcript-app/
 ├── run.sh                        # Linux/Mac: ./run.sh | ./run.sh gui | ./run.sh docker
 ├── setup.bat / setup.sh          # First-time dependency install
 ├── docker-compose.gpu.yml        # Docker + NVIDIA GPU (CUDA)
-├── docker-compose.openvino.yml   # Docker + OpenVINO (Intel/AMD AI CPU, ARM)
-├── docker-compose.yml            # Docker generic CPU PyTorch fallback
+├── docker-compose.openvino.yml   # Docker + OpenVINO / CPU
 ├── Dockerfile                    # CUDA 13 image (GPU compose)
 ├── Dockerfile.openvino           # OpenVINO / CPU AI image
 ├── .env                          # Runtime configuration (copy from .env.example)
@@ -285,7 +288,9 @@ TYPHOON_WORD_TIMESTAMPS_ON_8GB=false
 
 ### Job history & refresh recovery
 
-Completed and in-progress jobs write manifests to `storage/jobs/`. The **Previous transcripts** panel lists past jobs; refresh the browser during a long run to reattach progress (same tab id in sessionStorage).
+Completed and in-progress jobs write manifests to `storage/jobs/` (including `client_ip` when available). The **Previous transcripts** panel lists past jobs for your IP when `UI_HISTORY_PER_CLIENT_IP=true`; refresh the browser during a long run to reattach progress (same tab id in sessionStorage). **Cancel** stops that tab’s job (including while queued) and clears CUDA cache for the next queued user (`UI_CANCEL_FREES_GPU_FOR_QUEUE`).
+
+On **8 GB** keep `UI_MAX_CONCURRENT_JOBS=1` and set `UI_GRADIO_TRANSCRIBE_CONCURRENCY=2`–`4` so multiple users queue instead of OOM. True 2–4 parallel GPU ASR+diar jobs need **16 GB+**.
 
 ### Audio Enhancement
 
@@ -320,18 +325,20 @@ DIARIZATION_MIN_CLUSTER_SIZE=6
 
 ## Hardware Support
 
+**Minimum host:** 4 CPU threads, **8 GB RAM**. NVIDIA CUDA path also needs **≥ 8 GB VRAM**.
+
 | Hardware | Mode |
 | --- | --- |
-| NVIDIA GPU ≥ 6 GB VRAM | CUDA (PyTorch, strict memory mode up to 9 GB) |
-| NVIDIA GPU < 6 GB VRAM | OpenVINO / CPU fallback |
-| Intel Core Ultra / Arc GPU | OpenVINO GPU (preferred) |
-| Intel NPU | OpenVINO NPU (fallback/optional) |
-| AMD GPU | Windows: DirectML (optional) · otherwise CPU/OpenVINO CPU |
-| CPU only | OpenVINO CPU |
+| NVIDIA GPU ≥ 8 GB VRAM | CUDA (`docker-compose.gpu.yml`) |
+| NVIDIA GPU < 8 GB VRAM | OpenVINO / CPU fallback |
+| Intel Core Ultra / Arc / iGPU | OpenVINO GPU / NPU (`docker-compose.openvino.yml` or `run.bat ov-gpu`) |
+| Intel NPU | OpenVINO NPU (`OV_DEVICE=NPU`) |
+| AMD AI CPU / x86 CPU | OpenVINO CPU |
+| AMD GPU (Windows) | DirectML when `torch-directml` is installed; else OpenVINO CPU |
+| AMD GPU (Linux) | ROCm PyTorch when available; else OpenVINO CPU |
+| ARM64 (Apple Silicon / Ampere) | OpenVINO (CPU; GPU when exposed) |
 
-**Docker note (Intel GPU/NPU):** to actually use Intel **GPU/NPU inside Docker**, the container must have access to the host device nodes/drivers (Linux hosts). On Windows Docker Desktop, OpenVINO typically runs as **CPU-only** inside the Linux container unless you have a passthrough setup (e.g. WSL2 + `/dev/dri` mapping).
-
-The RTX 4060 Laptop (8 GB) is the reference hardware. Strict low-VRAM mode uses bounded long-form ASR windows and sequential multi-engine transcription by default, while the configured preloaded ASR models stay in VRAM for reuse across transcript rounds.
+**Docker note (Intel GPU/NPU):** to use Intel **GPU/NPU inside Docker**, the container needs host device nodes (Linux `/dev/dri`). On Windows Docker Desktop, OpenVINO is usually **CPU-only** in the Linux container — use native `run.bat ov-gpu` for Arc/NPU.
 
 ---
 
@@ -448,16 +455,15 @@ The app detects available resources and chooses the best local backend.
 | --- | --- |
 | NVIDIA GPU with CUDA and at least 8 GB VRAM | Use CUDA |
 | NVIDIA GPU with less than 8 GB VRAM | Use OpenVINO/CPU fallback |
-| Intel GPU | Prefer OpenVINO GPU |
-| Intel NPU | Prefer OpenVINO NPU when available |
-| AMD GPU | Use CPU/OpenVINO fallback in v1 |
-| CPU only | Use OpenVINO CPU or CPU fallback |
+| Intel GPU / Core Ultra | Prefer OpenVINO GPU (then NPU) |
+| Intel NPU | Prefer OpenVINO NPU when GPU absent |
+| AMD GPU (Windows) | Prefer DirectML when installed |
+| AMD GPU (Linux ROCm) | Prefer PyTorch HIP |
+| ARM64 / AMD AI / CPU only | OpenVINO CPU (or GPU when exposed) |
 
-The CUDA runtime now uses a strict 8 GB-class policy. On GPUs up to `ASR_8GB_CLASS_MAX_MB` (default 9000 MB, covering RTX 4060 Laptop cards that report about 8187 MB), the app keeps configured ASR models resident for reuse, uses sequential ASR unless `ASR_ALLOW_8GB_PARALLEL=true`, caps CUDA batch size, and keeps speaker diarization on CPU so ASR owns the GPU budget. If CUDA diarization is enabled on larger GPUs, pyannote moves to CPU when free CUDA memory drops below `DIARIZATION_CUDA_MIN_FREE_MB`.
+**Minimum:** `MIN_CPU_THREADS=4`, `MIN_SYSTEM_RAM_MB=8192`. Hosts below that still run with a warning.
 
-For repeated 8 GB operation, the default UI selection preloads both Pathumma and Typhoon. They run sequentially to stay inside the VRAM budget, then remain loaded for the next transcript round.
-
-The selected backend and reason are saved to `config/app_config.json`.
+The CUDA runtime uses a strict 8 GB-class policy. On GPUs up to `ASR_8GB_CLASS_MAX_MB` (default 9000 MB, covering RTX 4060 Laptop cards that report about 8187 MB), the app keeps configured ASR models resident for reuse, uses sequential ASR unless `ASR_ALLOW_8GB_PARALLEL=true`, and stages diarization vs ASR on 8 GB cards.
 
 ## Windows Quick Start For Normal Users
 
@@ -579,8 +585,11 @@ ASR_8GB_MAX_BATCH_SIZE=4
 ASR_BATCH_DURATION_CAP=true               # allow batch>1 for 60–120s audio when max batch>1
 ASR_MAX_CONCURRENT_INFERENCE=1            # one shared Whisper pipeline on 8 GB
 ASR_UNLOAD_ON_CANCEL=true                 # Cancel & Reset frees VRAM before next job
-UI_MAX_CONCURRENT_JOBS=4                  # pipeline slots; restart app after changing
+UI_MAX_CONCURRENT_JOBS=1                  # GPU slots; keep 1 on 8 GB (restart after change)
+UI_GRADIO_TRANSCRIBE_CONCURRENCY=4        # queued users / tabs
 UI_CANCEL_JOIN_TIMEOUT_S=120              # max wait for worker after cancel
+UI_HISTORY_PER_CLIENT_IP=true
+UI_CANCEL_FREES_GPU_FOR_QUEUE=true
 UI_GRADIO_TRANSCRIBE_CONCURRENCY=8        # Gradio streams (tabs); does not add GPU load
 ASR_CUDA_MEMORY_FRACTION=0.90             # leave headroom for CUDA/runtime allocations
 ASR_CHUNK_LENGTH_S=30                     # balanced profile default
@@ -632,7 +641,7 @@ python scripts/run_docker_acceptance.py --tag final
 | `sample01` | `tests/test-sample01.m4a` (~3.7 min) | 99/98/98/95% content/speaker/timestamp/strict, 4/4 speakers, 0 mismatched lines | ≤10 min |
 | `meeting309` | `tests/309.m4a` (~90 min) | 11/11 speakers + meeting gates | ≤ half audio (~45 min) |
 
-VRAM policy: `ASR_CUDA_MEMORY_FRACTION=0.92` with batch=1, beams=6, single concurrent job. See `backend/enterprise_config.py` and `docker-compose.gpu.yml`.
+VRAM policy: `ASR_CUDA_MEMORY_FRACTION=0.92` with batch=1, beams=5, single concurrent job. See `backend/enterprise_config.py` and `docker-compose.gpu.yml`.
 
 **Offline models:** Docker and validation never download from Hugging Face Hub. Populate `./models/` once via `scripts/bootstrap_models.py` on a maintainer machine; `ensure_model_cache.py --strict-diarization` verifies ASR + pyannote caches before acceptance runs.
 

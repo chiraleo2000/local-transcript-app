@@ -3,7 +3,7 @@
 Single source of truth for GPU Docker, validation queue, and high-quality ASR/diar
 defaults. Fixture-specific overlays tune short dialogue vs long meetings.
 
-VRAM 0.92 is locked; companion 8 GB guards (batch=1, beams≤6, single job) are mandatory.
+VRAM 0.92 is locked; companion 8 GB guards (batch=1, beams≤5, single job) are mandatory.
 Wall time target: <=10 min for audio <20 min; half realtime for longer audio.
 """
 
@@ -34,13 +34,15 @@ ENTERPRISE_ACCURACY_BASE: dict[str, str] = {
     "ASR_8GB_MAX_BATCH_SIZE": "1",
     "ASR_CUDA_MEMORY_FRACTION": "0.92",
     "ASR_CUDA_MEMORY_FRACTION_MAX": "0.92",
-    "ASR_CLEAR_VRAM_AFTER_JOB": "true",
+    "ASR_CLEAR_VRAM_AFTER_JOB": "false",
     "ASR_CLEAR_VRAM_BETWEEN_ENGINES": "false",
     "ASR_KEEP_PRELOADED": "true",
     "ASR_PRELOAD_MODE": "eager",
-    "ASR_NUM_BEAMS": "6",
-    "ASR_NUM_BEAMS_MAX": "6",
+    "ASR_NUM_BEAMS": "4",
+    "ASR_NUM_BEAMS_MAX": "4",
     "ASR_NUM_BEAMS_MIN": "4",
+    "ASR_FAST_MODE": "true",
+    "ASR_CLEAR_VRAM_ON_MEDIA_CHANGE": "false",
     # --- ASR decode / turn-guided (diar timestamps, not Whisper word TS) ---
     "ASR_WORD_TIMESTAMPS_WITH_DIARIZATION": "false",
     "ASR_TURN_GUIDED": "true",
@@ -68,7 +70,7 @@ ENTERPRISE_ACCURACY_BASE: dict[str, str] = {
     "DIARIZATION_MULTI_SAMPLE_PASSES": "0",
     "DIARIZATION_PREPROCESS_SR": "16000",
     "DIARIZATION_PRELOAD_MODE": "eager",
-    "DIARIZATION_KEEP_PRELOADED": "false",
+    "DIARIZATION_KEEP_PRELOADED": "true",
     "DIARIZATION_SEGMENTATION_THRESHOLD": "0.36",
     "DIARIZATION_CLUSTERING_THRESHOLD": "0.40",
     "DIARIZATION_MIN_DURATION_OFF": "0.03",
@@ -97,7 +99,11 @@ ENTERPRISE_ACCURACY_BASE: dict[str, str] = {
     "ASR_PARALLEL_MODE": "sequential",
     "DIARIZATION_GPU_CO_RESIDENT": "false",
     "UI_MAX_CONCURRENT_JOBS": "1",
-    "UI_GRADIO_TRANSCRIBE_CONCURRENCY": "1",
+    "UI_GRADIO_TRANSCRIBE_CONCURRENCY": "4",
+    "UI_QUEUE_MAX_SIZE": "16",
+    "UI_HISTORY_PER_CLIENT_IP": "true",
+    "UI_CANCEL_FREES_GPU_FOR_QUEUE": "true",
+    "ASR_UNLOAD_ON_CANCEL": "false",
     # --- Audio enhance (CPU; diar on raw, ASR on enhanced when configured) ---
     "AUDIO_ENHANCE_ADAPTIVE": "true",
     "AUDIO_ENHANCE_ATEMPO": "1.0",

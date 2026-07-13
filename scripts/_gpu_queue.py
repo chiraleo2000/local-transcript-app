@@ -16,14 +16,10 @@ CONTAINER_NAME = "transcription-service"
 
 _GPU_SCRIPT_MARKERS = (
     "run_enterprise_validation",
-    "sweep_309_vbx",
-    "diarize_count",
-    "smoke_transcribe",
-    "run_309_diar",
-    "probe_309_centroids",
-    "score_fixture",
-    "check_sm_pipeline_speakers",
-    "check_sm_speakers",
+    "run_docker_acceptance",
+    "run_enterprise_validation",
+    "run_golden_automation",
+    "stop_gpu_work",
 )
 
 _T = TypeVar("_T")

@@ -171,19 +171,26 @@ def _job_row_from_path(path: Path) -> dict[str, Any] | None:
         "audio_duration_s": float(data.get("audio_duration_s") or 0.0),
         "total_elapsed_s": float(data.get("total_elapsed_s") or 0.0),
         "tab_id": data.get("tab_id") or "",
+        "client_ip": data.get("client_ip") or "",
         "progress": data.get("progress") or {},
         "results": data.get("results") or {},
     }
 
 
-def list_jobs(limit: int = 50) -> list[dict[str, Any]]:
-    """Return job summary rows sorted by created_at descending."""
+def list_jobs(limit: int = 50, *, client_ip: str | None = None) -> list[dict[str, Any]]:
+    """Return job summary rows sorted by created_at descending.
+
+    When *client_ip* is set, only jobs recorded for that client are returned
+    (workstation multi-user history).
+    """
     ensure_app_dirs()
     rows: list[dict[str, Any]] = []
     for path in JOB_DIR.glob("*.json"):
         row = _job_row_from_path(path)
         if row is not None:
             rows.append(row)
+    if client_ip:
+        rows = [row for row in rows if (row.get("client_ip") or "") == client_ip]
     rows.sort(key=lambda row: row["created_at"], reverse=True)
     return rows[: max(1, limit)]
 

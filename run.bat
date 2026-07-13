@@ -104,13 +104,8 @@ echo [2/3] Detecting accelerator support in Docker...
 set COMPOSE_FILES=-f docker-compose.openvino.yml
 docker run --rm --gpus all nvidia/cuda:13.0.0-runtime-ubuntu24.04 nvidia-smi >nul 2>&1
 if errorlevel 1 (
-    if exist docker-compose.openvino.yml (
-        echo       No NVIDIA GPU in Docker — using OpenVINO/CPU AI compose.
-    ) else (
-        echo       GPU not available — using generic CPU compose.
-        set COMPOSE_FILES=-f docker-compose.yml
-        echo       To enable NVIDIA GPU: Docker Desktop ^> Settings ^> Resources ^> GPU ^> Enable
-    )
+    echo       No NVIDIA GPU in Docker — using OpenVINO/CPU compose.
+    echo       To enable NVIDIA GPU: Docker Desktop ^> Settings ^> Resources ^> GPU ^> Enable
 ) else (
     echo       NVIDIA GPU available — using CUDA compose.
     set COMPOSE_FILES=-f docker-compose.gpu.yml

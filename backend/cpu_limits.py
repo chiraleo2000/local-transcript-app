@@ -14,16 +14,27 @@ _THREAD_ENV_KEYS = (
     "NUMEXPR_NUM_THREADS",
 )
 
+# Floor documented for OpenVINO / CPU hosts (Intel Core Ultra, AMD AI, ARM).
+MIN_CPU_THREADS = 4
+
+
+def _detected_cpu_threads() -> int:
+    return max(1, os.cpu_count() or MIN_CPU_THREADS)
+
 
 def cpu_thread_count() -> int:
+    """Resolve APP_CPU_THREADS (0/auto = detected cores; default auto)."""
+    raw = os.getenv("APP_CPU_THREADS", "0").strip()
+    if not raw or raw.lower() in {"0", "auto"}:
+        return _detected_cpu_threads()
     try:
-        return max(1, int(os.getenv("APP_CPU_THREADS", "16")))
+        return max(1, int(raw))
     except ValueError:
-        return 16
+        return _detected_cpu_threads()
 
 
 def apply_cpu_thread_limits() -> int:
-    """Cap BLAS/OpenMP and PyTorch CPU threads (default 16)."""
+    """Cap BLAS/OpenMP and PyTorch CPU threads (auto-detect by default)."""
     threads = cpu_thread_count()
     for key in _THREAD_ENV_KEYS:
         os.environ[key] = str(threads)

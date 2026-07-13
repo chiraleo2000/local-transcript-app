@@ -116,6 +116,7 @@ def _patch_gradio_schema_parser() -> None:
 
 _patch_gradio_schema_parser()
 
+from backend.client_identity import client_ip_from_request
 from backend.job_cancel import cancel_tab_job
 from backend.pipeline import JobMeta, active_job_count, run_transcription_job
 from backend.progress import JobProgress, get_job_progress
@@ -265,6 +266,17 @@ def _gradio_transcribe_concurrency() -> int:
         return max(1, int(raw))
     except ValueError:
         return 8
+
+
+def _gradio_queue_max_size() -> int:
+    try:
+        return max(1, int(os.getenv("UI_QUEUE_MAX_SIZE", "16")))
+    except ValueError:
+        return 16
+
+
+def _history_per_client_ip() -> bool:
+    return _env_bool("UI_HISTORY_PER_CLIENT_IP", True)
 
 
 def _is_eager_preload_mode(mode: str | None = None) -> bool:
@@ -432,13 +444,17 @@ PROGRESS_IDLE = _job_status_html({
 })
 
 
-def _history_dropdown_update():
+def _history_dropdown_update(client_ip: str | None = None):
+    filter_ip = client_ip if (_history_per_client_ip() and client_ip) else None
     choices = []
-    for row in list_jobs(50):
+    for row in list_jobs(50, client_ip=filter_ip):
         name = row.get("display_name") or row.get("source_filename") or row["job_id"]
         engines = ", ".join(row.get("selected_engines") or [])
         created = (row.get("created_at") or "")[:16]
-        label = f"{created} | {name} | {engines} | {row.get('status', '')}"
+        ip_tag = ""
+        if not filter_ip and row.get("client_ip"):
+            ip_tag = f" | {row['client_ip']}"
+        label = f"{created} | {name} | {engines} | {row.get('status', '')}{ip_tag}"
         choices.append((label, row["job_id"]))
     return gr.update(choices=choices)
 
@@ -477,6 +493,7 @@ def _empty_outputs(
     tracker: JobProgress | None = None,
     *,
     refresh_history: bool = True,
+    client_ip: str | None = None,
 ) -> tuple:
     no_download = gr.update(value=None, interactive=False)
     snap = (tracker or JobProgress()).snapshot()
@@ -486,7 +503,9 @@ def _empty_outputs(
         "elapsed_s": snap["elapsed_s"],
         "message": status_message,
     })
-    history = _history_dropdown_update() if refresh_history else gr.update()
+    history = (
+        _history_dropdown_update(client_ip) if refresh_history else gr.update()
+    )
     return (
         message, "", gr.update(), no_download,
         "",
@@ -505,7 +524,13 @@ def _env_bool(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _build_outputs(job_result: dict, selected_engines: list[str], tracker: JobProgress) -> tuple:
+def _build_outputs(
+    job_result: dict,
+    selected_engines: list[str],
+    tracker: JobProgress,
+    *,
+    client_ip: str | None = None,
+) -> tuple:
     engine = selected_engines[0] if selected_engines else default_asr_engines()[0]
     result = job_result["results"].get(engine)
     if result:
@@ -563,16 +588,17 @@ def _build_outputs(job_result: dict, selected_engines: list[str], tracker: JobPr
     outputs.append(_status_html("done", perf_text))
     outputs.append(_job_status_html(tracker.snapshot()))
     outputs.append(_transcribe_btn_ready())
-    outputs.append(_history_dropdown_update())
+    outputs.append(_history_dropdown_update(client_ip))
     outputs.append(gr.update(value=None, interactive=False))
     return tuple(outputs)
 
 
-def _reset_ui_outputs(tab_id: str) -> tuple:
-    """Signal cancellation for this browser tab only."""
+def _reset_ui_outputs(tab_id: str, request: gr.Request | None = None) -> tuple:
+    """Signal cancellation for this browser tab only; free GPU cache for queued jobs."""
     runtime, _ = resolve_runtime(tab_id)
     tracker = runtime["progress"]
     cancel_tab_job(runtime, tracker=tracker, message=_MSG_CANCELLED)
+    client_ip = client_ip_from_request(request)
     no_dl = gr.update(value=None, interactive=False)
     return (
         _CANCELLED, "", gr.update(), no_dl,
@@ -580,7 +606,7 @@ def _reset_ui_outputs(tab_id: str) -> tuple:
         _status_html("error", "Cancelled by user."),
         PROGRESS_IDLE,
         _transcribe_btn_ready(),
-        _history_dropdown_update(),
+        _history_dropdown_update(client_ip),
         gr.update(value=None, interactive=False),
     )
 
@@ -773,9 +799,10 @@ def _recover_manifest_or_idle(tab_id: str, tracker: JobProgress, no_dl: dict):
     yield _empty_outputs("", "idle", "Idle. Upload media and click Transcribe.", tracker=tracker)
 
 
-def transcribe(*inputs):
+def transcribe(*inputs, request: gr.Request | None = None):
     """Gradio callback — per browser-tab isolation; stopwatch via gr.Timer."""
     req = _parse_transcribe_request(inputs)
+    client_ip = client_ip_from_request(request)
     runtime, tid = resolve_runtime(req.tab_id)
     tracker = runtime["progress"]
     blocked = _transcribe_blocked_output(runtime, tracker, req.media_path)
@@ -829,6 +856,7 @@ def transcribe(*inputs):
                     display_name=display_name,
                     source_filename=source_filename,
                     output_name=output_name or None,
+                    client_ip=client_ip,
                 ),
             )
         except Exception as exc:  # pylint: disable=broad-exception-caught
@@ -857,28 +885,63 @@ def transcribe(*inputs):
         yield _transcription_error_outputs(tracker, error_holder["error"])
         return
 
-    yield _build_outputs(holder["result"], selected, tracker)
+    yield _build_outputs(
+        holder["result"], selected, tracker, client_ip=client_ip,
+    )
 
 
-def load_history():
-    return _history_dropdown_update()
+def load_history(request: gr.Request | None = None):
+    return _history_dropdown_update(client_ip_from_request(request))
 
 
-def load_selected_job(job_id: str):
+def load_selected_job(job_id: str, request: gr.Request | None = None):
+    client_ip = client_ip_from_request(request)
     if not job_id:
-        return _empty_outputs("Select a job from Previous transcripts.", refresh_history=False)
+        return _empty_outputs(
+            "Select a job from Previous transcripts.",
+            refresh_history=False,
+            client_ip=client_ip,
+        )
     job = load_job(job_id)
     if not job:
-        return _empty_outputs(f"Job not found: {job_id}", "error", "Job not found.")
+        return _empty_outputs(
+            f"Job not found: {job_id}",
+            "error",
+            "Job not found.",
+            client_ip=client_ip,
+        )
+    if (
+        _history_per_client_ip()
+        and client_ip
+        and (job.get("client_ip") or "") not in {"", client_ip}
+    ):
+        return _empty_outputs(
+            "Job not found for this client.",
+            "error",
+            "Access denied.",
+            client_ip=client_ip,
+        )
     selected = job.get("selected_engines") or default_asr_engines()
-    return _build_outputs(_manifest_to_job_result(job), selected, JobProgress())
+    return _build_outputs(
+        _manifest_to_job_result(job),
+        selected,
+        JobProgress(),
+        client_ip=client_ip,
+    )
 
 
-def download_selected_job(job_id: str):
+def download_selected_job(job_id: str, request: gr.Request | None = None):
     if not job_id:
         return gr.update(value=None, interactive=False)
     job = load_job(job_id)
     if not job:
+        return gr.update(value=None, interactive=False)
+    client_ip = client_ip_from_request(request)
+    if (
+        _history_per_client_ip()
+        and client_ip
+        and (job.get("client_ip") or "") not in {"", client_ip}
+    ):
         return gr.update(value=None, interactive=False)
     for result in (job.get("results") or {}).values():
         path = result.get("download_path")
@@ -1180,7 +1243,12 @@ def build_ui() -> gr.Blocks:
         with gr.Accordion("Job Info", open=False):
             job_info = gr.Textbox(label="", lines=2, interactive=False, elem_id="job-info", show_label=False)
 
-        gr.Markdown("### Previous transcripts")
+        gr.Markdown(
+            "### Previous transcripts\n"
+            "Filtered by your client IP when `UI_HISTORY_PER_CLIENT_IP=true` "
+            "(workstation multi-user). Cancel stops your job and frees GPU cache "
+            "for the next queued user."
+        )
         with gr.Row():
             history_dropdown = gr.Dropdown(
                 label="Past jobs",
@@ -1265,7 +1333,10 @@ def build_ui() -> gr.Blocks:
             inputs=[tab_instance_id],
             outputs=transcribe_outputs,
         )
-        demo.queue(default_concurrency_limit=_gradio_transcribe_concurrency() + 4)
+        demo.queue(
+            default_concurrency_limit=_gradio_transcribe_concurrency() + 4,
+            max_size=_gradio_queue_max_size(),
+        )
 
     return demo
 
@@ -1295,18 +1366,38 @@ def main() -> None:
     apply_quality_profile()
     hardware = detect_hardware()
     logger.info("Selected backend: %s / %s", hardware["backend"], hardware["selected_device"])
+    public_base = os.getenv("APP_PUBLIC_BASE_URL", "").strip()
+    if public_base:
+        logger.info("Public base URL hint: %s", public_base)
     _preload_models()
     application = build_ui()
     _register_progress_api(application)
     server_name = os.getenv("GRADIO_SERVER_NAME", "127.0.0.1")
     server_port = int(os.getenv("GRADIO_SERVER_PORT", "7896"))
-    launch_kwargs = {
+    launch_kwargs: dict = {
         "server_name": server_name,
         "server_port": server_port,
         "max_threads": 8,
         "show_error": True,
         "share": _env_bool("GRADIO_SHARE", False),
     }
+    root_path = os.getenv("GRADIO_ROOT_PATH", "").strip()
+    if root_path:
+        launch_kwargs["root_path"] = root_path
+        logger.info("Gradio root_path=%s (reverse proxy)", root_path)
+    max_file = os.getenv("GRADIO_MAX_FILE_SIZE", "").strip()
+    if max_file:
+        launch_kwargs["max_file_size"] = max_file
+    auth_user = os.getenv("GRADIO_AUTH_USER", "").strip()
+    auth_password = os.getenv("GRADIO_AUTH_PASSWORD", "").strip()
+    if auth_user and auth_password:
+        launch_kwargs["auth"] = (auth_user, auth_password)
+        logger.info("Gradio basic auth enabled for user=%s", auth_user)
+    elif auth_user or auth_password:
+        logger.warning(
+            "GRADIO_AUTH_USER/PASSWORD incomplete; basic auth disabled "
+            "(set both to enable)."
+        )
     try:
         application.launch(**launch_kwargs)
     except ValueError as exc:
