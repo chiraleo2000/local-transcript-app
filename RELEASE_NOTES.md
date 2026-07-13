@@ -38,8 +38,8 @@ Public/LAN Docker access (nginx/IIS), workstation multi-user queue, modest ASR s
 
 ### ASR / diarization speed (GPU)
 
-| Knob | v1.2.5 (cal15) | v1.2.6 |
-|------|----------------|--------|
+| Knob | Previous (cal15) | v1.2.6 |
+|------|------------------|--------|
 | `ASR_NUM_BEAMS` / `MAX` | 6 | **4** |
 | Merge gap / max turn | 0.35 / 20 | unchanged |
 | `DIARIZATION_KEEP_PRELOADED` | false | **true** |
@@ -48,13 +48,21 @@ Public/LAN Docker access (nginx/IIS), workstation multi-user queue, modest ASR s
 
 `models/ov_cache` is **OpenVINO-only**. NVIDIA GPU Docker does not need it.
 
+### Offline slim pack (GitHub release assets)
+
+- `install.bat` / `install.sh` — write `HF_TOKEN` + resource settings
+- `LocalTranscriptApp-v1.2.6-offline.zip.001` … `.006`
+- `join_offline_zip.ps1` / `join_offline_zip.sh`
+- `SHA256SUMS.txt` / `README_OFFLINE_PACK.md`
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\join_offline_zip.ps1
+# Extract, then run installer with optional token
+```
+
+### Deploy
+
 ```powershell
 docker compose -f docker-compose.gpu.yml up -d --build      # :7988
 docker compose -f docker-compose.openvino.yml up -d --build # :7987
 ```
-
----
-
-## Earlier — v1.2.5
-
-Enterprise GPU Docker acceptance, offline-only model policy, cal15 sample01 baseline (≈99.4% content / 100% speakers / ~177s), meeting309 profile, and slim offline pack assets on the GitHub release. Canonical knobs live in `backend/enterprise_config.py`.
