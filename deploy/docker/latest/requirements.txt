@@ -1,3 +1,4 @@
+# CUDA latest / recommended (PyTorch cu130) — see also repo-root requirements.txt
 # Local Transcript App — PyTorch NVIDIA CUDA 13 (cu130) wheels — recommended.
 # Host NVIDIA driver must support CUDA >= 12.4. See deploy/configs/CUDA.md
 # Minimum CUDA 12.4 image uses requirements-cuda124.txt instead.

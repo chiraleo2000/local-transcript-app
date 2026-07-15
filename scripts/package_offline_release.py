@@ -382,7 +382,7 @@ def _zip_stage(stage_root: Path, zip_path: Path, prefix: str) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Package offline release zip + installers.")
-    parser.add_argument("--version", default="1.2.6")
+    parser.add_argument("--version", default="1.2.7")
     parser.add_argument("--max-part-mib", type=int, default=1900)
     parser.add_argument("--keep-stage", action="store_true")
     parser.add_argument("--skip-manifest", action="store_true")

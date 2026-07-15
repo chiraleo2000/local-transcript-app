@@ -1,0 +1,40 @@
+# OpenVINO / CPU AI
+#   docker compose -f deploy/docker/openvino/compose.yml up -d --build
+# UI: http://localhost:7987
+
+services:
+  transcription:
+    image: local-transcript-app-openvino
+    build:
+      context: ../../..
+      dockerfile: deploy/docker/openvino/Dockerfile
+      tags:
+        - local-transcript-app-openvino
+    container_name: transcription-service-openvino
+    restart: unless-stopped
+    shm_size: "2gb"
+    ports:
+      - "7987:7896"
+    env_file:
+      - path: ../../../.env
+        required: false
+      - ../openvino-app.env
+    environment:
+      - APP_CPU_THREADS=${APP_CPU_THREADS:-4}
+      - OMP_NUM_THREADS=${APP_CPU_THREADS:-4}
+      - MKL_NUM_THREADS=${APP_CPU_THREADS:-4}
+      - OPENBLAS_NUM_THREADS=${APP_CPU_THREADS:-4}
+      - NUMEXPR_NUM_THREADS=${APP_CPU_THREADS:-4}
+      - GRADIO_AUTH_USER=${GRADIO_AUTH_USER:-}
+      - GRADIO_AUTH_PASSWORD=${GRADIO_AUTH_PASSWORD:-}
+      - APP_PUBLIC_BASE_URL=${APP_PUBLIC_BASE_URL:-}
+    volumes:
+      - ../../../models:/app/models
+      - ../../../storage:/app/storage
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+        "import urllib.request; urllib.request.urlopen('http://localhost:7896/startup-events')"]
+      interval: 30s
+      timeout: 10s
+      start_period: 600s
+      retries: 3

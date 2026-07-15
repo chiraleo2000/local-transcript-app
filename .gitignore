@@ -54,6 +54,15 @@ dist/
 
 # Env / secrets
 .env
+deploy/.public-credentials.txt
+deploy/nginx/certs/
+deploy/nginx/runtime/certs/
+deploy/nginx/runtime/logs/
+deploy/nginx/runtime/temp/
+deploy/nginx/runtime/conf/mime.types
+deploy/nginx/runtime/conf/conf.d/
+deploy/nginx/runtime/logs/nginx.pid
+
 
 # Logs
 *.log

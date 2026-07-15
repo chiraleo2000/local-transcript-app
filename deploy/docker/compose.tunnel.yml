@@ -1,0 +1,13 @@
+# Travel-proof public access via Cloudflare Tunnel (WiFi-safe)
+#   docker compose -f deploy/docker/latest/compose.yml -f deploy/docker/compose.proxy-override.yml -f deploy/docker/compose.tunnel.yml up -d
+services:
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: local-transcript-tunnel
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on: []

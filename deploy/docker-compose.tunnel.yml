@@ -1,0 +1,3 @@
+# Compatibility shim — use deploy/docker/compose.tunnel.yml
+include:
+  - path: docker/compose.tunnel.yml

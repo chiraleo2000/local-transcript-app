@@ -18,7 +18,7 @@ REM ---------------------------------------------------------------------------
 
 set "APP_ID=LocalTranscriptApp"
 set "APP_NAME=Local Transcript App"
-set "APP_VERSION=1.2.6"
+set "APP_VERSION=1.2.7"
 set "DEFAULT_PREFIX=%LOCALAPPDATA%\%APP_ID%"
 set "PREFIX=%DEFAULT_PREFIX%"
 set "DO_UNINSTALL=0"

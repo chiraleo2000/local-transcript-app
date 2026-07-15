@@ -1,0 +1,59 @@
+# NVIDIA GPU — cuda124
+# From repo root:
+#   docker compose -f deploy/docker/cuda124/compose.yml up -d --build
+# UI: http://localhost:7988
+#
+# Shared diarization/ASR policy: deploy/docker/gpu-app.env
+
+services:
+  transcription:
+    image: local-transcript-app:cuda124
+    build:
+      context: ../../..
+      dockerfile: deploy/docker/cuda124/Dockerfile
+      tags:
+        - local-transcript-app:cuda124
+    container_name: transcription-service
+    restart: unless-stopped
+    gpus: all
+    shm_size: "4gb"
+    ports:
+      - "7988:7896"
+    env_file:
+      - path: ../../../.env
+        required: false
+      - ../gpu-app.env
+    environment:
+      - GRADIO_ROOT_PATH=${GRADIO_ROOT_PATH:-}
+      - GRADIO_MAX_FILE_SIZE=${GRADIO_MAX_FILE_SIZE:-512mb}
+      - GRADIO_AUTH_USER=${GRADIO_AUTH_USER:-}
+      - GRADIO_AUTH_PASSWORD=${GRADIO_AUTH_PASSWORD:-}
+      - APP_PUBLIC_BASE_URL=${APP_PUBLIC_BASE_URL:-}
+      - APP_CPU_THREADS=${APP_CPU_THREADS:-16}
+      - OMP_NUM_THREADS=${APP_CPU_THREADS:-16}
+      - MKL_NUM_THREADS=${APP_CPU_THREADS:-16}
+      - OPENBLAS_NUM_THREADS=${APP_CPU_THREADS:-16}
+      - NUMEXPR_NUM_THREADS=${APP_CPU_THREADS:-16}
+      - APP_CUDA_STACK=cuda124
+      - NVIDIA_REQUIRE_CUDA=cuda>=12.4
+    volumes:
+      - ../../../:/app
+      - ../../../models:/app/models
+      - ../../../storage:/app/storage
+    deploy:
+      resources:
+        limits:
+          cpus: "16"
+        reservations:
+          cpus: "4"
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+        "import urllib.request; urllib.request.urlopen('http://localhost:7896/startup-events')"]
+      interval: 30s
+      timeout: 10s
+      start_period: 120s
+      retries: 3

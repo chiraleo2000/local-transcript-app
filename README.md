@@ -3,7 +3,7 @@
 GPU-accelerated local audio/video transcription with speaker diarization.  
 No cloud APIs. No telemetry. All processing stays on your machine.
 
-**Version 1.2.6** — see [RELEASE_NOTES.md](RELEASE_NOTES.md)
+**Version 1.2.7** — see [RELEASE_NOTES.md](RELEASE_NOTES.md)
 
 ---
 
@@ -41,11 +41,11 @@ Do this **before** Docker or the installer:
    GRADIO_AUTH_USER=
    GRADIO_AUTH_PASSWORD=
    ```
-6. **Deploy**
-   - NVIDIA: `docker compose -f docker-compose.gpu.yml up -d --build` → http://localhost:7988  
-   - OpenVINO / Intel / AMD AI / ARM: `docker compose -f docker-compose.openvino.yml up -d --build` → http://localhost:7987  
-   - Native installer: `installer\install.bat --hf-token hf_xxx` or `./installer/install.sh --hf-token hf_xxx`  
-   - Public proxy: [`deploy/README.md`](deploy/README.md)
+6. **Deploy (Docker GPU / OpenVINO)**
+   - One-click: `Deploy-Docker.bat` (reads `DEPLOY_BACKEND` from `.env`: `auto` / `gpu` / `openvino`)
+   - Or: `.\deploy\scripts\Deploy-Docker.ps1 -Backend gpu -Build`
+   - GPU → http://localhost:7988 · OpenVINO → http://localhost:7987
+   - Public / travel: see [`deploy/SETUP.md`](deploy/SETUP.md)
 
 `docker-compose.*.yml` **overrides** many `.env` keys for production safety. Put secrets (`HF_TOKEN`) in `.env`; tune runtime policy in compose or via installer flags.
 
@@ -59,10 +59,11 @@ Do this **before** Docker or the installer:
 - **Advanced diarization tuning** — segmentation threshold, clustering threshold, min cluster size, silence gap — adjustable live in the UI
 - **Audio enhancement** — bandpass filter → spectral noise reduction → gate / compress / limiter chain (louder speech, minimal background)
 - **Native desktop window** — pywebview wraps the Gradio UI; no browser required when using `launcher.py` or `LocalTranscriptApp.exe`
-- **Docker GPU mode** — NVIDIA CUDA 13 + PyTorch; models cached in `./models/`
+- **Docker GPU mode** — stacks under [`deploy/docker/`](deploy/docker/): **latest** (CUDA 13.3), **cuda126**, **cuda124**, plus **openvino** — see [`deploy/docker/README.md`](deploy/docker/README.md)
+- **Fast diarization + accuracy** — shared policy in [`deploy/docker/gpu-app.env`](deploy/docker/gpu-app.env)
 - **Strict 8 GB VRAM policy** — safe on RTX 4060 Laptop (8 GB); one model at a time, sequential engines, capped chunk size
 - **OOM-safe long jobs** — disk-window ASR streaming (one slice in RAM), iterative CUDA chunk halving, UI transcript line/char caps, co-resident GPU preload with phase teardown
-- **Public/LAN reverse proxy** — nginx or Windows IIS in front of Docker `:7988` (see [`deploy/README.md`](deploy/README.md))
+- **Public WiFi-safe access** — home: nginx; travel: Cloudflare Tunnel for `asrservice.demotoday.th` — setup guide [`deploy/SETUP.md`](deploy/SETUP.md)
 
 ---
 
@@ -71,9 +72,9 @@ Do this **before** Docker or the installer:
 | Mode | URL | Notes |
 | --- | --- | --- |
 | Direct Python / GUI (`run.bat`, `launcher.py`) | `http://localhost:7896` | `GRADIO_SERVER_PORT=7896` |
-| Docker NVIDIA GPU | `http://localhost:7988` | `docker-compose.gpu.yml` |
-| Docker OpenVINO / CPU | `http://localhost:7987` | `docker-compose.openvino.yml` |
-| Public / LAN (nginx or IIS) | your hostname | Reverse-proxy to `127.0.0.1:7988` — [`deploy/README.md`](deploy/README.md) |
+| Docker NVIDIA GPU (latest/12.6/12.4) | `http://localhost:7988` | `deploy/docker/{latest,cuda126,cuda124}/` |
+| Docker OpenVINO / CPU | `http://localhost:7987` | `deploy/docker/openvino/` |
+| Public (`asrservice.demotoday.th`) | `https://asrservice.demotoday.th` | Tunnel or nginx → `127.0.0.1:7988` — [`deploy/SETUP.md`](deploy/SETUP.md) |
 
 `models/ov_cache` is **OpenVINO-only**. GPU Docker does not need it.
 
@@ -83,15 +84,17 @@ Do this **before** Docker or the installer:
 
 ### Option A — Docker (recommended)
 
-> **NVIDIA GPU:** `docker compose -f docker-compose.gpu.yml up -d --build` → http://localhost:7988  
-> **OpenVINO / CPU (no NVIDIA):** `docker compose -f docker-compose.openvino.yml up -d --build` → http://localhost:7987
+> **One-click:** `Deploy-Docker.bat` (auto GPU or OpenVINO from `.env`)  
+> **NVIDIA GPU:** http://localhost:7988 · **OpenVINO:** http://localhost:7987
 
 ```bat
-REM Windows — auto-detect GPU vs OpenVINO
-run.bat docker
+REM Windows — preferred
+Deploy-Docker.bat
+Deploy-Docker.bat gpu -Build
+Deploy-Docker.bat openvino -ClearCache
 
-# Linux / macOS
-./run.sh docker
+REM Legacy shortcut (also auto-detects)
+run.bat docker
 ```
 
 Open the native desktop window automatically by running the launcher instead:

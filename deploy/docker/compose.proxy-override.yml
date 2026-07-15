@@ -1,0 +1,6 @@
+# From repo root:
+#   docker compose -f deploy/docker/latest/compose.yml -f deploy/docker/compose.proxy-override.yml up -d
+services:
+  transcription:
+    ports: !override
+      - "127.0.0.1:7988:7896"
