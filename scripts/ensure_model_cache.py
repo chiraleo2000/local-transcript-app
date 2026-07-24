@@ -17,10 +17,10 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from dotenv import load_dotenv
+from backend.dotenv_load import load_dotenv_safe
 
-load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
-load_dotenv(os.path.join(PROJECT_ROOT, ".env.production"), override=False)
+load_dotenv_safe(os.path.join(PROJECT_ROOT, ".env"))
+load_dotenv_safe(os.path.join(PROJECT_ROOT, ".env.production"), override=False)
 
 from backend.paths import app_root, resolve_path
 from engines.model_cache import (

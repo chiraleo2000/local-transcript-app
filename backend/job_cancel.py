@@ -1,4 +1,4 @@
-"""Cancel in-flight tab jobs and release GPU memory before restart."""
+"""Cancel in-flight tab / API jobs and release GPU memory before restart."""
 
 from __future__ import annotations
 
@@ -11,6 +11,13 @@ from backend.services.asr_local import should_unload_on_cancel
 from backend.ui_session import clear_active_job
 
 logger = logging.getLogger(__name__)
+
+
+def cancel_job_by_id(job_id: str) -> bool:
+    """Cancel a headless/API job by durable job_id (see backend.job_queue)."""
+    from backend.job_queue import cancel_job_by_id as _cancel_api_job
+
+    return _cancel_api_job(job_id)
 
 
 def cancel_join_timeout_s() -> float:

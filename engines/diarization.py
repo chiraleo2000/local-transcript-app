@@ -1001,10 +1001,13 @@ def _build_diarize_kwargs(
     centroid merging + the max-speaker cap bring the count back down.
     """
     del audio_duration_s
-    exact = _env_bool("DIARIZATION_EXACT_NUM_SPEAKERS", False)
-    if num_speakers > 0 and exact:
-        return {"num_speakers": num_speakers}
+    # Meeting-scale VBx: request hint+extra even with an exact speaker count.
+    # community-1 otherwise under-fills (measured 8/11 on 309 before centroid
+    # merge collapsed the rest). _enforce_max_speakers clamps afterward.
     if num_speakers > 0:
+        extra = _overcluster_extra(max_speakers if max_speakers > 0 else num_speakers)
+        if extra > 0 and num_speakers >= 6:
+            return {"num_speakers": num_speakers + extra}
         return {"num_speakers": num_speakers}
     if min_speakers_hint <= 0 and max_speakers > 0:
         extra = _overcluster_extra(max_speakers)

@@ -5,8 +5,8 @@ Fixtures run in a single queue — never start two validation processes in paral
 on 8 GB VRAM. A cross-process lock enforces one holder at a time.
 
 Fixtures:
-  1. sample01   — 99/98/98/95% accuracy, 4/4 speakers, <=10 min wall time (<20 min audio)
-  2. meeting309 — 11/11 named speakers + meeting gates, half-realtime budget
+  1. sample01   — >=95% content, >=98% speaker, locked cal15 ts/strict gates, 4/4 speakers, <=10 min
+  2. meeting309 — 11/11 named speakers + meeting gates, half-realtime budget (needs tests/309.m4a)
 
 Exits 0 only when every check passes. Writes JSON summary to tests/output/.
 """
@@ -196,7 +196,8 @@ def _apply_fixture_env(name: str, *, fast: bool = False) -> None:
     from backend.enterprise_config import ENTERPRISE_FIXTURE_OVERRIDES, ENTERPRISE_LONG_AUDIO_ENV
     from tests.golden.config import apply_enterprise_env
 
-    apply_enterprise_env()
+    # Force locked enterprise defaults over compose gpu-app.env, then fixture overlays.
+    apply_enterprise_env(override=True)
     for key, value in _VALIDATION_BASE_ENV.items():
         os.environ[key] = value
     if fast:
@@ -208,6 +209,19 @@ def _apply_fixture_env(name: str, *, fast: bool = False) -> None:
     apply_quality_profile()
     for key, value in ENTERPRISE_FIXTURE_OVERRIDES.get(name, {}).items():
         os.environ[key] = value
+    # Locked acceptance path: diar on raw, mild ASR-only enhance, no adaptive cuts.
+    os.environ["AUDIO_ENHANCE_ASR_ONLY"] = "true"
+    os.environ["AUDIO_ENHANCE_WHEN_DIARIZATION"] = "false"
+    os.environ["AUDIO_ENHANCE_ADAPTIVE"] = "false"
+    os.environ["AUDIO_ENHANCE_DEFAULT"] = "true"
+    os.environ["AUDIO_ENHANCE_NOISE_REDUCTION"] = "0.35"
+    os.environ["ASR_ADAPTIVE_PERFORMANCE"] = "false"
+    os.environ["ASR_DIAR_WINDOWED_FAST"] = "false"
+    os.environ["ASR_NUM_BEAMS"] = os.environ.get("ASR_NUM_BEAMS", "5") or "5"
+    if name == "sample01":
+        os.environ["ASR_NUM_BEAMS"] = "5"
+        os.environ["ASR_NUM_BEAMS_MAX"] = "5"
+        os.environ["ASR_NUM_BEAMS_MIN"] = "5"
 
 
 def _score_fixture_result(
@@ -248,10 +262,20 @@ def _build_diarize_kwargs(name: str, fx) -> dict:
     return {}
 
 
-def _enhance_when_diarization_enabled() -> bool:
+def _enhance_enabled_for_acceptance() -> bool:
+    """Locked path: ASR-only enhance on (diar stays raw via AUDIO_ENHANCE_ASR_ONLY)."""
     import os
 
-    return os.getenv("AUDIO_ENHANCE_WHEN_DIARIZATION", "").strip().lower() in {
+    if os.getenv("AUDIO_ENHANCE_WHEN_DIARIZATION", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }:
+        return True
+    # cal15/m310: checkbox-equivalent enhance with ASR_ONLY=true
+    if os.getenv("AUDIO_ENHANCE_ASR_ONLY", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }:
+        return True
+    return os.getenv("AUDIO_ENHANCE_DEFAULT", "").strip().lower() in {
         "1", "true", "yes", "on",
     }
 
@@ -294,7 +318,7 @@ def _run_fixture(name: str, tag: str, *, fast: bool = False) -> dict:
     t0 = time.perf_counter()
 
     diarize_kwargs = _build_diarize_kwargs(name, fx)
-    enhance = _enhance_when_diarization_enabled()
+    enhance = _enhance_enabled_for_acceptance()
 
     result = run_transcription_job(
         media_path=str(audio),

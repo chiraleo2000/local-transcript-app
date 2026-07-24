@@ -39,16 +39,17 @@ def _env_int(name: str, default: int) -> int:
 def performance_target_seconds(audio_duration_s: float) -> float:
     """Target wall time: tiered realtime budget.
 
-  - Audio < ``ASR_TARGET_MEDIUM_AUDIO_S`` (default 20 min): flat cap
+  - Audio < ``ASR_TARGET_MEDIUM_AUDIO_S`` (default 15 min): flat cap
     ``ASR_TARGET_SHORT_MAX_S`` (default 600 s / 10 min) when > 0.
   - Audio >= medium threshold: ``audio_duration / ASR_TARGET_RT_RATIO_LONG``
-    (default half realtime). Optional ``ASR_TARGET_LONG_MAX_S`` caps long jobs.
+    (default 1.5 → wall time = 2/3 of audio). Optional ``ASR_TARGET_LONG_MAX_S``
+    caps long jobs.
     """
     if audio_duration_s <= 0:
         return 0.0
-    medium_threshold = max(60.0, _env_float("ASR_TARGET_MEDIUM_AUDIO_S", 20 * 60))
+    medium_threshold = max(60.0, _env_float("ASR_TARGET_MEDIUM_AUDIO_S", 15 * 60))
     short_max = _env_float("ASR_TARGET_SHORT_MAX_S", 600.0)
-    ratio = max(1.0, _env_float("ASR_TARGET_RT_RATIO_LONG", 2.0))
+    ratio = max(1.0, _env_float("ASR_TARGET_RT_RATIO_LONG", 1.5))
 
     if audio_duration_s < medium_threshold and short_max > 0:
         return short_max
@@ -121,20 +122,39 @@ def should_use_windowed_diar_asr(
 
 
 def adaptive_turn_merge_gap_s(audio_duration_s: float) -> float:
-    """Wider merge on long audio → fewer turn-guided ASR passes."""
+    """Wider merge on long audio → fewer turn-guided ASR passes.
+
+    In accuracy mode keep merges tight so speaker timeline boundaries stay sharp;
+    time pressure is handled by lowering beams instead.
+    """
     from backend.asr_quality import is_accuracy_mode
 
     configured = os.getenv("ASR_TURN_GUIDED_MERGE_GAP_S", "").strip()
-    if configured and audio_duration_s < 5 * 60 and is_accuracy_mode():
+    if configured:
         try:
             value = float(configured)
-            if value > 0:
-                return value
+            if value >= 0:
+                if is_accuracy_mode():
+                    # Honor explicit env; only allow mild stretch on very long audio.
+                    if audio_duration_s < 45 * 60:
+                        return value
+                    return min(1.0, value + 0.25) if value < 1.0 else value
+                if value > 0 and audio_duration_s < 5 * 60:
+                    return value
         except ValueError:
             pass
 
+    if is_accuracy_mode():
+        if audio_duration_s < 12 * 60:
+            return 0.25
+        if audio_duration_s < 30 * 60:
+            return 0.35
+        if audio_duration_s < 60 * 60:
+            return 0.50
+        return 0.75
+
     if audio_duration_s < 5 * 60:
-        return 0.35 if is_accuracy_mode() else 0.5
+        return 0.5
     if audio_duration_s < 12 * 60:
         return 0.55
     if audio_duration_s < 20 * 60:
@@ -179,13 +199,22 @@ def adaptive_turn_settings_for_diarization(
         return merge_gap, max_turn
 
     compression = raw_turn_est / max_turns
-    merge_gap = min(3.5, merge_gap + 0.4 * math.log(compression))
+    from backend.asr_quality import is_accuracy_mode
     from engines.whisper_utils import whisper_max_asr_turn_body_s
 
-    max_turn = min(
-        whisper_max_asr_turn_body_s(),
-        max(max_turn, 60.0 * compression ** 0.35),
-    )
+    if is_accuracy_mode():
+        # Prefer slightly longer turns over smearing speaker boundaries.
+        max_turn = min(
+            whisper_max_asr_turn_body_s(),
+            max(max_turn, min(28.0, 22.0 * compression ** 0.25)),
+        )
+        merge_gap = min(1.0, merge_gap + 0.15 * math.log(compression))
+    else:
+        merge_gap = min(3.5, merge_gap + 0.4 * math.log(compression))
+        max_turn = min(
+            whisper_max_asr_turn_body_s(),
+            max(max_turn, 60.0 * compression ** 0.35),
+        )
     logger.info(
         "Turn budget tuning: audio=%.0fs target=%.0fs asr_budget=%.0fs "
         "est_turns=%d cap=%d → merge_gap=%.2fs max_turn=%.0fs",

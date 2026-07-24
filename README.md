@@ -33,14 +33,19 @@ Do this **before** Docker or the installer:
    # APP_FORCE_BACKEND=cuda|rocm|openvino|directml|cpu
    OV_DEVICE=GPU
    ```
-5. **Workstation / LAN** (optional):
+5. **Accounts + workstation queue** (optional):
    ```dotenv
+   APP_AUTH_ENABLED=true
+   APP_SEED_USER=chira
+   APP_SEED_PASSWORD=  # set in local .env only — never commit
+   APP_AUTH_SECRET=
    UI_MAX_CONCURRENT_JOBS=1
    UI_GRADIO_TRANSCRIBE_CONCURRENCY=4
+   API_MAX_QUEUED_JOBS=4
+   ASR_CUDA_MEMORY_FRACTION=0.75
    UI_HISTORY_PER_CLIENT_IP=true
-   GRADIO_AUTH_USER=
-   GRADIO_AUTH_PASSWORD=
    ```
+   Up to **4 jobs** may be queued; **1 GPU pipeline** runs at a time (~6 GB VRAM allowance on an 8 GB card). True 4-way GPU parallelism needs ≥16 GB.
 6. **Deploy (Docker GPU / OpenVINO)**
    - One-click: `Deploy-Docker.bat` (reads `DEPLOY_BACKEND` from `.env`: `auto` / `gpu` / `openvino`)
    - Or: `.\deploy\scripts\Deploy-Docker.ps1 -Backend gpu -Build`
@@ -61,9 +66,43 @@ Do this **before** Docker or the installer:
 - **Native desktop window** — pywebview wraps the Gradio UI; no browser required when using `launcher.py` or `LocalTranscriptApp.exe`
 - **Docker GPU mode** — stacks under [`deploy/docker/`](deploy/docker/): **latest** (CUDA 13.3), **cuda126**, **cuda124**, plus **openvino** — see [`deploy/docker/README.md`](deploy/docker/README.md)
 - **Fast diarization + accuracy** — shared policy in [`deploy/docker/gpu-app.env`](deploy/docker/gpu-app.env)
-- **Strict 8 GB VRAM policy** — safe on RTX 4060 Laptop (8 GB); one model at a time, sequential engines, capped chunk size
-- **OOM-safe long jobs** — disk-window ASR streaming (one slice in RAM), iterative CUDA chunk halving, UI transcript line/char caps, co-resident GPU preload with phase teardown
+- **Strict 6–8 GB VRAM policy** — one GPU pipeline at a time; up to 4 queued jobs (UI + REST); ASR↔diar staging; CUDA-only diarization
+- **User accounts** — SQLite store (`storage/users.db`); Gradio login + REST share the same credentials
+- **Headless job API** — submit/status/transcript/cancel without keeping a browser open (see below)
+- **OOM-safe long jobs** — disk-window ASR streaming (one slice in RAM), iterative CUDA chunk halving, UI transcript line/char caps, exclusive GPU model ownership
 - **Public WiFi-safe access** — home: nginx; travel: Cloudflare Tunnel for `asrservice.demotoday.th` — setup guide [`deploy/SETUP.md`](deploy/SETUP.md)
+
+---
+
+## Headless job API
+
+Jobs keep running after you close the browser. Authenticate once, submit audio, poll later.
+
+```bash
+# Login (returns token; also sets HttpOnly cookie lta_session)
+curl -s -X POST http://localhost:7896/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d "{\"username\":\"YOUR_USER\",\"password\":\"YOUR_PASSWORD\"}"
+
+# Submit (multipart). Use Bearer token from login.
+curl -s -X POST http://localhost:7896/api/jobs \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -F "file=@sample.wav" \
+  -F "language=Thai" \
+  -F "diarization=true" \
+  -F "enhance=true"
+
+# Status / transcript / cancel
+curl -s http://localhost:7896/api/jobs/JOB_ID -H "Authorization: Bearer YOUR_TOKEN"
+curl -s http://localhost:7896/api/jobs/JOB_ID/transcript -H "Authorization: Bearer YOUR_TOKEN" -o out.txt
+curl -s -X POST http://localhost:7896/api/jobs/JOB_ID/cancel -H "Authorization: Bearer YOUR_TOKEN"
+```
+
+**New users (browser):** open **[/register](http://localhost:7988/register)** (Docker) or `http://localhost:7896/register` (direct). The Gradio login screen also links there. Or `POST /api/auth/register` with `{"username","password"}`.
+
+Seed user is created on first boot from `APP_SEED_USER` / `APP_SEED_PASSWORD` in host `.env` (password is hashed at seed time; do not put plaintext secrets in committed env files).
+
+Docker GPU UI port is **7988** (replace `7896` above when calling the container).
 
 ---
 

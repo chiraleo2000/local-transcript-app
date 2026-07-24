@@ -80,7 +80,7 @@ def bootstrap() -> None:
 
     install_whisper_pipeline_log_filters()
 
-    from dotenv import load_dotenv
+    from backend.dotenv_load import load_dotenv_safe
 
     # Docker compose `environment:` / `docker compose run -e` must win over .env files.
     _preserve_prefixes = ("ASR_", "DIARIZATION_", "CUDA_", "UI_", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")
@@ -88,8 +88,8 @@ def bootstrap() -> None:
         k: v for k, v in os.environ.items()
         if k.startswith(_preserve_prefixes) or k == "CUDA_AUTO_RESTART"
     }
-    load_dotenv(REPO / ".env")
-    load_dotenv(REPO / ".env.production", override=False)
+    load_dotenv_safe(REPO / ".env")
+    load_dotenv_safe(REPO / ".env.production", override=False)
     for key, value in _preserved.items():
         os.environ[key] = value
 

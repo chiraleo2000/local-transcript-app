@@ -28,9 +28,9 @@ for _env_name in (".env", ".env.production"):
     _env_path = os.path.join(_root, _env_name)
     if os.path.isfile(_env_path):
         try:
-            from dotenv import load_dotenv
+            from backend.dotenv_load import load_dotenv_safe
 
-            load_dotenv(_env_path, override=False)
+            load_dotenv_safe(_env_path, override=False)
         except ImportError:
             break
 

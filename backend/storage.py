@@ -172,16 +172,24 @@ def _job_row_from_path(path: Path) -> dict[str, Any] | None:
         "total_elapsed_s": float(data.get("total_elapsed_s") or 0.0),
         "tab_id": data.get("tab_id") or "",
         "client_ip": data.get("client_ip") or "",
+        "user_id": int(data.get("user_id") or 0),
+        "username": data.get("username") or "",
         "progress": data.get("progress") or {},
         "results": data.get("results") or {},
     }
 
 
-def list_jobs(limit: int = 50, *, client_ip: str | None = None) -> list[dict[str, Any]]:
+def list_jobs(
+    limit: int = 50,
+    *,
+    client_ip: str | None = None,
+    username: str | None = None,
+    user_id: int | None = None,
+) -> list[dict[str, Any]]:
     """Return job summary rows sorted by created_at descending.
 
-    When *client_ip* is set, only jobs recorded for that client are returned
-    (workstation multi-user history).
+    Prefer *user_id* / *username* for account history. *client_ip* remains as a
+    legacy workstation filter when no user identity is provided.
     """
     ensure_app_dirs()
     rows: list[dict[str, Any]] = []
@@ -189,7 +197,16 @@ def list_jobs(limit: int = 50, *, client_ip: str | None = None) -> list[dict[str
         row = _job_row_from_path(path)
         if row is not None:
             rows.append(row)
-    if client_ip:
+    if user_id is not None and int(user_id) > 0:
+        uid = int(user_id)
+        rows = [row for row in rows if int(row.get("user_id") or 0) == uid]
+    elif username:
+        uname = username.strip().lower()
+        rows = [
+            row for row in rows
+            if (row.get("username") or "").strip().lower() == uname
+        ]
+    elif client_ip:
         rows = [row for row in rows if (row.get("client_ip") or "") == client_ip]
     rows.sort(key=lambda row: row["created_at"], reverse=True)
     return rows[: max(1, limit)]

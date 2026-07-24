@@ -3,11 +3,14 @@
 Single source of truth for GPU Docker, validation queue, and high-quality ASR/diar
 defaults. Fixture-specific overlays tune short dialogue vs long meetings.
 
-VRAM 0.92 is locked; companion 8 GB guards (batch=1, beams≤5, single job) are mandatory.
-Wall time target: <=10 min for audio <20 min; half realtime for longer audio.
+VRAM fraction ~0.75 (~6 GB on 8 GB cards); companion guards (batch=1, beams≤5, 1 GPU job /
+4 queued) are mandatory. Wall time: <=10 min for audio <20 min; half realtime for longer.
 """
 
 from __future__ import annotations
+
+# Whisper fallback temperature ladder (shared by base + fixture overlays).
+_ASR_TEMPERATURE_LADDER = "0.0,0.2,0.4,0.6,0.8,1.0"
 
 # Shared accuracy-first GPU profile (8 GB sequential, turn-guided ASR).
 ENTERPRISE_ACCURACY_BASE: dict[str, str] = {
@@ -22,7 +25,7 @@ ENTERPRISE_ACCURACY_BASE: dict[str, str] = {
     "ASR_ADAPTIVE_PERFORMANCE": "false",
     "ASR_DIAR_WINDOWED_FAST": "false",
     "ASR_HARD_MEMORY_SAFE": "true",
-    # --- Wall time: strict half realtime ---
+    # --- Wall time: strict half realtime (locked acceptance budget) ---
     "ASR_TARGET_RT_RATIO_LONG": "2",
     "ASR_TARGET_SHORT_MAX_S": "600",
     "ASR_TARGET_MEDIUM_AUDIO_S": "1200",
@@ -32,15 +35,15 @@ ENTERPRISE_ACCURACY_BASE: dict[str, str] = {
     "ASR_CUDA_BATCH_SIZE": "1",
     "ASR_8GB_BATCH_SIZE": "1",
     "ASR_8GB_MAX_BATCH_SIZE": "1",
-    "ASR_CUDA_MEMORY_FRACTION": "0.92",
-    "ASR_CUDA_MEMORY_FRACTION_MAX": "0.92",
+    "ASR_CUDA_MEMORY_FRACTION": "0.75",
+    "ASR_CUDA_MEMORY_FRACTION_MAX": "0.90",
     "ASR_CLEAR_VRAM_AFTER_JOB": "false",
     "ASR_CLEAR_VRAM_BETWEEN_ENGINES": "false",
     "ASR_KEEP_PRELOADED": "true",
     "ASR_PRELOAD_MODE": "eager",
-    "ASR_NUM_BEAMS": "4",
-    "ASR_NUM_BEAMS_MAX": "4",
-    "ASR_NUM_BEAMS_MIN": "4",
+    "ASR_NUM_BEAMS": "5",
+    "ASR_NUM_BEAMS_MAX": "5",
+    "ASR_NUM_BEAMS_MIN": "5",
     "ASR_FAST_MODE": "true",
     "ASR_CLEAR_VRAM_ON_MEDIA_CHANGE": "false",
     # --- ASR decode / turn-guided (diar timestamps, not Whisper word TS) ---
@@ -56,6 +59,7 @@ ENTERPRISE_ACCURACY_BASE: dict[str, str] = {
     "ASR_REJECT_HALLUCINATED_TURNS": "true",
     "ASR_CLEANUP_THAI_SPACING": "true",
     "ASR_CONDITION_ON_PREVIOUS_TEXT": "false",
+    "ASR_TEMPERATURE": _ASR_TEMPERATURE_LADDER,
     "ASR_LOGPROB_THRESHOLD": "-0.5",
     "ASR_NO_SPEECH_THRESHOLD": "0.6",
     "ASR_NO_REPEAT_NGRAM_SIZE": "8",
@@ -100,9 +104,12 @@ ENTERPRISE_ACCURACY_BASE: dict[str, str] = {
     "DIARIZATION_GPU_CO_RESIDENT": "false",
     "UI_MAX_CONCURRENT_JOBS": "1",
     "UI_GRADIO_TRANSCRIBE_CONCURRENCY": "4",
+    "API_MAX_QUEUED_JOBS": "4",
     "UI_QUEUE_MAX_SIZE": "16",
     "UI_HISTORY_PER_CLIENT_IP": "true",
     "UI_CANCEL_FREES_GPU_FOR_QUEUE": "true",
+    "APP_AUTH_ENABLED": "true",
+    "MIN_NVIDIA_VRAM_MB": "6000",
     "ASR_UNLOAD_ON_CANCEL": "false",
     # --- Audio enhance (CPU; diar on raw, ASR on enhanced when configured) ---
     "AUDIO_ENHANCE_ADAPTIVE": "true",
@@ -116,9 +123,12 @@ ENTERPRISE_ACCURACY_BASE: dict[str, str] = {
 # Per-fixture tuning for acceptance validation (see run_enterprise_validation.py).
 ENTERPRISE_FIXTURE_OVERRIDES: dict[str, dict[str, str]] = {
     "sample01": {
-        # cal15/best LOCKED (Docker offline 2026-07-08): 99.4% content, 100% spk,
-        # 4/4, 67.5% ts, 9 mismatched, 177–183s. Diar boundary refine infra
-        # added (cal16–cal21) but gates need further work — keep cal15 knobs.
+        # cal15/best LOCKED + beams=5 (Docker 2026-07-16: 99.3% content, 100% spk,
+        # 4/4, 67.5% ts, 9 mismatched). Keep diar knobs; ASR beams raised for wording.
+        "ASR_NUM_BEAMS": "5",
+        "ASR_NUM_BEAMS_MAX": "5",
+        "ASR_NUM_BEAMS_MIN": "5",
+        "ASR_TEMPERATURE": _ASR_TEMPERATURE_LADDER,
         "ASR_TURN_GUIDED_MAX_TURN_S": "20",
         "ASR_TURN_USE_DIAR_TIMESTAMPS": "true",
         "ASR_WORD_TIMESTAMPS_WITH_DIARIZATION": "false",
@@ -170,34 +180,36 @@ ENTERPRISE_FIXTURE_OVERRIDES: dict[str, dict[str, str]] = {
         "AUDIO_ENHANCE_NOISE_REDUCTION": "0.35",
     },
     "meeting309": {
-        # m310 LOCKED: 90-min / 11-speaker, diar on raw, ASR-only enhance.
-        # num_speakers=11 via DIARIZATION_EXACT_NUM_SPEAKERS + _build_diarize_kwargs.
-        # MEGA_TURN_MAX_REFINES=4 (m309 OOM at 12). Pending Docker validation.
+        # m311: fix 8/11 collapse — disable centroid merge (merged 3 speakers at 0.80),
+        # overcluster 11+7, intro recovery on, beams=5 for wording within 8 GB.
         "ASR_ADAPTIVE_PERFORMANCE": "false",
         "ASR_DIAR_WINDOWED_FAST": "false",
         "ASR_TARGET_LONG_MAX_S": "0",
-        "ASR_NUM_BEAMS": "6",
+        "ASR_NUM_BEAMS": "5",
+        "ASR_NUM_BEAMS_MAX": "5",
         "ASR_NUM_BEAMS_MIN": "5",
+        "ASR_TEMPERATURE": _ASR_TEMPERATURE_LADDER,
         "ASR_TURN_GUIDED": "true",
         "ASR_TURN_USE_DIAR_TIMESTAMPS": "true",
-        "ASR_TURN_GUIDED_MERGE_GAP_S": "1.25",
+        "ASR_TURN_GUIDED_MERGE_GAP_S": "0.75",
         "ASR_TURN_OUTPUT_MERGE_GAP_S": "0.0",
-        "ASR_TURN_PAD_S": "0.12",
+        "ASR_TURN_PAD_S": "0.15",
         "ASR_TURN_GUIDED_MAX_TURN_S": "26",
-        "ASR_BUDGET_SEC_PER_TURN": "4.5",
+        "ASR_BUDGET_SEC_PER_TURN": "5.0",
         "ASR_LOGPROB_THRESHOLD": "-0.55",
         "DIARIZATION_VBX_FA": "0.25",
         "DIARIZATION_VBX_FB": "0.8",
         "DIARIZATION_OVERCLUSTER_EXTRA": "7",
-        "DIARIZATION_CENTROID_MERGE_THRESHOLD": "0.80",
+        "DIARIZATION_CENTROID_MERGE_THRESHOLD": "0",
         "DIARIZATION_SEGMENTATION_THRESHOLD": "0.33",
-        "DIARIZATION_CLUSTERING_THRESHOLD": "0.58",
+        "DIARIZATION_CLUSTERING_THRESHOLD": "0.50",
         "DIARIZATION_LOCK_PARAMS": "true",
         "DIARIZATION_EXACT_NUM_SPEAKERS": "true",
         "DIARIZATION_MIN_DURATION_OFF": "0.03",
         "DIARIZATION_MULTI_SAMPLE": "false",
         "DIARIZATION_MULTI_SAMPLE_PASSES": "0",
-        "DIARIZATION_INTRO_RECOVERY": "false",
+        "DIARIZATION_INTRO_RECOVERY": "true",
+        "DIARIZATION_INTRO_RECOVERY_SPAN_S": "360",
         "DIARIZATION_MEGA_TURN_MAX_REFINES": "4",
         "DIARIZATION_MEGA_TURN_RETRY_S": "35",
         "DIARIZATION_REFINE_AFTER_SEGMENTED": "false",

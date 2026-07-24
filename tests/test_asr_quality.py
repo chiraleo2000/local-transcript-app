@@ -53,10 +53,11 @@ class TestEnterpriseDockerEnvDrift:
     """Critical compose keys must match ENTERPRISE_DOCKER_ENV."""
 
     _CRITICAL_KEYS = {
-        "ASR_CUDA_MEMORY_FRACTION": "0.92",
+        "ASR_CUDA_MEMORY_FRACTION": "0.75",
         "ASR_CUDA_BATCH_SIZE": "1",
         "ASR_TARGET_SHORT_MAX_S": "600",
         "UI_MAX_CONCURRENT_JOBS": "1",
+        "API_MAX_QUEUED_JOBS": "4",
         "HF_HUB_OFFLINE": "1",
         "TRANSFORMERS_OFFLINE": "1",
         "APP_AUTO_DOWNLOAD_MISSING_MODELS": "false",

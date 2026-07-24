@@ -65,6 +65,8 @@ class JobMeta:
     source_filename: str = ""
     output_name: str | None = None
     client_ip: str = ""
+    user_id: int = 0
+    username: str = ""
 
 
 @dataclass
@@ -86,9 +88,9 @@ class TranscriptionStageContext:
 
 def _max_concurrent_jobs() -> int:
     try:
-        return max(1, int(os.getenv("UI_MAX_CONCURRENT_JOBS", "4")))
+        return max(1, int(os.getenv("UI_MAX_CONCURRENT_JOBS", "1")))
     except ValueError:
-        return 4
+        return 1
 
 
 # Fixed at import — restart the process after changing UI_MAX_CONCURRENT_JOBS.
@@ -650,7 +652,8 @@ def _run_transcription_asr_phase(
     """Prepare ASR models and transcribe all selected engines."""
     from backend.asr_quality import enhance_asr_only_enabled
 
-    if enhance_asr_only_enabled() and ctx.diarization:
+    # ASR-only enhance must still honor the UI checkbox (ctx.enhance).
+    if enhance_asr_only_enabled() and ctx.diarization and ctx.enhance:
         asr_path = _apply_enhancement(
             process_path, True, ctx.progress, temp_files, asr_only=True,
         )
@@ -715,6 +718,8 @@ def _execute_transcription_stages(
             "source_filename": ctx.meta.source_filename,
             "source_path": ctx.media_path,
             "client_ip": ctx.meta.client_ip,
+            "user_id": ctx.meta.user_id,
+            "username": ctx.meta.username,
         })
     temp_files: list[str] = []
     if ctx.meta.source_filename:
@@ -724,6 +729,9 @@ def _execute_transcription_stages(
 
     speaker_limit = _speaker_limit(ctx.diarization, ctx.max_speakers)
     enhance, adaptive_enhance = _prepare_job_enhance_flags(ctx, speaker_limit)
+    # Keep resolved enhance on the context so later phases (incl. ASR-only)
+    # follow the same checkbox / WHEN_DIARIZATION decision.
+    ctx.enhance = enhance
     process_path, audio_duration_s = _normalize_and_stage_audio(
         ctx,
         enhance=enhance,
@@ -787,6 +795,7 @@ def run_transcription_job(
     cancel_event: threading.Event | None = None,
     progress: JobProgress | None = None,
     meta: JobMeta | None = None,
+    job_id: str | None = None,
 ) -> dict:
     """Run the full local transcript pipeline and persist outputs."""
     register_job_started()
@@ -804,6 +813,7 @@ def run_transcription_job(
                 cancel_event,
                 progress,
                 meta or JobMeta(),
+                job_id=job_id,
             )
         finally:
             _job_semaphore.release()
@@ -822,9 +832,10 @@ def _run_transcription_job_impl(
     cancel_event: threading.Event | None,
     progress: JobProgress | None,
     meta: JobMeta,
+    job_id: str | None = None,
 ) -> dict:
     """Inner job runner — limited by ``_job_semaphore`` (default 2 concurrent tabs)."""
-    job_id = new_job_id()
+    job_id = (job_id or "").strip() or new_job_id()
     last_manifest_sync = 0.0
 
     def _manifest_sync(patch: dict, *, force: bool = False) -> None:
@@ -919,6 +930,8 @@ def _run_transcription_job_impl(
         "target_elapsed_s": target_elapsed_s,
         "target_met": target_met,
         "client_ip": meta.client_ip,
+        "user_id": meta.user_id,
+        "username": meta.username,
         "results": results,
     }
     manifest_path = write_job_record(job_id, manifest)

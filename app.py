@@ -14,8 +14,7 @@ import types
 import warnings
 from dataclasses import dataclass
 
-from dotenv import load_dotenv
-
+from backend.dotenv_load import load_dotenv_safe
 from backend.paths import app_root, ensure_bundle_on_path, resolve_path
 
 ensure_bundle_on_path()
@@ -28,8 +27,8 @@ os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
 os.environ.setdefault("GRADIO_TELEMETRY_ENABLED", "False")
 
 _install_root = app_root()
-load_dotenv(_install_root / ".env")
-load_dotenv(_install_root / ".env.production", override=False)
+load_dotenv_safe(_install_root / ".env")
+load_dotenv_safe(_install_root / ".env.production", override=False)
 
 from backend.cpu_limits import apply_cpu_thread_limits
 
@@ -116,8 +115,16 @@ def _patch_gradio_schema_parser() -> None:
 
 _patch_gradio_schema_parser()
 
+from backend.auth_users import (
+    get_user_by_username,
+    gradio_auth_credentials,
+    init_user_db,
+    register_user,
+)
 from backend.client_identity import client_ip_from_request
+from backend.job_api import build_api_routes
 from backend.job_cancel import cancel_tab_job
+from backend.job_queue import get_job_progress as get_api_job_progress
 from backend.pipeline import JobMeta, active_job_count, run_transcription_job
 from backend.progress import JobProgress, get_job_progress
 from backend.ui_session import (
@@ -444,17 +451,42 @@ PROGRESS_IDLE = _job_status_html({
 })
 
 
-def _history_dropdown_update(client_ip: str | None = None):
-    filter_ip = client_ip if (_history_per_client_ip() and client_ip) else None
+def _request_username(request: gr.Request | None) -> str:
+    if request is None:
+        return ""
+    return (getattr(request, "username", None) or "").strip()
+
+
+def _request_user_meta(request: gr.Request | None) -> tuple[int, str]:
+    username = _request_username(request)
+    if not username:
+        return 0, ""
+    user = get_user_by_username(username)
+    if user is None:
+        return 0, username
+    return user.id, user.username
+
+
+def _history_dropdown_update(
+    client_ip: str | None = None,
+    *,
+    username: str | None = None,
+    user_id: int | None = None,
+):
+    filter_ip = None
+    if not username and not user_id:
+        filter_ip = client_ip if (_history_per_client_ip() and client_ip) else None
     choices = []
-    for row in list_jobs(50, client_ip=filter_ip):
+    for row in list_jobs(50, client_ip=filter_ip, username=username, user_id=user_id):
         name = row.get("display_name") or row.get("source_filename") or row["job_id"]
         engines = ", ".join(row.get("selected_engines") or [])
         created = (row.get("created_at") or "")[:16]
-        ip_tag = ""
-        if not filter_ip and row.get("client_ip"):
-            ip_tag = f" | {row['client_ip']}"
-        label = f"{created} | {name} | {engines} | {row.get('status', '')}{ip_tag}"
+        user_tag = ""
+        if row.get("username"):
+            user_tag = f" | @{row['username']}"
+        elif not filter_ip and row.get("client_ip"):
+            user_tag = f" | {row['client_ip']}"
+        label = f"{created} | {name} | {engines} | {row.get('status', '')}{user_tag}"
         choices.append((label, row["job_id"]))
     return gr.update(choices=choices)
 
@@ -494,6 +526,8 @@ def _empty_outputs(
     *,
     refresh_history: bool = True,
     client_ip: str | None = None,
+    username: str | None = None,
+    user_id: int | None = None,
 ) -> tuple:
     no_download = gr.update(value=None, interactive=False)
     snap = (tracker or JobProgress()).snapshot()
@@ -504,7 +538,9 @@ def _empty_outputs(
         "message": status_message,
     })
     history = (
-        _history_dropdown_update(client_ip) if refresh_history else gr.update()
+        _history_dropdown_update(
+            client_ip, username=username, user_id=user_id,
+        ) if refresh_history else gr.update()
     )
     return (
         message, "", gr.update(), no_download,
@@ -530,6 +566,8 @@ def _build_outputs(
     tracker: JobProgress,
     *,
     client_ip: str | None = None,
+    username: str | None = None,
+    user_id: int | None = None,
 ) -> tuple:
     engine = selected_engines[0] if selected_engines else default_asr_engines()[0]
     result = job_result["results"].get(engine)
@@ -585,10 +623,16 @@ def _build_outputs(
         )
     else:
         perf_text = f"Done in {total_elapsed:.1f}s."
-    outputs.append(_status_html("done", perf_text))
+    job_note = (
+        f"Done. Job ID {job_result.get('job_id', '')} — safe to close this page; "
+        "retrieve later under Previous transcripts or GET /api/jobs/{id}."
+    )
+    outputs.append(_status_html("done", f"{perf_text} {job_note}"))
     outputs.append(_job_status_html(tracker.snapshot()))
     outputs.append(_transcribe_btn_ready())
-    outputs.append(_history_dropdown_update(client_ip))
+    outputs.append(
+        _history_dropdown_update(client_ip, username=username, user_id=user_id)
+    )
     outputs.append(gr.update(value=None, interactive=False))
     return tuple(outputs)
 
@@ -599,6 +643,7 @@ def _reset_ui_outputs(tab_id: str, request: gr.Request | None = None) -> tuple:
     tracker = runtime["progress"]
     cancel_tab_job(runtime, tracker=tracker, message=_MSG_CANCELLED)
     client_ip = client_ip_from_request(request)
+    user_id, username = _request_user_meta(request)
     no_dl = gr.update(value=None, interactive=False)
     return (
         _CANCELLED, "", gr.update(), no_dl,
@@ -606,7 +651,9 @@ def _reset_ui_outputs(tab_id: str, request: gr.Request | None = None) -> tuple:
         _status_html("error", "Cancelled by user."),
         PROGRESS_IDLE,
         _transcribe_btn_ready(),
-        _history_dropdown_update(client_ip),
+        _history_dropdown_update(
+            client_ip, username=username or None, user_id=user_id or None,
+        ),
         gr.update(value=None, interactive=False),
     )
 
@@ -803,6 +850,7 @@ def transcribe(*inputs, request: gr.Request | None = None):
     """Gradio callback — per browser-tab isolation; stopwatch via gr.Timer."""
     req = _parse_transcribe_request(inputs)
     client_ip = client_ip_from_request(request)
+    user_id, username = _request_user_meta(request)
     runtime, tid = resolve_runtime(req.tab_id)
     tracker = runtime["progress"]
     blocked = _transcribe_blocked_output(runtime, tracker, req.media_path)
@@ -857,6 +905,8 @@ def transcribe(*inputs, request: gr.Request | None = None):
                     source_filename=source_filename,
                     output_name=output_name or None,
                     client_ip=client_ip,
+                    user_id=user_id,
+                    username=username,
                 ),
             )
         except Exception as exc:  # pylint: disable=broad-exception-caught
@@ -886,21 +936,60 @@ def transcribe(*inputs, request: gr.Request | None = None):
         return
 
     yield _build_outputs(
-        holder["result"], selected, tracker, client_ip=client_ip,
+        holder["result"],
+        selected,
+        tracker,
+        client_ip=client_ip,
+        username=username or None,
+        user_id=user_id or None,
     )
 
 
 def load_history(request: gr.Request | None = None):
-    return _history_dropdown_update(client_ip_from_request(request))
+    client_ip = client_ip_from_request(request)
+    user_id, username = _request_user_meta(request)
+    return _history_dropdown_update(
+        client_ip, username=username or None, user_id=user_id or None,
+    )
+
+
+def _job_access_denied(job: dict, request: gr.Request | None) -> bool:
+    user_id, username = _request_user_meta(request)
+    if user_id or username:
+        if int(job.get("user_id") or 0) == int(user_id):
+            return False
+        job_user = (job.get("username") or "").strip().lower()
+        if job_user and job_user == username.lower():
+            return False
+        # Legacy jobs without username: allow owner via IP when enabled.
+        if not job_user and not int(job.get("user_id") or 0):
+            client_ip = client_ip_from_request(request)
+            if (
+                _history_per_client_ip()
+                and client_ip
+                and (job.get("client_ip") or "") not in {"", client_ip}
+            ):
+                return True
+            return False
+        return True
+    client_ip = client_ip_from_request(request)
+    return bool(
+        _history_per_client_ip()
+        and client_ip
+        and (job.get("client_ip") or "") not in {"", client_ip}
+    )
 
 
 def load_selected_job(job_id: str, request: gr.Request | None = None):
     client_ip = client_ip_from_request(request)
+    user_id, username = _request_user_meta(request)
     if not job_id:
         return _empty_outputs(
             "Select a job from Previous transcripts.",
             refresh_history=False,
             client_ip=client_ip,
+            username=username or None,
+            user_id=user_id or None,
         )
     job = load_job(job_id)
     if not job:
@@ -909,17 +998,17 @@ def load_selected_job(job_id: str, request: gr.Request | None = None):
             "error",
             "Job not found.",
             client_ip=client_ip,
+            username=username or None,
+            user_id=user_id or None,
         )
-    if (
-        _history_per_client_ip()
-        and client_ip
-        and (job.get("client_ip") or "") not in {"", client_ip}
-    ):
+    if _job_access_denied(job, request):
         return _empty_outputs(
-            "Job not found for this client.",
+            "Job not found for this account.",
             "error",
             "Access denied.",
             client_ip=client_ip,
+            username=username or None,
+            user_id=user_id or None,
         )
     selected = job.get("selected_engines") or default_asr_engines()
     return _build_outputs(
@@ -927,6 +1016,8 @@ def load_selected_job(job_id: str, request: gr.Request | None = None):
         selected,
         JobProgress(),
         client_ip=client_ip,
+        username=username or None,
+        user_id=user_id or None,
     )
 
 
@@ -936,18 +1027,24 @@ def download_selected_job(job_id: str, request: gr.Request | None = None):
     job = load_job(job_id)
     if not job:
         return gr.update(value=None, interactive=False)
-    client_ip = client_ip_from_request(request)
-    if (
-        _history_per_client_ip()
-        and client_ip
-        and (job.get("client_ip") or "") not in {"", client_ip}
-    ):
+    if _job_access_denied(job, request):
         return gr.update(value=None, interactive=False)
     for result in (job.get("results") or {}).values():
         path = result.get("download_path")
         if path:
             return gr.update(value=path, interactive=True)
     return gr.update(value=None, interactive=False)
+
+
+def register_account(username: str, password: str) -> str:
+    try:
+        user = register_user(username or "", password or "")
+    except ValueError as exc:
+        return f"Registration failed: {exc}"
+    return (
+        f"Registered @{user.username}. Log in with these credentials "
+        "(Gradio login / API POST /api/auth/login)."
+    )
 
 
 def recover_session(tab_id: str):
@@ -1243,11 +1340,28 @@ def build_ui() -> gr.Blocks:
         with gr.Accordion("Job Info", open=False):
             job_info = gr.Textbox(label="", lines=2, interactive=False, elem_id="job-info", show_label=False)
 
+        with gr.Accordion("Invite another user", open=False):
+            gr.Markdown(
+                "Create an extra account (or send others to the public page "
+                "**[/register](/register)** before login). Same store as "
+                "`POST /api/auth/register`."
+            )
+            reg_user = gr.Textbox(label="New username", max_lines=1)
+            reg_pass = gr.Textbox(label="Password", type="password", max_lines=1)
+            reg_btn = gr.Button("Create account")
+            reg_status = gr.Markdown("")
+            reg_btn.click(  # pylint: disable=no-member
+                fn=register_account,
+                inputs=[reg_user, reg_pass],
+                outputs=[reg_status],
+            )
+
         gr.Markdown(
             "### Previous transcripts\n"
-            "Filtered by your client IP when `UI_HISTORY_PER_CLIENT_IP=true` "
-            "(workstation multi-user). Cancel stops your job and frees GPU cache "
-            "for the next queued user."
+            "Filtered by your logged-in account (fallback: client IP when "
+            "`UI_HISTORY_PER_CLIENT_IP=true`). Jobs keep running after you close "
+            "the page — use this list or `GET /api/jobs/{id}`. Cancel stops your "
+            "job and frees GPU cache for the next queued user."
         )
         with gr.Row():
             history_dropdown = gr.Dropdown(
@@ -1341,20 +1455,53 @@ def build_ui() -> gr.Blocks:
     return demo
 
 
-def _register_progress_api(demo: gr.Blocks) -> None:
-    """Expose GET /job/progress for frontend polling (avoid Gradio /api POST namespace)."""
+def _mount_custom_routes(app) -> None:
+    """Attach REST + register + progress routes to a freshly built Gradio app."""
+    if getattr(app, "_lta_routes_mounted", False):
+        return
     from starlette.requests import Request
     from starlette.responses import JSONResponse
     from starlette.routing import Route
 
     def progress_api(request: Request):
+        job_id = (request.query_params.get("job_id") or "").strip()
+        if job_id:
+            tracker = get_api_job_progress(job_id)
+            if tracker is not None:
+                return JSONResponse(tracker.snapshot())
+            job = load_job(job_id)
+            if job and isinstance(job.get("progress"), dict):
+                return JSONResponse(job["progress"])
+            return JSONResponse({"phase": "unknown", "active": False, "job_id": job_id})
         tab_id = request.query_params.get("tab_id")
         if tab_id:
             runtime, _ = resolve_runtime(tab_id)
             return JSONResponse(runtime["progress"].snapshot())
         return JSONResponse(get_job_progress().snapshot())
 
-    demo.app.routes.insert(0, Route("/job/progress", progress_api, methods=["GET"]))
+    # Gradio launch() rebuilds the FastAPI app — mount after create_app.
+    for route in reversed(build_api_routes()):
+        app.routes.insert(0, route)
+    app.routes.insert(0, Route("/job/progress", progress_api, methods=["GET"]))
+    app._lta_routes_mounted = True  # type: ignore[attr-defined]
+
+
+def _patch_gradio_create_app_for_custom_routes() -> None:
+    """Ensure our routes survive Gradio's App.create_app() inside launch()."""
+    from gradio.routes import App
+
+    if getattr(App, "_lta_custom_routes_patched", False):
+        return
+    original = App.create_app
+
+    def create_app_with_routes(*args, **kwargs):
+        app = original(*args, **kwargs)
+        _mount_custom_routes(app)
+        logger.info("Mounted /register, /api/*, and /job/progress on Gradio app.")
+        return app
+
+    App.create_app = staticmethod(create_app_with_routes)  # type: ignore[method-assign]
+    App._lta_custom_routes_patched = True  # type: ignore[attr-defined]
 
 
 def main() -> None:
@@ -1362,6 +1509,7 @@ def main() -> None:
     from backend.asr_quality import apply_quality_profile
 
     ensure_app_dirs()
+    init_user_db()
     apply_cpu_thread_limits()
     apply_quality_profile()
     hardware = detect_hardware()
@@ -1370,8 +1518,8 @@ def main() -> None:
     if public_base:
         logger.info("Public base URL hint: %s", public_base)
     _preload_models()
+    _patch_gradio_create_app_for_custom_routes()
     application = build_ui()
-    _register_progress_api(application)
     server_name = os.getenv("GRADIO_SERVER_NAME", "127.0.0.1")
     server_port = int(os.getenv("GRADIO_SERVER_PORT", "7896"))
     launch_kwargs: dict = {
@@ -1390,13 +1538,21 @@ def main() -> None:
         launch_kwargs["max_file_size"] = max_file
     auth_user = os.getenv("GRADIO_AUTH_USER", "").strip()
     auth_password = os.getenv("GRADIO_AUTH_PASSWORD", "").strip()
-    if auth_user and auth_password:
+    # Prefer the shared SQLite user store (seed + register) for UI + API.
+    if _env_bool("APP_AUTH_ENABLED", True):
+        launch_kwargs["auth"] = gradio_auth_credentials
+        launch_kwargs["auth_message"] = (
+            'New user? <a href="/register" target="_self">'
+            "Create an account</a> first, then sign in here."
+        )
+        logger.info("Gradio auth enabled via user database (APP_AUTH_ENABLED).")
+    elif auth_user and auth_password:
         launch_kwargs["auth"] = (auth_user, auth_password)
         logger.info("Gradio basic auth enabled for user=%s", auth_user)
     elif auth_user or auth_password:
         logger.warning(
             "GRADIO_AUTH_USER/PASSWORD incomplete; basic auth disabled "
-            "(set both to enable)."
+            "(set both, or APP_AUTH_ENABLED=true with seeded users)."
         )
     try:
         application.launch(**launch_kwargs)

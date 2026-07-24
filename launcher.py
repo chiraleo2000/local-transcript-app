@@ -50,10 +50,10 @@ def _bootstrap_sys_path() -> str:
 if "--app-server" in sys.argv:
     _root = _bootstrap_sys_path()
     os.chdir(_root)
-    from dotenv import load_dotenv
+    from backend.dotenv_load import load_dotenv_safe
 
-    load_dotenv(os.path.join(_root, ".env"))
-    load_dotenv(os.path.join(_root, ".env.production"), override=False)
+    load_dotenv_safe(os.path.join(_root, ".env"))
+    load_dotenv_safe(os.path.join(_root, ".env.production"), override=False)
     from backend.asr_quality import apply_quality_profile
 
     apply_quality_profile()
