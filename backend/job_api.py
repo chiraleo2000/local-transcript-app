@@ -17,6 +17,7 @@ from backend.auth_users import (
     init_user_db,
     issue_session_token,
     register_user,
+    session_ttl_s,
     user_public_dict,
     verify_session_token,
 )
@@ -105,7 +106,7 @@ def _set_session_cookie(response: Response, token: str, request: Request) -> Non
         httponly=True,
         samesite="lax",
         secure=_cookie_secure(request),
-        max_age=7 * 24 * 3600,
+        max_age=session_ttl_s(),
     )
 
 

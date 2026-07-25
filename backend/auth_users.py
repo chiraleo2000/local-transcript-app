@@ -24,7 +24,17 @@ logger = logging.getLogger(__name__)
 _DB_LOCK = threading.Lock()
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9_.-]{3,64}$")
 _PBKDF2_ITERS = 200_000
-_TOKEN_TTL_S = 7 * 24 * 3600
+
+
+def session_ttl_s() -> int:
+    """API/UI session lifetime (APP_SESSION_TTL_S, default 15 minutes)."""
+    try:
+        return max(60, int(os.getenv("APP_SESSION_TTL_S", "900")))
+    except ValueError:
+        return 900
+
+
+_TOKEN_TTL_S = 900  # overwritten at issue time via session_ttl_s()
 
 
 @dataclass(frozen=True)
@@ -242,11 +252,12 @@ def get_user_by_username(username: str) -> UserRecord | None:
     )
 
 
-def issue_session_token(user: UserRecord, *, ttl_s: int = _TOKEN_TTL_S) -> str:
+def issue_session_token(user: UserRecord, *, ttl_s: int | None = None) -> str:
+    lifetime = session_ttl_s() if ttl_s is None else max(60, int(ttl_s))
     payload = {
         "uid": user.id,
         "u": user.username,
-        "exp": int(time.time()) + max(60, ttl_s),
+        "exp": int(time.time()) + lifetime,
         "n": secrets.token_hex(8),
     }
     body = base64.urlsafe_b64encode(

@@ -120,8 +120,14 @@ from backend.auth_users import (
     gradio_auth_credentials,
     init_user_db,
     register_user,
+    session_ttl_s,
 )
 from backend.client_identity import client_ip_from_request
+from backend.gradio_session import (
+    force_logout,
+    install_gradio_session_timeout,
+    session_ttl_s as gradio_session_ttl_s,
+)
 from backend.job_api import build_api_routes
 from backend.job_cancel import cancel_tab_job
 from backend.job_queue import get_job_progress as get_api_job_progress
@@ -254,6 +260,26 @@ TAB_INSTANCE_SCRIPT = """
     obs.observe(document.body, { childList: true, subtree: true });
     setTimeout(function() { obs.disconnect(); }, 15000);
   }
+})();
+</script>
+"""
+
+SESSION_WATCHDOG_SCRIPT = """
+<script>
+(function sessionWatchdog() {
+  const CHECK_MS = 30000;
+  async function ping() {
+    try {
+      const res = await fetch('/login_check', { credentials: 'same-origin', cache: 'no-store' });
+      if (res.status === 401) {
+        window.location.replace('/');
+      }
+    } catch (_err) { /* ignore transient network errors */ }
+  }
+  setInterval(ping, CHECK_MS);
+  document.addEventListener('visibilitychange', function() {
+    if (document.visibilityState === 'visible') ping();
+  });
 })();
 </script>
 """
@@ -1145,9 +1171,31 @@ def build_ui() -> gr.Blocks:
     hw_md = hardware_summary()
     models_ready = _models_ready.is_set()
 
+    ttl_min = max(1, int(round(session_ttl_s() / 60)))
     with gr.Blocks(title="Local Transcript App", theme=_SoftTheme(), css=APP_CSS) as demo:
-        gr.Markdown("# Local Transcript App")
-        gr.Markdown("Upload audio or video, then transcribe locally with open-source models.")
+        gr.HTML(
+            f"""
+            <div style="display:flex;justify-content:space-between;align-items:center;
+                        gap:12px;flex-wrap:wrap;margin-bottom:4px;">
+              <div>
+                <h1 style="margin:0;font-size:1.6rem;">Local Transcript App</h1>
+                <p style="margin:4px 0 0;color:#71717a;font-size:0.95rem;">
+                  Upload audio or video, then transcribe locally with open-source models.
+                </p>
+              </div>
+              <div style="display:flex;gap:10px;align-items:center;">
+                <span style="color:#71717a;font-size:0.85rem;">
+                  Session idle timeout: {ttl_min} min
+                </span>
+                <a href="/logout"
+                   style="display:inline-block;padding:8px 14px;border-radius:8px;
+                          background:#27272a;color:#fff;text-decoration:none;font-weight:600;">
+                  Log out
+                </a>
+              </div>
+            </div>
+            """
+        )
 
         load_status = gr.Markdown(_get_load_status())
         tab_instance_id = gr.Textbox(
@@ -1158,6 +1206,7 @@ def build_ui() -> gr.Blocks:
             interactive=True,
         )
         gr.HTML(TAB_INSTANCE_SCRIPT)
+        gr.HTML(SESSION_WATCHDOG_SCRIPT)
 
         media_input = gr.File(
             label="Audio or Video File",
@@ -1483,6 +1532,10 @@ def _mount_custom_routes(app) -> None:
     for route in reversed(build_api_routes()):
         app.routes.insert(0, route)
     app.routes.insert(0, Route("/job/progress", progress_api, methods=["GET"]))
+    # Override Gradio /logout so cookies are cleared and login page is shown.
+    app.routes.insert(0, Route("/logout", force_logout, methods=["GET"]))
+    app.routes.insert(0, Route("/logout/", force_logout, methods=["GET"]))
+    install_gradio_session_timeout(app)
     app._lta_routes_mounted = True  # type: ignore[attr-defined]
 
 
@@ -1497,7 +1550,10 @@ def _patch_gradio_create_app_for_custom_routes() -> None:
     def create_app_with_routes(*args, **kwargs):
         app = original(*args, **kwargs)
         _mount_custom_routes(app)
-        logger.info("Mounted /register, /api/*, and /job/progress on Gradio app.")
+        logger.info(
+            "Mounted /register, /logout, /api/*, /job/progress; session TTL=%ss.",
+            gradio_session_ttl_s(),
+        )
         return app
 
     App.create_app = staticmethod(create_app_with_routes)  # type: ignore[method-assign]
@@ -1540,12 +1596,16 @@ def main() -> None:
     auth_password = os.getenv("GRADIO_AUTH_PASSWORD", "").strip()
     # Prefer the shared SQLite user store (seed + register) for UI + API.
     if _env_bool("APP_AUTH_ENABLED", True):
+        ttl_min = max(1, int(round(session_ttl_s() / 60)))
         launch_kwargs["auth"] = gradio_auth_credentials
         launch_kwargs["auth_message"] = (
-            'New user? <a href="/register" target="_self">'
-            "Create an account</a> first, then sign in here."
+            f"Sign in to continue. Sessions expire after <b>{ttl_min} minutes</b> of inactivity. "
+            'New user? <a href="/register" target="_self">Create an account</a>.'
         )
-        logger.info("Gradio auth enabled via user database (APP_AUTH_ENABLED).")
+        logger.info(
+            "Gradio auth enabled (APP_AUTH_ENABLED); idle timeout=%ss.",
+            session_ttl_s(),
+        )
     elif auth_user and auth_password:
         launch_kwargs["auth"] = (auth_user, auth_password)
         logger.info("Gradio basic auth enabled for user=%s", auth_user)
