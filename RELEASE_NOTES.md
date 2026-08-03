@@ -1,8 +1,31 @@
 # Local Transcript App — release notes
 
-**Current version: 1.2.7**
+**Current version: 1.2.8**
 
 See [README.md](README.md) for setup. Docker stacks live under [`deploy/docker/`](deploy/docker/).
+
+---
+
+## v1.2.8
+
+### Summary
+
+Fix **Load into editor** for queued/running jobs so the UI streams live status (same as an online transcription) instead of blank “Done” output. Harden session recover after refresh / brief network drops, and tighten turn-guided ASR pads for content + timestamp quality (beams=5 retained).
+
+### Job status recover
+
+- Loading an in-flight Previous transcript polls the durable manifest / live API progress until completion, then shows the transcript
+- Page recover re-attaches by `tab_id` / active job id and loads results when the worker finishes
+- Manifest writes keep `status=running` sticky (avoids throttled sync dropping the running flag)
+
+### Accuracy
+
+- Production turn pad / boundary / merge gaps aligned closer to the cal15 sample01 lock
+- `ASR_NUM_BEAMS=5` unchanged
+
+### Auth (from 1.2.7+)
+
+- Public `/register`, 15‑minute idle login timeout, Log out control, headless job API
 
 ---
 

@@ -83,7 +83,7 @@ class TranscriptionStageContext:
     progress: JobProgress | None
     phase: Callable[[str, str, float], None]
     meta: JobMeta
-    manifest_sync: Callable[[dict], None] | None = None
+    manifest_sync: Callable[..., None] | None = None
 
 
 def _max_concurrent_jobs() -> int:
@@ -711,16 +711,22 @@ def _execute_transcription_stages(
     except ImportError:
         pass
     if ctx.manifest_sync:
-        ctx.manifest_sync({
-            "status": "running",
-            "tab_id": ctx.meta.tab_id,
-            "display_name": ctx.meta.display_name,
-            "source_filename": ctx.meta.source_filename,
-            "source_path": ctx.media_path,
-            "client_ip": ctx.meta.client_ip,
-            "user_id": ctx.meta.user_id,
-            "username": ctx.meta.username,
-        })
+        ctx.manifest_sync(
+            {
+                "status": "running",
+                "tab_id": ctx.meta.tab_id,
+                "display_name": ctx.meta.display_name,
+                "source_filename": ctx.meta.source_filename,
+                "source_path": ctx.media_path,
+                "selected_engines": list(ctx.selected_engines or []),
+                "language": ctx.language,
+                "diarization": ctx.diarization,
+                "client_ip": ctx.meta.client_ip,
+                "user_id": ctx.meta.user_id,
+                "username": ctx.meta.username,
+            },
+            force=True,
+        )
     temp_files: list[str] = []
     if ctx.meta.source_filename:
         archived = copy_input_file(ctx.media_path, ctx.job_id, ctx.meta.source_filename)
@@ -850,12 +856,16 @@ def _run_transcription_job_impl(
         if progress is not None:
             progress.set_phase(phase, message, percent)
             snap = progress.snapshot()
+            # Keep status=running sticky on progress writes so recover/load
+            # can attach even when the dedicated "running" sync was throttled.
             _manifest_sync({
+                "status": "running",
                 "progress": {
                     "phase": snap["phase"],
                     "message": snap["message"],
                     "percent": snap["percent"],
                     "elapsed_s": snap["elapsed_s"],
+                    "active": True,
                 },
             })
 

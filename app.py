@@ -131,6 +131,7 @@ from backend.gradio_session import (
 from backend.job_api import build_api_routes
 from backend.job_cancel import cancel_tab_job
 from backend.job_queue import get_job_progress as get_api_job_progress
+from backend.job_status import job_is_in_flight, job_status_norm
 from backend.pipeline import JobMeta, active_job_count, run_transcription_job
 from backend.progress import JobProgress, get_job_progress
 from backend.ui_session import (
@@ -530,6 +531,128 @@ def _manifest_to_job_result(job: dict) -> dict:
     }
 
 
+_IN_FLIGHT_STATUSES = frozenset({"queued", "running"})
+
+
+def _job_status_norm(job: dict | None) -> str:
+    return job_status_norm(job)
+
+
+def _job_is_in_flight(job: dict | None) -> bool:
+    return job_is_in_flight(job)
+
+
+def _snap_from_job_manifest(job: dict) -> dict:
+    """Build a UI progress snapshot from disk (or live API tracker when present)."""
+    job_id = str(job.get("job_id") or "")
+    live = get_api_job_progress(job_id) if job_id else None
+    if live is not None:
+        snap = live.snapshot()
+        snap["active"] = True
+        snap["job_id"] = job_id
+        return snap
+    prog = job.get("progress") or {}
+    status = _job_status_norm(job) or "running"
+    return {
+        "phase": prog.get("phase") or status,
+        "message": prog.get("message") or f"Job {status}…",
+        "elapsed_s": float(prog.get("elapsed_s") or 0),
+        "percent": float(prog.get("percent") or 0),
+        "active": True,
+        "job_id": job_id,
+    }
+
+
+def _completed_job_outputs(
+    job: dict,
+    *,
+    client_ip: str | None = None,
+    username: str | None = None,
+    user_id: int | None = None,
+) -> tuple:
+    selected = job.get("selected_engines") or default_asr_engines()
+    return _build_outputs(
+        _manifest_to_job_result(job),
+        selected,
+        JobProgress(),
+        client_ip=client_ip,
+        username=username,
+        user_id=user_id,
+    )
+
+
+def _terminal_job_outputs(
+    job: dict,
+    *,
+    client_ip: str | None = None,
+    username: str | None = None,
+    user_id: int | None = None,
+) -> tuple:
+    status = _job_status_norm(job)
+    if status == "completed" or (job.get("results") and status not in {"failed", "cancelled"}):
+        return _completed_job_outputs(
+            job, client_ip=client_ip, username=username, user_id=user_id,
+        )
+    err = job.get("error") or status or "unknown"
+    state = "error" if status in {"failed", "cancelled"} else "idle"
+    return _empty_outputs(
+        f"Job {status or 'ended'}: {err}",
+        state,
+        f"Job {status or 'ended'}.",
+        client_ip=client_ip,
+        username=username,
+        user_id=user_id,
+    )
+
+
+def _poll_job_manifest_live(
+    job_id: str,
+    *,
+    client_ip: str | None = None,
+    username: str | None = None,
+    user_id: int | None = None,
+    max_idle_reads: int = 3,
+):
+    """Yield running UI while the job is in flight; then final transcript/status.
+
+    Survives brief disk/network blips by retrying a few empty reads before giving up.
+    """
+    no_dl = gr.update(value=None, interactive=False)
+    poll_s = _progress_poll_interval()
+    last_sig = None
+    idle_misses = 0
+    while True:
+        job = load_job(job_id)
+        if job is None:
+            idle_misses += 1
+            if idle_misses > max_idle_reads:
+                yield _empty_outputs(
+                    f"Job not found: {job_id}",
+                    "error",
+                    "Job not found.",
+                    client_ip=client_ip,
+                    username=username,
+                    user_id=user_id,
+                )
+                return
+            time.sleep(poll_s)
+            continue
+        idle_misses = 0
+        if _job_is_in_flight(job):
+            snap = _snap_from_job_manifest(job)
+            engines = ", ".join(job.get("selected_engines") or []) or "ASR"
+            sig = _transcription_progress_signature(snap)
+            if sig != last_sig or last_sig is None:
+                last_sig = sig
+            yield _running_transcript_outputs(snap, engines, no_dl)
+            time.sleep(poll_s)
+            continue
+        yield _terminal_job_outputs(
+            job, client_ip=client_ip, username=username, user_id=user_id,
+        )
+        return
+
+
 def _default_output_names(media_path: str | None) -> str:
     if not media_path:
         return ""
@@ -837,39 +960,88 @@ def _stream_worker_progress(
     tracker: JobProgress,
     no_dl: dict,
     poll_s: float,
+    *,
+    runtime: dict | None = None,
+    client_ip: str | None = None,
+    username: str | None = None,
+    user_id: int | None = None,
 ):
     while worker.is_alive():
         snap = tracker.snapshot()
         yield _running_transcript_outputs(snap, "ASR", no_dl)
         time.sleep(poll_s)
+    # Worker finished — load durable results if the job id is known.
+    job_id = ""
+    if runtime is not None:
+        job_id = str(runtime.get("active_job_id") or "")
+    if not job_id:
+        snap = tracker.snapshot()
+        job_id = str(snap.get("job_id") or "")
+    if job_id:
+        job = load_job(job_id)
+        if job is not None:
+            yield _terminal_job_outputs(
+                job, client_ip=client_ip, username=username, user_id=user_id,
+            )
+            return
+    yield _empty_outputs(
+        "",
+        "idle",
+        "Job finished — open Previous transcripts to load results.",
+        client_ip=client_ip,
+        username=username,
+        user_id=user_id,
+    )
 
 
-def _recover_manifest_or_idle(tab_id: str, tracker: JobProgress, no_dl: dict):
-    for row in list_jobs(20):
-        if row.get("tab_id") != tab_id or row.get("status") != "running":
+def _recover_manifest_or_idle(
+    tab_id: str,
+    tracker: JobProgress,
+    no_dl: dict,
+    *,
+    runtime: dict | None = None,
+    client_ip: str | None = None,
+    username: str | None = None,
+    user_id: int | None = None,
+):
+    del no_dl  # unused — live helper builds its own download updates
+    # Prefer the tab's active job id, then any in-flight manifest for this tab.
+    candidates: list[str] = []
+    if runtime and runtime.get("active_job_id"):
+        candidates.append(str(runtime["active_job_id"]))
+    for row in list_jobs(50, username=username, user_id=user_id):
+        if row.get("tab_id") != tab_id:
             continue
-        job_id = row["job_id"]
-        while True:
-            job = load_job(job_id)
-            if not job or job.get("status") != "running":
-                break
-            prog = job.get("progress") or {}
-            snap = {
-                "phase": prog.get("phase", "running"),
-                "message": prog.get("message", "Finishing in background\u2026"),
-                "elapsed_s": prog.get("elapsed_s", 0),
-                "active": True,
-            }
-            yield _running_transcript_outputs(snap, "ASR", no_dl)
-            time.sleep(1.0)
-        yield _empty_outputs(
-            "",
-            "idle",
-            "Previous job finished — open Previous transcripts to load results.",
-            tracker=tracker,
-        )
-        return
-    yield _empty_outputs("", "idle", "Idle. Upload media and click Transcribe.", tracker=tracker)
+        if _job_is_in_flight(row) or _job_status_norm(row) == "running":
+            jid = str(row.get("job_id") or "")
+            if jid and jid not in candidates:
+                candidates.append(jid)
+    for job_id in candidates:
+        job = load_job(job_id)
+        if job is None:
+            continue
+        if _job_is_in_flight(job):
+            yield from _poll_job_manifest_live(
+                job_id,
+                client_ip=client_ip,
+                username=username,
+                user_id=user_id,
+            )
+            return
+        if _job_status_norm(job) == "completed" or job.get("results"):
+            yield _terminal_job_outputs(
+                job, client_ip=client_ip, username=username, user_id=user_id,
+            )
+            return
+    yield _empty_outputs(
+        "",
+        "idle",
+        "Idle. Upload media and click Transcribe.",
+        tracker=tracker,
+        client_ip=client_ip,
+        username=username,
+        user_id=user_id,
+    )
 
 
 def transcribe(*inputs, request: gr.Request | None = None):
@@ -1007,19 +1179,21 @@ def _job_access_denied(job: dict, request: gr.Request | None) -> bool:
 
 
 def load_selected_job(job_id: str, request: gr.Request | None = None):
+    """Load a past job, or re-attach live progress when it is still running/queued."""
     client_ip = client_ip_from_request(request)
     user_id, username = _request_user_meta(request)
     if not job_id:
-        return _empty_outputs(
+        yield _empty_outputs(
             "Select a job from Previous transcripts.",
             refresh_history=False,
             client_ip=client_ip,
             username=username or None,
             user_id=user_id or None,
         )
+        return
     job = load_job(job_id)
     if not job:
-        return _empty_outputs(
+        yield _empty_outputs(
             f"Job not found: {job_id}",
             "error",
             "Job not found.",
@@ -1027,8 +1201,9 @@ def load_selected_job(job_id: str, request: gr.Request | None = None):
             username=username or None,
             user_id=user_id or None,
         )
+        return
     if _job_access_denied(job, request):
-        return _empty_outputs(
+        yield _empty_outputs(
             "Job not found for this account.",
             "error",
             "Access denied.",
@@ -1036,11 +1211,18 @@ def load_selected_job(job_id: str, request: gr.Request | None = None):
             username=username or None,
             user_id=user_id or None,
         )
-    selected = job.get("selected_engines") or default_asr_engines()
-    return _build_outputs(
-        _manifest_to_job_result(job),
-        selected,
-        JobProgress(),
+        return
+    if _job_is_in_flight(job):
+        # Mirror online transcription UX: stream phase/elapsed until durable results.
+        yield from _poll_job_manifest_live(
+            job_id,
+            client_ip=client_ip,
+            username=username or None,
+            user_id=user_id or None,
+        )
+        return
+    yield _terminal_job_outputs(
+        job,
         client_ip=client_ip,
         username=username or None,
         user_id=user_id or None,
@@ -1073,18 +1255,37 @@ def register_account(username: str, password: str) -> str:
     )
 
 
-def recover_session(tab_id: str):
+def recover_session(tab_id: str, request: gr.Request | None = None):
     """On page load, reattach to an in-flight worker or poll a running manifest."""
     runtime, tid = resolve_runtime(tab_id)
     tracker = runtime["progress"]
     worker = runtime.get("worker")
     no_dl = gr.update(value=None, interactive=False)
+    client_ip = client_ip_from_request(request)
+    user_id, username = _request_user_meta(request)
 
     if worker and worker.is_alive():
-        yield from _stream_worker_progress(worker, tracker, no_dl, _progress_poll_interval())
+        yield from _stream_worker_progress(
+            worker,
+            tracker,
+            no_dl,
+            _progress_poll_interval(),
+            runtime=runtime,
+            client_ip=client_ip,
+            username=username or None,
+            user_id=user_id or None,
+        )
         return
 
-    yield from _recover_manifest_or_idle(tid, tracker, no_dl)
+    yield from _recover_manifest_or_idle(
+        tid,
+        tracker,
+        no_dl,
+        runtime=runtime,
+        client_ip=client_ip,
+        username=username or None,
+        user_id=user_id or None,
+    )
 
 
 def _apply_short_clip_preset(enabled):
@@ -1408,9 +1609,11 @@ def build_ui() -> gr.Blocks:
         gr.Markdown(
             "### Previous transcripts\n"
             "Filtered by your logged-in account (fallback: client IP when "
-            "`UI_HISTORY_PER_CLIENT_IP=true`). Jobs keep running after you close "
-            "the page — use this list or `GET /api/jobs/{id}`. Cancel stops your "
-            "job and frees GPU cache for the next queued user."
+            "`UI_HISTORY_PER_CLIENT_IP=true`). **Load into editor** re-attaches to "
+            "queued/running jobs and streams live status (same as an online "
+            "transcription) until results are ready — also works after refresh or "
+            "brief network drops. Completed jobs load the transcript immediately. "
+            "Cancel stops your job and frees GPU cache for the next queued user."
         )
         with gr.Row():
             history_dropdown = gr.Dropdown(
