@@ -1,8 +1,28 @@
 # Local Transcript App — release notes
 
-**Current version: 1.2.8**
+**Current version: 1.2.9**
 
 See [README.md](README.md) for setup. Docker stacks live under [`deploy/docker/`](deploy/docker/).
+
+---
+
+## v1.2.9
+
+### Summary
+
+Fix **Download .txt** after long transcriptions: idle login no longer kills the session mid-job or right after completion, and re-login restores the finished transcript instead of an empty Output panel.
+
+### Session / download
+
+- Keepalive + tab-id scripts run via Gradio `head=` (previously injected with `gr.HTML` and never executed)
+- Idle timeout skips forced logout while a job is in flight, and for a short grace window after completion so Download is not 401’d
+- Completed jobs are recovered into Output / Download after refresh or re-login (`last_completed_job_id` + tab history)
+- Durable Gradio-auth download route: `/ui/download/{job_id}` (also listed under Job Info)
+- `allowed_paths` includes transcript/job storage so file serve stays reliable
+
+### Notes
+
+- Transcripts were always saved under `storage/transcripts` / **Previous transcripts**; the UI session was what looked “gone”
 
 ---
 

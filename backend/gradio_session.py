@@ -40,8 +40,74 @@ def _clear_auth_cookies(response: Response, app: Any) -> None:
     response.delete_cookie("lta_session", path="/")
 
 
+def _username_for_token(app: Any, token: str | None) -> str | None:
+    if not token:
+        return None
+    tokens: dict = getattr(app, "tokens", None) or {}
+    name = tokens.get(token)
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    return None
+
+
+def _user_has_inflight_job(username: str | None) -> bool:
+    """True when this account still has a queued/running transcription on disk."""
+    if not username:
+        return False
+    try:
+        from backend.job_status import job_is_in_flight
+        from backend.storage import list_jobs
+    except Exception:  # pylint: disable=broad-exception-caught
+        return False
+    try:
+        for row in list_jobs(30, username=username):
+            if job_is_in_flight(row):
+                return True
+    except Exception:  # pylint: disable=broad-exception-caught
+        return False
+    return False
+
+
+def _user_has_recent_job_activity(username: str | None, *, within_s: int = 600) -> bool:
+    """True when a job for this user was updated recently (post-complete download grace)."""
+    if not username:
+        return False
+    try:
+        from datetime import datetime, timezone
+
+        from backend.storage import list_jobs
+    except Exception:  # pylint: disable=broad-exception-caught
+        return False
+    now = datetime.now(timezone.utc)
+    try:
+        for row in list_jobs(10, username=username):
+            raw = row.get("updated_at") or row.get("created_at") or ""
+            if not isinstance(raw, str) or not raw:
+                continue
+            try:
+                stamp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=timezone.utc)
+            if (now - stamp).total_seconds() <= within_s:
+                return True
+    except Exception:  # pylint: disable=broad-exception-caught
+        return False
+    return False
+
+
+def _should_extend_idle_session(username: str | None) -> bool:
+    return _user_has_inflight_job(username) or _user_has_recent_job_activity(username)
+
+
 class SessionIdleMiddleware(BaseHTTPMiddleware):
-    """Expire Gradio auth tokens after APP_SESSION_TTL_S of inactivity."""
+    """Expire Gradio auth tokens after APP_SESSION_TTL_S of inactivity.
+
+    Long transcriptions often hold a single SSE connection without new HTTP
+    requests. Keep the session alive while the user still has an in-flight job,
+    and treat keepalive pings as normal activity.
+    """
 
     def __init__(self, app, gradio_app: Any):
         super().__init__(app)
@@ -63,14 +129,37 @@ class SessionIdleMiddleware(BaseHTTPMiddleware):
         if token and token in tokens:
             meta = sessions.get(token)
             if meta is None:
-                sessions[token] = {"last": now, "created": now}
+                sessions[token] = {
+                    "last": now,
+                    "created": now,
+                    "username": tokens.get(token),
+                }
             elif (now - float(meta.get("last") or 0)) > ttl:
-                tokens.pop(token, None)
-                sessions.pop(token, None)
-                expired = True
-                logger.info("Gradio session expired after %ss idle — login required.", ttl)
+                username = _username_for_token(app, token) or meta.get("username")
+                # Do not kick users mid-transcription or right after completion —
+                # SSE progress does not refresh idle timers, and Download .txt
+                # would otherwise 401 immediately after a long job finishes.
+                if _should_extend_idle_session(
+                    username if isinstance(username, str) else None
+                ):
+                    meta["last"] = now
+                    meta["username"] = username
+                    logger.info(
+                        "Extended Gradio session for @%s — active/recent job.",
+                        username,
+                    )
+                else:
+                    tokens.pop(token, None)
+                    sessions.pop(token, None)
+                    expired = True
+                    logger.info(
+                        "Gradio session expired after %ss idle — login required.",
+                        ttl,
+                    )
             else:
                 meta["last"] = now
+                if "username" not in meta:
+                    meta["username"] = tokens.get(token)
         elif token and token not in tokens:
             # Stale cookie after logout/expiry — force clean login screen.
             expired = True
@@ -79,7 +168,11 @@ class SessionIdleMiddleware(BaseHTTPMiddleware):
         before = set(tokens.keys())
         response = await call_next(request)
         for new_token in set(tokens.keys()) - before:
-            sessions[new_token] = {"last": time.time(), "created": time.time()}
+            sessions[new_token] = {
+                "last": time.time(),
+                "created": time.time(),
+                "username": tokens.get(new_token),
+            }
 
         if expired:
             _clear_auth_cookies(response, app)

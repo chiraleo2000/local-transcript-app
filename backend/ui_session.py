@@ -19,6 +19,7 @@ def _new_runtime() -> dict:
         "progress": JobProgress(),
         "last_upload_path": None,
         "active_job_id": None,
+        "last_completed_job_id": None,
         "worker": None,
         "selected_asr_engine": None,
     }
@@ -62,7 +63,15 @@ def set_active_job(runtime: dict, job_id: str, worker: threading.Thread | None) 
     runtime["worker"] = worker
 
 
-def clear_active_job(runtime: dict) -> None:
+def set_last_completed_job(runtime: dict, job_id: str | None) -> None:
+    """Remember the latest finished job so re-login can restore Output/download."""
+    jid = (job_id or "").strip()
+    runtime["last_completed_job_id"] = jid or None
+
+
+def clear_active_job(runtime: dict, *, completed_job_id: str | None = None) -> None:
+    if completed_job_id:
+        set_last_completed_job(runtime, completed_job_id)
     runtime["active_job_id"] = None
     runtime["worker"] = None
 
