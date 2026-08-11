@@ -37,7 +37,7 @@ _ERROR_MARKERS = (
 )
 
 _REQUIRED_ENV = {
-    "ASR_CUDA_MEMORY_FRACTION": "0.92",
+    "ASR_CUDA_MEMORY_FRACTION": "0.75",
     "ASR_CUDA_BATCH_SIZE": "1",
     "ASR_NUM_BEAMS": "5",
     "UI_MAX_CONCURRENT_JOBS": "1",
@@ -176,10 +176,34 @@ def _build_image(*, skip_build: bool) -> None:
 
 
 def _stop_service() -> None:
+    # Prefer explicit container name — Deploy-Docker.ps1 may use project "latest"
+    # while this script defaults to project "local-transcript-app".
+    if subprocess.run(
+        ["docker", "ps", "-q", "--filter", f"name=^{CONTAINER}$"],
+        cwd=REPO,
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.strip():
+        _run(["docker", "stop", CONTAINER], capture=False)
+        return
     _run(["docker", "compose", "-f", str(COMPOSE_FILE), "stop", SERVICE], capture=False)
 
 
 def _start_service() -> None:
+    inspect = subprocess.run(
+        ["docker", "inspect", "-f", "{{.State.Status}}", CONTAINER],
+        cwd=REPO,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    status = (inspect.stdout or "").strip()
+    if status in {"created", "exited", "paused"}:
+        _run(["docker", "start", CONTAINER], capture=False)
+        return
+    if status == "running":
+        return
     _run(["docker", "compose", "-f", str(COMPOSE_FILE), "up", "-d", SERVICE], capture=False)
 
 

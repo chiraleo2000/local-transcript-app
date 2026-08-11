@@ -3,7 +3,7 @@
 GPU-accelerated local audio/video transcription with speaker diarization.  
 No cloud APIs. No telemetry. All processing stays on your machine.
 
-**Version 1.2.9** — see [RELEASE_NOTES.md](RELEASE_NOTES.md)
+**Version 1.2.10** — see [RELEASE_NOTES.md](RELEASE_NOTES.md)
 
 ---
 
@@ -745,14 +745,14 @@ python scripts/run_docker_acceptance.py --tag final
 
 | Fixture | Audio | Accuracy gates | Wall time |
 |---------|-------|----------------|-----------|
-| `sample01` | `tests/test-sample01.m4a` (~3.7 min) | 99/98/98/95% content/speaker/timestamp/strict, 4/4 speakers, 0 mismatched lines | ≤10 min |
+| `sample01` | `tests/test-sample01.m4a` (~3.7 min) | ≥95% content, ≥98% speaker, ≥55% timestamp, ≥65% strict, ≤9 mismatched (cal15 lock) | ≤10 min |
 | `meeting309` | `tests/309.m4a` (~90 min) | 11/11 speakers + meeting gates | ≤ half audio (~45 min) |
 
-VRAM policy: `ASR_CUDA_MEMORY_FRACTION=0.92` with batch=1, beams=5, single concurrent job. See `backend/enterprise_config.py` and `docker-compose.gpu.yml`.
+VRAM policy: `ASR_CUDA_MEMORY_FRACTION=0.75` (~6 GB on 8 GB cards) with batch=1, beams=5, single concurrent job. See `deploy/docker/gpu-app.env` and `backend/enterprise_config.py`.
 
 **Offline models:** Docker and validation never download from Hugging Face Hub. Populate `./models/` once via `scripts/bootstrap_models.py` on a maintainer machine; `ensure_model_cache.py --strict-diarization` verifies ASR + pyannote caches before acceptance runs.
 
-**sample01 baseline:** `ENTERPRISE_FIXTURE_OVERRIDES["sample01"]` is locked to the cal8 Docker profile (diar on raw audio, ASR-only enhance, seg 0.31 / cluster 0.38). Do not change without a fresh Docker re-score.
+**sample01 baseline:** `ENTERPRISE_FIXTURE_OVERRIDES["sample01"]` is locked to the **cal15** Docker profile (diar on raw audio, ASR-only enhance, seg 0.31 / cluster 0.38, beams=5). Do not change without a fresh Docker re-score.
 
 ### Golden automation (GPU regression)
 

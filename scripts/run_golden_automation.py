@@ -149,7 +149,9 @@ def _run_pytest(fixtures: list[str] | None) -> int:
         "sample01": "tests/test_golden_automation.py::test_sample01_meets_golden_transcript",
         "recording172": "tests/test_golden_automation.py::test_recording172_meets_performance_target",
         "recording19": "tests/test_golden_automation.py::test_recording19_meets_performance_target",
-        "sample47": "tests/test_golden_automation.py::test_sample47_meets_performance_target",
+        "recording47": "tests/test_golden_automation.py::test_recording47_meets_performance_target",
+        # Legacy alias used in older CLI docs / scripts.
+        "sample47": "tests/test_golden_automation.py::test_recording47_meets_performance_target",
     }
     for name, node in mapping.items():
         if selected is None or name in selected:

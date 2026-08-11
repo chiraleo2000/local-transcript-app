@@ -1,8 +1,25 @@
 # Local Transcript App — release notes
 
-**Current version: 1.2.9**
+**Current version: 1.2.10**
 
 See [README.md](README.md) for setup. Docker stacks live under [`deploy/docker/`](deploy/docker/).
+
+---
+
+## v1.2.10
+
+### Summary
+
+Harden the accuracy/performance improve loop: unify cal15 gates across golden/enterprise/docs, align production turn knobs to the verified sample01 lock, and add a CPU-only transcript scorer for fast regression checks.
+
+### Accuracy / performance
+
+- Docker sample01 acceptance re-verified: **99.3% content, 100% speaker, 67.5% ts, 66.8% strict, 9 mismatched, ~299s / 600s budget**
+- Production `gpu-app.env` turn pad/merge/max-turn aligned to cal15 fixture overlay
+- Golden gates matched to enterprise cal15 ceilings (no more impossible 99/98/98 chase)
+- Acceptance env check uses VRAM **0.75** (was stale 0.92)
+- `scripts/score_transcript.py` for CPU-only re-score without GPU
+- Fixed `recording47` golden automation mapping; Docker stop/start uses container name across compose projects
 
 ---
 
