@@ -118,6 +118,42 @@ def normalize_window_chunks(result: dict, window_duration_s: float) -> dict:
     return out
 
 
+def _split_oversized_text(text: str, max_chars_per_chunk: int) -> list[str]:
+    """Split oversized text into parts (whitespace tokens or fixed-size slices)."""
+    tokens = text.split()
+    if len(tokens) < 2:
+        n_parts = max(1, len(text) // max_chars_per_chunk)
+        slice_len = (len(text) + n_parts - 1) // n_parts
+        return [text[i:i + slice_len] for i in range(0, len(text), slice_len)]
+
+    n_parts = max(1, (len(text) + max_chars_per_chunk - 1) // max_chars_per_chunk)
+    per = max(1, len(tokens) // n_parts)
+    parts = [" ".join(tokens[i:i + per]) for i in range(0, len(tokens), per)]
+    if len(parts) > 1 and len(parts[-1]) < max_chars_per_chunk // 4:
+        parts[-2] = parts[-2] + " " + parts[-1]
+        parts.pop()
+    return parts
+
+
+def _emit_subdivided_parts(
+    parts: list[str],
+    start: float,
+    end: float,
+    timestamp_type: type,
+) -> list[dict]:
+    total_chars = sum(len(p) for p in parts) or 1
+    duration = float(end) - float(start)
+    cursor = float(start)
+    out: list[dict] = []
+    for i, part in enumerate(parts):
+        share = len(part) / total_chars
+        sub_end = float(end) if i == len(parts) - 1 else cursor + duration * share
+        sub_end = max(cursor, min(float(end), sub_end))
+        out.append({"text": part, "timestamp": timestamp_type((cursor, sub_end))})
+        cursor = sub_end
+    return out
+
+
 def subdivide_large_chunks(
     result: dict,
     max_chars_per_chunk: int = 200,
@@ -153,40 +189,13 @@ def subdivide_large_chunks(
             out_chunks.append(chunk)
             continue
 
-        # Split on whitespace; for Thai (no spaces) fall back to fixed-size slices.
-        tokens = text.split()
-        if len(tokens) < 2:
-            # Fixed-size character slices.
-            n_parts = max(1, len(text) // max_chars_per_chunk)
-            slice_len = (len(text) + n_parts - 1) // n_parts
-            parts = [text[i:i + slice_len] for i in range(0, len(text), slice_len)]
-        else:
-            n_parts = max(1, (len(text) + max_chars_per_chunk - 1) // max_chars_per_chunk)
-            per = max(1, len(tokens) // n_parts)
-            parts = []
-            for i in range(0, len(tokens), per):
-                parts.append(" ".join(tokens[i:i + per]))
-            # Merge a tiny last part into the previous one.
-            if len(parts) > 1 and len(parts[-1]) < max_chars_per_chunk // 4:
-                parts[-2] = parts[-2] + " " + parts[-1]
-                parts.pop()
-
+        parts = _split_oversized_text(text, max_chars_per_chunk)
         if len(parts) <= 1:
             out_chunks.append(chunk)
             continue
-
-        total_chars = sum(len(p) for p in parts) or 1
-        duration = float(end) - float(start)
-        cursor = float(start)
-        for i, part in enumerate(parts):
-            share = len(part) / total_chars
-            sub_end = float(end) if i == len(parts) - 1 else cursor + duration * share
-            sub_end = max(cursor, min(float(end), sub_end))
-            out_chunks.append({
-                "text": part,
-                "timestamp": timestamp_type((cursor, sub_end)),
-            })
-            cursor = sub_end
+        out_chunks.extend(
+            _emit_subdivided_parts(parts, float(start), float(end), timestamp_type)
+        )
 
     if len(out_chunks) == len(chunks):
         return result
@@ -220,6 +229,28 @@ def _strip_prefix_overlap(new_text: str, previous_text: str) -> str:
     return new_text
 
 
+def _trim_overlap_chunk(
+    chunk: dict,
+    text: str,
+    kept: list[dict],
+    last_end: float,
+    start: float,
+    end: float,
+) -> tuple[dict | None, float]:
+    """Return (chunk_or_None_if_dropped, updated_last_end)."""
+    if float(end) <= last_end + 0.25 and _is_recent_duplicate_text(text, kept):
+        return None, last_end
+    if float(start) < last_end + 1.0:
+        prev_text = kept[-1].get("text", "").strip()
+        trimmed = _strip_prefix_overlap(text, prev_text)
+        if not trimmed:
+            return None, max(last_end, float(end))
+        if trimmed != text:
+            chunk = dict(chunk)
+            chunk["text"] = trimmed
+    return chunk, max(last_end, float(end))
+
+
 def _dedupe_overlapped_chunks(chunks: list[dict]) -> list[dict]:
     """Drop or trim chunks duplicated by overlapped long-form ASR windows."""
     ordered = sorted(chunks, key=_chunk_sort_key)
@@ -231,19 +262,11 @@ def _dedupe_overlapped_chunks(chunks: list[dict]) -> list[dict]:
         if not text:
             continue
         if start is not None and end is not None and kept:
-            if float(end) <= last_end + 0.25 and _is_recent_duplicate_text(text, kept):
+            chunk, last_end = _trim_overlap_chunk(
+                chunk, text, kept, last_end, float(start), float(end),
+            )
+            if chunk is None:
                 continue
-            if float(start) < last_end + 1.0:
-                prev_text = kept[-1].get("text", "").strip()
-                trimmed = _strip_prefix_overlap(text, prev_text)
-                if not trimmed:
-                    last_end = max(last_end, float(end))
-                    continue
-                if trimmed != text:
-                    chunk = dict(chunk)
-                    chunk["text"] = trimmed
-                    text = trimmed
-            last_end = max(last_end, float(end))
         elif start is not None and end is not None:
             last_end = max(last_end, float(end))
         kept.append(chunk)

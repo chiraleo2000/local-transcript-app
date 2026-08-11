@@ -176,12 +176,86 @@ from backend.services.media_pipeline import clear_prejob_caches
 
 
 LABEL_ELAPSED = "Elapsed Time"
-LABEL_DOWNLOAD = "Download .txt"
+LABEL_DOWNLOAD = "3) Download .txt"
 _CANCELLED = "(cancelled)"
 _MSG_CANCELLED = "Cancelled."
+_MSG_JOB_NOT_FOUND = "Job not found."
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv", ".wmv", ".m4v", ".ts"}
 
 APP_CSS = """
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=IBM+Plex+Sans+Thai:wght@400;500;600&display=swap');
+.gradio-container {
+    font-family: 'DM Sans', 'IBM Plex Sans Thai', system-ui, sans-serif !important;
+    max-width: 1100px !important;
+}
+.lta-hero {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 16px;
+    flex-wrap: wrap;
+    margin: 0 0 12px 0;
+    padding: 18px 20px;
+    border-radius: 14px;
+    background:
+        radial-gradient(1200px 280px at 0% 0%, rgba(14, 165, 233, 0.12), transparent 55%),
+        linear-gradient(180deg, #f8fafc 0%, #eef2ff 100%);
+    border: 1px solid #e2e8f0;
+}
+.lta-hero h1 {
+    margin: 0;
+    font-size: 1.75rem;
+    letter-spacing: -0.02em;
+    color: #0f172a;
+}
+.lta-hero p {
+    margin: 6px 0 0;
+    color: #475569;
+    font-size: 0.98rem;
+    max-width: 42rem;
+    line-height: 1.45;
+}
+.lta-steps {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 10px;
+    margin: 0 0 14px 0;
+}
+.lta-step {
+    padding: 12px 14px;
+    border-radius: 12px;
+    background: #ffffff;
+    border: 1px solid #e2e8f0;
+}
+.lta-step strong {
+    display: block;
+    color: #0f172a;
+    font-size: 0.92rem;
+    margin-bottom: 4px;
+}
+.lta-step span {
+    color: #64748b;
+    font-size: 0.84rem;
+    line-height: 1.35;
+}
+.lta-tip {
+    margin: 8px 0 14px;
+    padding: 12px 14px;
+    border-radius: 12px;
+    background: #ecfeff;
+    border: 1px solid #a5f3fc;
+    color: #155e75;
+    font-size: 0.9rem;
+    line-height: 1.4;
+}
+#transcribe-btn {
+    min-height: 48px !important;
+    font-weight: 700 !important;
+    font-size: 1.05rem !important;
+}
+#media-input {
+    border-radius: 12px !important;
+}
 .config-landscape textarea { min-height: 42px !important; }
 .tall-audio-preview { min-height: 220px !important; }
 .tall-audio-preview audio { min-height: 100px !important; }
@@ -232,6 +306,7 @@ APP_CSS = """
 }
 @media (max-width: 900px) {
     .config-landscape { flex-wrap: wrap; }
+    .lta-steps { grid-template-columns: 1fr; }
 }
 #tab-instance-id { display: none !important; }
 """
@@ -245,39 +320,39 @@ def _gradio_root_js() -> str:
 
 
 # sessionStorage is per browser tab — isolates cancel/progress from other tabs/users.
-TAB_INSTANCE_SCRIPT = f"""
+TAB_INSTANCE_SCRIPT = """
 <script>
-(function initTabInstanceId() {{
+(function initTabInstanceId() {
   const KEY = 'lta_tab_instance_id';
-  function apply() {{
+  function apply() {
     const host = document.getElementById('tab-instance-id');
     if (!host) return false;
     const input = host.querySelector('textarea, input');
     if (!input) return false;
     let id = sessionStorage.getItem(KEY);
-    if (!id && input.value && input.value.trim()) {{
+    if (!id && input.value && input.value.trim()) {
       id = input.value.trim();
       sessionStorage.setItem(KEY, id);
-    }}
-    if (!id) {{
+    }
+    if (!id) {
       id = (typeof crypto !== 'undefined' && crypto.randomUUID)
         ? crypto.randomUUID()
         : ('tab_' + Date.now() + '_' + Math.random().toString(36).slice(2));
       sessionStorage.setItem(KEY, id);
-    }}
-    if (input.value !== id) {{
+    }
+    if (input.value !== id) {
       input.value = id;
-      input.dispatchEvent(new Event('input', {{ bubbles: true }}));
-      input.dispatchEvent(new Event('change', {{ bubbles: true }}));
-    }}
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    }
     return true;
-  }}
-  if (!apply()) {{
-    const obs = new MutationObserver(function() {{ if (apply()) obs.disconnect(); }});
-    obs.observe(document.documentElement, {{ childList: true, subtree: true }});
-    setTimeout(function() {{ obs.disconnect(); }}, 20000);
-  }}
-}})();
+  }
+  if (!apply()) {
+    const obs = new MutationObserver(function() { if (apply()) obs.disconnect(); });
+    obs.observe(document.documentElement, { childList: true, subtree: true });
+    setTimeout(function() { obs.disconnect(); }, 20000);
+  }
+})();
 </script>
 """
 
@@ -655,7 +730,7 @@ def _poll_job_manifest_live(
                 yield _empty_outputs(
                     f"Job not found: {job_id}",
                     "error",
-                    "Job not found.",
+                    _MSG_JOB_NOT_FOUND,
                     client_ip=client_ip,
                     username=username,
                     user_id=user_id,
@@ -1022,6 +1097,125 @@ def _stream_worker_progress(
     )
 
 
+def _append_tab_job_id(
+    row: dict,
+    *,
+    candidates: list[str],
+    completed: list[str],
+) -> None:
+    jid = str(row.get("job_id") or "")
+    if not jid:
+        return
+    if _job_is_in_flight(row) or _job_status_norm(row) == "running":
+        if jid not in candidates:
+            candidates.append(jid)
+        return
+    if _job_status_norm(row) == "completed" or row.get("results"):
+        if jid not in completed:
+            completed.append(jid)
+
+
+def _collect_tab_job_candidates(
+    tab_id: str,
+    runtime: dict | None,
+    *,
+    username: str | None = None,
+    user_id: int | None = None,
+) -> tuple[list[str], list[str]]:
+    """Return (in-flight candidates, completed ids) for a browser tab."""
+    candidates: list[str] = []
+    completed: list[str] = []
+    if runtime and runtime.get("active_job_id"):
+        candidates.append(str(runtime["active_job_id"]))
+    if runtime and runtime.get("last_completed_job_id"):
+        completed.append(str(runtime["last_completed_job_id"]))
+    for row in list_jobs(50, username=username, user_id=user_id):
+        if row.get("tab_id") != tab_id:
+            continue
+        _append_tab_job_id(row, candidates=candidates, completed=completed)
+    return candidates, completed
+
+
+def _job_has_terminal_results(job: dict) -> bool:
+    return _job_status_norm(job) == "completed" or bool(job.get("results"))
+
+
+def _yield_terminal_recovered_job(
+    job: dict,
+    job_id: str,
+    *,
+    runtime: dict | None,
+    client_ip: str | None,
+    username: str | None,
+    user_id: int | None,
+):
+    if runtime is not None:
+        set_last_completed_job(runtime, job_id)
+    yield _terminal_job_outputs(
+        job, client_ip=client_ip, username=username, user_id=user_id,
+    )
+
+
+def _recover_from_candidate_jobs(
+    candidates: list[str],
+    *,
+    runtime: dict | None,
+    client_ip: str | None,
+    username: str | None,
+    user_id: int | None,
+):
+    """Yield recovery outputs for the first usable candidate. Returns True if handled."""
+    for job_id in candidates:
+        job = load_job(job_id)
+        if job is None:
+            continue
+        if _job_is_in_flight(job):
+            yield from _poll_job_manifest_live(
+                job_id,
+                client_ip=client_ip,
+                username=username,
+                user_id=user_id,
+            )
+            return True
+        if _job_has_terminal_results(job):
+            yield from _yield_terminal_recovered_job(
+                job,
+                job_id,
+                runtime=runtime,
+                client_ip=client_ip,
+                username=username,
+                user_id=user_id,
+            )
+            return True
+    return False
+
+
+def _recover_from_completed_jobs(
+    completed: list[str],
+    *,
+    runtime: dict | None,
+    client_ip: str | None,
+    username: str | None,
+    user_id: int | None,
+):
+    """Yield terminal outputs for the first completed job. Returns True if handled."""
+    for job_id in completed:
+        job = load_job(job_id)
+        if job is None:
+            continue
+        if _job_has_terminal_results(job):
+            yield from _yield_terminal_recovered_job(
+                job,
+                job_id,
+                runtime=runtime,
+                client_ip=client_ip,
+                username=username,
+                user_id=user_id,
+            )
+            return True
+    return False
+
+
 def _recover_manifest_or_idle(
     tab_id: str,
     tracker: JobProgress,
@@ -1034,54 +1228,25 @@ def _recover_manifest_or_idle(
 ):
     del no_dl  # unused — live helper builds its own download updates
     # Prefer the tab's active job id, then in-flight / completed manifests for this tab.
-    candidates: list[str] = []
-    completed: list[str] = []
-    if runtime and runtime.get("active_job_id"):
-        candidates.append(str(runtime["active_job_id"]))
-    if runtime and runtime.get("last_completed_job_id"):
-        completed.append(str(runtime["last_completed_job_id"]))
-    for row in list_jobs(50, username=username, user_id=user_id):
-        if row.get("tab_id") != tab_id:
-            continue
-        jid = str(row.get("job_id") or "")
-        if not jid:
-            continue
-        if _job_is_in_flight(row) or _job_status_norm(row) == "running":
-            if jid not in candidates:
-                candidates.append(jid)
-        elif _job_status_norm(row) == "completed" or row.get("results"):
-            if jid not in completed:
-                completed.append(jid)
-    for job_id in candidates:
-        job = load_job(job_id)
-        if job is None:
-            continue
-        if _job_is_in_flight(job):
-            yield from _poll_job_manifest_live(
-                job_id,
-                client_ip=client_ip,
-                username=username,
-                user_id=user_id,
-            )
-            return
-        if _job_status_norm(job) == "completed" or job.get("results"):
-            if runtime is not None:
-                set_last_completed_job(runtime, job_id)
-            yield _terminal_job_outputs(
-                job, client_ip=client_ip, username=username, user_id=user_id,
-            )
-            return
-    for job_id in completed:
-        job = load_job(job_id)
-        if job is None:
-            continue
-        if _job_status_norm(job) == "completed" or job.get("results"):
-            if runtime is not None:
-                set_last_completed_job(runtime, job_id)
-            yield _terminal_job_outputs(
-                job, client_ip=client_ip, username=username, user_id=user_id,
-            )
-            return
+    candidates, completed = _collect_tab_job_candidates(
+        tab_id, runtime, username=username, user_id=user_id,
+    )
+    if (yield from _recover_from_candidate_jobs(
+        candidates,
+        runtime=runtime,
+        client_ip=client_ip,
+        username=username,
+        user_id=user_id,
+    )):
+        return
+    if (yield from _recover_from_completed_jobs(
+        completed,
+        runtime=runtime,
+        client_ip=client_ip,
+        username=username,
+        user_id=user_id,
+    )):
+        return
     yield _empty_outputs(
         "",
         "idle",
@@ -1090,6 +1255,67 @@ def _recover_manifest_or_idle(
         client_ip=client_ip,
         username=username,
         user_id=user_id,
+    )
+
+
+def _transcription_worker_target(ctx: dict) -> None:
+    runtime = ctx["runtime"]
+    holder = ctx["holder"]
+    error_holder = ctx["error_holder"]
+    try:
+        holder["result"] = run_transcription_job(
+            media_path=ctx["media_path"],
+            selected_engines=ctx["selected"],
+            language=ctx["language"],
+            diarization=ctx["diarization"],
+            max_speakers=ctx["max_speakers"],
+            enhance=ctx["enhance"],
+            diarize_kwargs=ctx["diarize_kwargs"],
+            cancel_event=ctx["cancel_event"],
+            progress=ctx["tracker"],
+            meta=JobMeta(
+                tab_id=ctx["tid"],
+                display_name=ctx["display_name"],
+                source_filename=ctx["source_filename"],
+                output_name=ctx["output_name"] or None,
+                client_ip=ctx["client_ip"],
+                user_id=ctx["user_id"],
+                username=ctx["username"],
+            ),
+        )
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        error_holder["error"] = exc
+    finally:
+        completed_id = None
+        result = holder.get("result")
+        if isinstance(result, dict):
+            completed_id = result.get("job_id") or runtime.get("active_job_id")
+        clear_active_job(
+            runtime,
+            completed_job_id=str(completed_id) if completed_id else None,
+        )
+
+
+def _yield_transcription_result(
+    holder: dict,
+    error_holder: dict,
+    selected: list,
+    tracker: JobProgress,
+    *,
+    client_ip: str | None,
+    username: str | None,
+    user_id: int | None,
+):
+    if error_holder.get("error"):
+        yield _transcription_error_outputs(tracker, error_holder["error"])
+        return
+    yield _build_outputs(
+        holder["result"],
+        selected,
+        tracker,
+        client_ip=client_ip,
+        username=username or None,
+        user_id=user_id or None,
     )
 
 
@@ -1133,44 +1359,35 @@ def transcribe(*inputs, request: gr.Request | None = None):
 
     holder: dict = {}
     error_holder: dict = {}
-
-    def _run_job() -> None:
-        try:
-            holder["result"] = run_transcription_job(
-                media_path=req.media_path,
-                selected_engines=selected,
-                language=req.language,
-                diarization=req.diarization,
-                max_speakers=int(req.max_speakers),
-                enhance=req.enhance,
-                diarize_kwargs=diarize_kwargs,
-                cancel_event=cancel_event,
-                progress=tracker,
-                meta=JobMeta(
-                    tab_id=tid,
-                    display_name=display_name,
-                    source_filename=source_filename,
-                    output_name=output_name or None,
-                    client_ip=client_ip,
-                    user_id=user_id,
-                    username=username,
-                ),
-            )
-        except Exception as exc:  # pylint: disable=broad-exception-caught
-            error_holder["error"] = exc
-        finally:
-            completed_id = None
-            result = holder.get("result")
-            if isinstance(result, dict):
-                completed_id = result.get("job_id") or runtime.get("active_job_id")
-            clear_active_job(
-                runtime,
-                completed_job_id=str(completed_id) if completed_id else None,
-            )
+    worker_ctx = {
+        "runtime": runtime,
+        "media_path": req.media_path,
+        "selected": selected,
+        "language": req.language,
+        "diarization": req.diarization,
+        "max_speakers": int(req.max_speakers),
+        "enhance": req.enhance,
+        "diarize_kwargs": diarize_kwargs,
+        "cancel_event": cancel_event,
+        "tracker": tracker,
+        "tid": tid,
+        "display_name": display_name,
+        "source_filename": source_filename,
+        "output_name": output_name,
+        "client_ip": client_ip,
+        "user_id": user_id,
+        "username": username,
+        "holder": holder,
+        "error_holder": error_holder,
+    }
 
     tracker.reset()
     tracker.start()
-    worker = threading.Thread(target=_run_job, daemon=True)
+    worker = threading.Thread(
+        target=_transcription_worker_target,
+        args=(worker_ctx,),
+        daemon=True,
+    )
     set_active_job(runtime, "", worker)
     worker.start()
 
@@ -1184,13 +1401,9 @@ def transcribe(*inputs, request: gr.Request | None = None):
         return
 
     worker.join()
-
-    if error_holder.get("error"):
-        yield _transcription_error_outputs(tracker, error_holder["error"])
-        return
-
-    yield _build_outputs(
-        holder["result"],
+    yield from _yield_transcription_result(
+        holder,
+        error_holder,
         selected,
         tracker,
         client_ip=client_ip,
@@ -1207,25 +1420,19 @@ def load_history(request: gr.Request | None = None):
     )
 
 
-def _job_access_denied(job: dict, request: gr.Request | None) -> bool:
-    user_id, username = _request_user_meta(request)
-    if user_id or username:
-        if int(job.get("user_id") or 0) == int(user_id):
-            return False
-        job_user = (job.get("username") or "").strip().lower()
-        if job_user and job_user == username.lower():
-            return False
-        # Legacy jobs without username: allow owner via IP when enabled.
-        if not job_user and not int(job.get("user_id") or 0):
-            client_ip = client_ip_from_request(request)
-            if (
-                _history_per_client_ip()
-                and client_ip
-                and (job.get("client_ip") or "") not in {"", client_ip}
-            ):
-                return True
-            return False
+def _job_owned_by_account(job: dict, user_id: int, username: str) -> bool:
+    if int(job.get("user_id") or 0) == int(user_id):
         return True
+    job_user = (job.get("username") or "").strip().lower()
+    return bool(job_user and job_user == username.lower())
+
+
+def _job_is_legacy_unowned(job: dict) -> bool:
+    job_user = (job.get("username") or "").strip().lower()
+    return not job_user and not int(job.get("user_id") or 0)
+
+
+def _client_ip_blocks_job(job: dict, request: gr.Request | None) -> bool:
     client_ip = client_ip_from_request(request)
     return bool(
         _history_per_client_ip()
@@ -1234,39 +1441,27 @@ def _job_access_denied(job: dict, request: gr.Request | None) -> bool:
     )
 
 
+def _job_access_denied(job: dict, request: gr.Request | None) -> bool:
+    user_id, username = _request_user_meta(request)
+    if user_id or username:
+        if _job_owned_by_account(job, user_id, username):
+            return False
+        # Legacy jobs without username: allow owner via IP when enabled.
+        if _job_is_legacy_unowned(job):
+            return _client_ip_blocks_job(job, request)
+        return True
+    return _client_ip_blocks_job(job, request)
+
+
 def load_selected_job(job_id: str, request: gr.Request | None = None):
     """Load a past job, or re-attach live progress when it is still running/queued."""
     client_ip = client_ip_from_request(request)
     user_id, username = _request_user_meta(request)
-    if not job_id:
-        yield _empty_outputs(
-            "Select a job from Previous transcripts.",
-            refresh_history=False,
-            client_ip=client_ip,
-            username=username or None,
-            user_id=user_id or None,
-        )
-        return
-    job = load_job(job_id)
-    if not job:
-        yield _empty_outputs(
-            f"Job not found: {job_id}",
-            "error",
-            "Job not found.",
-            client_ip=client_ip,
-            username=username or None,
-            user_id=user_id or None,
-        )
-        return
-    if _job_access_denied(job, request):
-        yield _empty_outputs(
-            "Job not found for this account.",
-            "error",
-            "Access denied.",
-            client_ip=client_ip,
-            username=username or None,
-            user_id=user_id or None,
-        )
+    job, denied = _resolve_selected_job(
+        job_id, request, client_ip, username, user_id,
+    )
+    if denied is not None:
+        yield denied
         return
     if _job_is_in_flight(job):
         # Mirror online transcription UX: stream phase/elapsed until durable results.
@@ -1283,6 +1478,44 @@ def load_selected_job(job_id: str, request: gr.Request | None = None):
         username=username or None,
         user_id=user_id or None,
     )
+
+
+def _resolve_selected_job(
+    job_id: str,
+    request: gr.Request | None,
+    client_ip: str | None,
+    username: str | None,
+    user_id: int | None,
+) -> tuple[dict | None, tuple | None]:
+    """Return (job, None) or (None, empty_outputs) for invalid selections."""
+    if not job_id:
+        return None, _empty_outputs(
+            "Select a job from Previous transcripts.",
+            refresh_history=False,
+            client_ip=client_ip,
+            username=username or None,
+            user_id=user_id or None,
+        )
+    job = load_job(job_id)
+    if not job:
+        return None, _empty_outputs(
+            f"Job not found: {job_id}",
+            "error",
+            _MSG_JOB_NOT_FOUND,
+            client_ip=client_ip,
+            username=username or None,
+            user_id=user_id or None,
+        )
+    if _job_access_denied(job, request):
+        return None, _empty_outputs(
+            "Job not found for this account.",
+            "error",
+            "Access denied.",
+            client_ip=client_ip,
+            username=username or None,
+            user_id=user_id or None,
+        )
+    return job, None
 
 
 def download_selected_job(job_id: str, request: gr.Request | None = None):
@@ -1449,24 +1682,34 @@ def build_ui() -> gr.Blocks:
     ) as demo:
         gr.HTML(
             f"""
-            <div style="display:flex;justify-content:space-between;align-items:center;
-                        gap:12px;flex-wrap:wrap;margin-bottom:4px;">
+            <div class="lta-hero">
               <div>
-                <h1 style="margin:0;font-size:1.6rem;">Local Transcript App</h1>
-                <p style="margin:4px 0 0;color:#71717a;font-size:0.95rem;">
-                  Upload audio or video, then transcribe locally with open-source models.
+                <h1>Local Transcript App</h1>
+                <p>
+                  Private on-device transcription. Upload audio or video, click
+                  <strong>Transcribe</strong>, then download your .txt when the status turns green.
                 </p>
               </div>
-              <div style="display:flex;gap:10px;align-items:center;">
-                <span style="color:#71717a;font-size:0.85rem;">
-                  Session idle timeout: {ttl_min} min
+              <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+                <span style="color:#475569;font-size:0.85rem;">
+                  Keep this tab open · idle login after {ttl_min} min
                 </span>
                 <a href="/logout"
                    style="display:inline-block;padding:8px 14px;border-radius:8px;
-                          background:#27272a;color:#fff;text-decoration:none;font-weight:600;">
+                          background:#0f172a;color:#fff;text-decoration:none;font-weight:600;">
                   Log out
                 </a>
               </div>
+            </div>
+            <div class="lta-steps">
+              <div class="lta-step"><strong>1. Upload</strong><span>Drop an audio/video file below.</span></div>
+              <div class="lta-step"><strong>2. Transcribe</strong><span>Optional: speakers + enhancement, then start.</span></div>
+              <div class="lta-step"><strong>3. Download</strong><span>Use Download .txt or Previous transcripts.</span></div>
+            </div>
+            <div class="lta-tip">
+              Tip: finished jobs are saved automatically. If you ever need to sign in again,
+              open <strong>Previous transcripts</strong> → <em>Load into editor</em> or
+              <em>Download selected</em> — your .txt is still there.
             </div>
             """
         )
@@ -1481,7 +1724,7 @@ def build_ui() -> gr.Blocks:
         )
 
         media_input = gr.File(
-            label="Audio or Video File",
+            label="1) Upload audio or video",
             file_types=["audio", "video"],
             type="filepath",
             interactive=models_ready,
@@ -1511,18 +1754,22 @@ def build_ui() -> gr.Blocks:
                     label="Audio Enhancement",
                     value=_env_bool("AUDIO_ENHANCE_DEFAULT", False),
                     elem_id="enhance-checkbox",
-                    info="Recommended for diarization — denoise and normalize loudness.",
+                    info="Denoise/normalize for ASR only (diarization stays on raw audio).",
                 )
                 diarization = gr.Checkbox(
-                    label="Speaker Diarization",
+                    label="Speaker labels",
                     value=False,
                     elem_id="diarization-checkbox",
+                    info="Add [SPEAKER_XX] labels when multiple people talk.",
                 )
             with gr.Column(scale=1, min_width=180, visible=False) as speakers_row:
                 max_speakers = gr.Slider(1, 10, step=1, value=6, label="Max Speakers")
             with gr.Column(scale=1, min_width=180):
                 transcribe_btn = gr.Button(
-                    "Transcribe", variant="primary", interactive=models_ready, elem_id="transcribe-btn",
+                    "2) Transcribe",
+                    variant="primary",
+                    interactive=models_ready,
+                    elem_id="transcribe-btn",
                 )
                 cancel_btn = gr.Button("Cancel & Reset", variant="stop", interactive=True)
 
@@ -1630,6 +1877,10 @@ def build_ui() -> gr.Blocks:
         )
 
         with gr.TabItem("Output"):
+            gr.Markdown(
+                "When status is **Done**, click **3) Download .txt**. "
+                "You can also rename the file below before downloading."
+            )
             output_text = gr.Textbox(
                 label="Transcript",
                 lines=20,
@@ -1656,6 +1907,7 @@ def build_ui() -> gr.Blocks:
                     value=None,
                     scale=1,
                     interactive=False,
+                    variant="primary",
                 )
 
         with gr.Accordion("Job Info", open=False):
@@ -1679,18 +1931,16 @@ def build_ui() -> gr.Blocks:
 
         gr.Markdown(
             "### Previous transcripts\n"
-            "Filtered by your logged-in account (fallback: client IP when "
-            "`UI_HISTORY_PER_CLIENT_IP=true`). **Load into editor** re-attaches to "
-            "queued/running jobs and streams live status (same as an online "
-            "transcription) until results are ready — also works after refresh, "
-            "re-login, or brief network drops. Completed jobs restore the transcript "
-            "and **Download .txt** immediately. Transcripts are saved on disk under "
-            "Previous transcripts even if a session expires mid-job. "
-            "Cancel stops your job and frees GPU cache for the next queued user."
+            "Your finished jobs stay here even after refresh or re-login.\n\n"
+            "1. Click **Refresh list**\n"
+            "2. Pick a job\n"
+            "3. **Load into editor** (view/edit) or **Download selected** (.txt)\n\n"
+            "Running jobs re-attach and stream live status. "
+            "**Cancel & Reset** stops your job and frees the GPU for the next user."
         )
         with gr.Row():
             history_dropdown = gr.Dropdown(
-                label="Past jobs",
+                label="Your past jobs",
                 choices=[],
                 value=None,
                 interactive=True,
@@ -1699,7 +1949,9 @@ def build_ui() -> gr.Blocks:
             history_refresh_btn = gr.Button("Refresh list", scale=1)
         with gr.Row():
             history_load_btn = gr.Button("Load into editor", variant="secondary")
-            history_download_btn = gr.DownloadButton("Download selected", value=None, interactive=False)
+            history_download_btn = gr.DownloadButton(
+                "Download selected", value=None, interactive=False, variant="primary",
+            )
 
         gr.Markdown(hw_md)
 
@@ -1785,84 +2037,100 @@ def build_ui() -> gr.Blocks:
     return demo
 
 
+def _progress_api(request):
+    from starlette.responses import JSONResponse
+
+    job_id = (request.query_params.get("job_id") or "").strip()
+    if job_id:
+        tracker = get_api_job_progress(job_id)
+        if tracker is not None:
+            return JSONResponse(tracker.snapshot())
+        job = load_job(job_id)
+        if job and isinstance(job.get("progress"), dict):
+            return JSONResponse(job["progress"])
+        return JSONResponse({"phase": "unknown", "active": False, "job_id": job_id})
+    tab_id = request.query_params.get("tab_id")
+    if tab_id:
+        runtime, _ = resolve_runtime(tab_id)
+        return JSONResponse(runtime["progress"].snapshot())
+    return JSONResponse(get_job_progress().snapshot())
+
+
+def _gradio_username_from_app(app, request) -> str | None:
+    from backend.gradio_session import _request_token
+
+    tokens: dict = getattr(app, "tokens", None) or {}
+    token = _request_token(request, app)
+    if not token:
+        return None
+    name = tokens.get(token)
+    return name.strip() if isinstance(name, str) and name.strip() else None
+
+
+def _job_owned_by_username(job: dict, username: str) -> bool:
+    user = get_user_by_username(username)
+    user_id = int(user.id) if user is not None else 0
+    job_uid = int(job.get("user_id") or 0)
+    job_user = (job.get("username") or "").strip().lower()
+    return bool(
+        (user_id and job_uid == user_id)
+        or (job_user and job_user == username.lower())
+    )
+
+
+def _transcript_download_path(job: dict) -> str | None:
+    for payload in (job.get("results") or {}).values():
+        if isinstance(payload, dict) and payload.get("download_path"):
+            return payload["download_path"]
+    return None
+
+
+def _ui_download_transcript_response(app, request):
+    """Serve transcript TXT using Gradio login cookies (survives file-cache wipe)."""
+    from pathlib import Path
+
+    from starlette.responses import FileResponse, PlainTextResponse
+
+    username = _gradio_username_from_app(app, request)
+    if not username:
+        return PlainTextResponse("Login required.", status_code=401)
+    job_id = (request.path_params.get("job_id") or "").strip()
+    job = load_job(job_id)
+    if job is None:
+        return PlainTextResponse(_MSG_JOB_NOT_FOUND, status_code=404)
+    job_uid = int(job.get("user_id") or 0)
+    job_user = (job.get("username") or "").strip().lower()
+    if not _job_owned_by_username(job, username) and (job_uid or job_user):
+        return PlainTextResponse("Forbidden.", status_code=403)
+    path = _transcript_download_path(job)
+    if not path or not Path(path).is_file():
+        return PlainTextResponse("Transcript not ready.", status_code=404)
+    # Only serve files from the transcript store (path traversal guard).
+    resolved = Path(path).resolve()
+    try:
+        resolved.relative_to(Path(TRANSCRIPT_DIR).resolve())
+    except ValueError:
+        return PlainTextResponse("Invalid transcript path.", status_code=400)
+    return FileResponse(
+        resolved,
+        filename=resolved.name,
+        media_type="text/plain; charset=utf-8",
+    )
+
+
 def _mount_custom_routes(app) -> None:
     """Attach REST + register + progress routes to a freshly built Gradio app."""
     if getattr(app, "_lta_routes_mounted", False):
         return
-    from pathlib import Path
-
-    from starlette.requests import Request
-    from starlette.responses import FileResponse, JSONResponse, PlainTextResponse
     from starlette.routing import Route
 
-    from backend.gradio_session import _request_token
-    from backend.storage import TRANSCRIPT_DIR
-
-    def progress_api(request: Request):
-        job_id = (request.query_params.get("job_id") or "").strip()
-        if job_id:
-            tracker = get_api_job_progress(job_id)
-            if tracker is not None:
-                return JSONResponse(tracker.snapshot())
-            job = load_job(job_id)
-            if job and isinstance(job.get("progress"), dict):
-                return JSONResponse(job["progress"])
-            return JSONResponse({"phase": "unknown", "active": False, "job_id": job_id})
-        tab_id = request.query_params.get("tab_id")
-        if tab_id:
-            runtime, _ = resolve_runtime(tab_id)
-            return JSONResponse(runtime["progress"].snapshot())
-        return JSONResponse(get_job_progress().snapshot())
-
-    def _gradio_username(request: Request) -> str | None:
-        tokens: dict = getattr(app, "tokens", None) or {}
-        token = _request_token(request, app)
-        if not token:
-            return None
-        name = tokens.get(token)
-        return name.strip() if isinstance(name, str) and name.strip() else None
-
-    def ui_download_transcript(request: Request):
-        """Serve transcript TXT using Gradio login cookies (survives file-cache wipe)."""
-        username = _gradio_username(request)
-        if not username:
-            return PlainTextResponse("Login required.", status_code=401)
-        job_id = (request.path_params.get("job_id") or "").strip()
-        job = load_job(job_id)
-        if job is None:
-            return PlainTextResponse("Job not found.", status_code=404)
-        user = get_user_by_username(username)
-        user_id = int(user.id) if user is not None else 0
-        job_uid = int(job.get("user_id") or 0)
-        job_user = (job.get("username") or "").strip().lower()
-        owned = (user_id and job_uid == user_id) or (
-            job_user and job_user == username.lower()
-        )
-        if not owned and (job_uid or job_user):
-            return PlainTextResponse("Forbidden.", status_code=403)
-        path = None
-        for payload in (job.get("results") or {}).values():
-            if isinstance(payload, dict) and payload.get("download_path"):
-                path = payload["download_path"]
-                break
-        if not path or not Path(path).is_file():
-            return PlainTextResponse("Transcript not ready.", status_code=404)
-        # Only serve files from the transcript store (path traversal guard).
-        resolved = Path(path).resolve()
-        try:
-            resolved.relative_to(Path(TRANSCRIPT_DIR).resolve())
-        except ValueError:
-            return PlainTextResponse("Invalid transcript path.", status_code=400)
-        return FileResponse(
-            resolved,
-            filename=resolved.name,
-            media_type="text/plain; charset=utf-8",
-        )
+    def ui_download_transcript(request):
+        return _ui_download_transcript_response(app, request)
 
     # Gradio launch() rebuilds the FastAPI app — mount after create_app.
     for route in reversed(build_api_routes()):
         app.routes.insert(0, route)
-    app.routes.insert(0, Route("/job/progress", progress_api, methods=["GET"]))
+    app.routes.insert(0, Route("/job/progress", _progress_api, methods=["GET"]))
     app.routes.insert(
         0,
         Route("/ui/download/{job_id}", ui_download_transcript, methods=["GET"]),

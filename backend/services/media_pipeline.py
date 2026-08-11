@@ -8,6 +8,7 @@ import logging
 import os
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 from backend.storage import AUDIO_DIR, ensure_app_dirs, safe_name
@@ -134,17 +135,28 @@ def _stage_audio_enabled() -> bool:
 
 
 def stage_audio_for_inference(audio_path: str, job_id: str) -> str:
-    """Copy job audio to container-local /tmp for fast per-turn ASR slicing."""
+    """Copy job audio to a private per-user temp dir for fast per-turn ASR slicing."""
     if not _stage_audio_enabled():
         return audio_path
     src = Path(audio_path)
     if not src.is_file():
         return audio_path
     resolved = str(src.resolve())
-    if resolved.startswith("/tmp/"):
-        return audio_path
-    staging = Path("/tmp/job_audio")
+    # Already under a private temp tree for this process — reuse as-is.
+    private_root = Path(tempfile.gettempdir()) / "lta_job_audio"
+    try:
+        if Path(resolved).is_relative_to(private_root.resolve()):
+            return audio_path
+    except (OSError, ValueError):
+        pass
+    staging = private_root
     staging.mkdir(parents=True, exist_ok=True)
+    try:
+        # Restrict to the current OS user (not world-writable /tmp).
+        if hasattr(os, "chmod"):
+            os.chmod(staging, 0o700)
+    except OSError:
+        pass
     dest = staging / f"{job_id}_{src.name}"
     try:
         if not dest.exists() or dest.stat().st_mtime < src.stat().st_mtime:

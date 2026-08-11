@@ -160,6 +160,94 @@ def _parse_bool(value: Any, default: bool = False) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _parse_job_create_form(form) -> dict[str, Any]:
+    language = str(form.get("language") or "Thai")
+    diarization = _parse_bool(form.get("diarization"), True)
+    enhance = _parse_bool(form.get("enhance"), True)
+    max_speakers = int(form.get("max_speakers") or 0)
+    engines_raw = str(form.get("engines") or form.get("selected_engines") or "Auto")
+    selected_engines = [e.strip() for e in engines_raw.split(",") if e.strip()] or ["Auto"]
+    return {
+        "language": language,
+        "diarization": diarization,
+        "enhance": enhance,
+        "max_speakers": max_speakers,
+        "selected_engines": selected_engines,
+    }
+
+
+def _store_job_upload(upload, job_id: str) -> tuple[str, Path] | tuple[None, Response]:
+    filename = safe_name(getattr(upload, "filename", None) or "upload.bin")
+    dest = INPUT_DIR / f"{job_id}_{filename}"
+    try:
+        with dest.open("wb") as out:
+            shutil.copyfileobj(upload.file, out)
+    except OSError as exc:
+        release_queue_slot(started=False)
+        return None, _error(f"Failed to store upload: {exc}", status=500)
+    return filename, dest
+
+
+def _api_job_worker(
+    handle,
+    *,
+    job_id: str,
+    dest: Path,
+    filename: str,
+    selected_engines: list,
+    language: str,
+    diarization: bool,
+    max_speakers: int,
+    enhance: bool,
+    client_ip: str,
+    user_id: int,
+    username: str,
+) -> None:
+    try:
+        run_transcription_job(
+            media_path=str(dest),
+            selected_engines=selected_engines,
+            language=language,
+            diarization=diarization,
+            max_speakers=max_speakers,
+            enhance=enhance,
+            cancel_event=handle.cancel_event,
+            progress=handle.progress,
+            meta=JobMeta(
+                tab_id=f"api:{job_id}",
+                display_name=Path(filename).stem,
+                source_filename=filename,
+                output_name=Path(filename).stem,
+                client_ip=client_ip,
+                user_id=user_id,
+                username=username,
+            ),
+            job_id=job_id,
+        )
+    except RuntimeError as exc:
+        status = "cancelled" if "cancel" in str(exc).lower() else "failed"
+        write_job_record(
+            job_id,
+            {
+                "status": status,
+                "error": str(exc),
+                "user_id": user_id,
+                "username": username,
+            },
+        )
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        logger.exception("API job %s failed", job_id)
+        write_job_record(
+            job_id,
+            {
+                "status": "failed",
+                "error": str(exc),
+                "user_id": user_id,
+                "username": username,
+            },
+        )
+
+
 async def jobs_create(request: Request) -> Response:
     user, err = _require_user(request)
     if err is not None:
@@ -177,25 +265,15 @@ async def jobs_create(request: Request) -> Response:
         release_queue_slot(started=False)
         return _error("Missing multipart file field (file|audio|media).")
 
-    filename = safe_name(getattr(upload, "filename", None) or "upload.bin")
-    language = str(form.get("language") or "Thai")
-    diarization = _parse_bool(form.get("diarization"), True)
-    enhance = _parse_bool(form.get("enhance"), True)
-    max_speakers = int(form.get("max_speakers") or 0)
-    engines_raw = str(form.get("engines") or form.get("selected_engines") or "Auto")
-    selected_engines = [e.strip() for e in engines_raw.split(",") if e.strip()] or ["Auto"]
-
+    opts = _parse_job_create_form(form)
     job_id = new_job_id()
-    dest = INPUT_DIR / f"{job_id}_{filename}"
+    stored = _store_job_upload(upload, job_id)
+    if stored[0] is None:
+        return stored[1]
+    filename, dest = stored
     client_ip = request.client.host if request.client else ""
     user_id = user.id
     username = user.username
-    try:
-        with dest.open("wb") as out:
-            shutil.copyfileobj(upload.file, out)
-    except OSError as exc:
-        release_queue_slot(started=False)
-        return _error(f"Failed to store upload: {exc}", status=500)
 
     write_job_record(
         job_id,
@@ -207,59 +285,30 @@ async def jobs_create(request: Request) -> Response:
             "source_path": str(dest),
             "user_id": user_id,
             "username": username,
-            "language": language,
-            "diarization": diarization,
-            "enhance": enhance,
-            "max_speakers": max_speakers,
-            "selected_engines": selected_engines,
+            "language": opts["language"],
+            "diarization": opts["diarization"],
+            "enhance": opts["enhance"],
+            "max_speakers": opts["max_speakers"],
+            "selected_engines": opts["selected_engines"],
             "client_ip": client_ip,
         },
     )
 
     def _worker(handle) -> None:
-        try:
-            run_transcription_job(
-                media_path=str(dest),
-                selected_engines=selected_engines,
-                language=language,
-                diarization=diarization,
-                max_speakers=max_speakers,
-                enhance=enhance,
-                cancel_event=handle.cancel_event,
-                progress=handle.progress,
-                meta=JobMeta(
-                    tab_id=f"api:{job_id}",
-                    display_name=Path(filename).stem,
-                    source_filename=filename,
-                    output_name=Path(filename).stem,
-                    client_ip=client_ip,
-                    user_id=user_id,
-                    username=username,
-                ),
-                job_id=job_id,
-            )
-        except RuntimeError as exc:
-            status = "cancelled" if "cancel" in str(exc).lower() else "failed"
-            write_job_record(
-                job_id,
-                {
-                    "status": status,
-                    "error": str(exc),
-                    "user_id": user_id,
-                    "username": username,
-                },
-            )
-        except Exception as exc:  # pylint: disable=broad-exception-caught
-            logger.exception("API job %s failed", job_id)
-            write_job_record(
-                job_id,
-                {
-                    "status": "failed",
-                    "error": str(exc),
-                    "user_id": user_id,
-                    "username": username,
-                },
-            )
+        _api_job_worker(
+            handle,
+            job_id=job_id,
+            dest=dest,
+            filename=filename,
+            selected_engines=opts["selected_engines"],
+            language=opts["language"],
+            diarization=opts["diarization"],
+            max_speakers=opts["max_speakers"],
+            enhance=opts["enhance"],
+            client_ip=client_ip,
+            user_id=user_id,
+            username=username,
+        )
 
     try:
         submit_background_job(job_id, _worker)

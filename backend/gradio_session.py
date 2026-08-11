@@ -101,6 +101,66 @@ def _should_extend_idle_session(username: str | None) -> bool:
     return _user_has_inflight_job(username) or _user_has_recent_job_activity(username)
 
 
+def _touch_session_meta(meta: dict, now: float, username: Any = None) -> None:
+    meta["last"] = now
+    if username is not None:
+        meta["username"] = username
+    elif "username" not in meta:
+        meta["username"] = None
+
+
+def _refresh_active_token(
+    tokens: dict,
+    token: str,
+    meta: dict,
+    now: float,
+) -> None:
+    _touch_session_meta(meta, now)
+    if meta.get("username") is None:
+        meta["username"] = tokens.get(token)
+
+
+def _expire_or_extend_token(
+    *,
+    app: Any,
+    tokens: dict,
+    sessions: dict,
+    token: str,
+    meta: dict,
+    ttl: int,
+    now: float,
+) -> bool:
+    """Return True when the token should be expired (cookies cleared)."""
+    if (now - float(meta.get("last") or 0)) <= ttl:
+        _refresh_active_token(tokens, token, meta, now)
+        return False
+    username = _username_for_token(app, token) or meta.get("username")
+    # Do not kick users mid-transcription or right after completion —
+    # SSE progress does not refresh idle timers, and Download .txt
+    # would otherwise 401 immediately after a long job finishes.
+    if _should_extend_idle_session(username if isinstance(username, str) else None):
+        _touch_session_meta(meta, now, username)
+        logger.info("Extended Gradio session for @%s — active/recent job.", username)
+        return False
+    tokens.pop(token, None)
+    sessions.pop(token, None)
+    logger.info("Gradio session expired after %ss idle — login required.", ttl)
+    return True
+
+
+def _register_new_login_tokens(
+    tokens: dict,
+    sessions: dict,
+    before: set,
+) -> None:
+    for new_token in set(tokens.keys()) - before:
+        sessions[new_token] = {
+            "last": time.time(),
+            "created": time.time(),
+            "username": tokens.get(new_token),
+        }
+
+
 class SessionIdleMiddleware(BaseHTTPMiddleware):
     """Expire Gradio auth tokens after APP_SESSION_TTL_S of inactivity.
 
@@ -134,49 +194,25 @@ class SessionIdleMiddleware(BaseHTTPMiddleware):
                     "created": now,
                     "username": tokens.get(token),
                 }
-            elif (now - float(meta.get("last") or 0)) > ttl:
-                username = _username_for_token(app, token) or meta.get("username")
-                # Do not kick users mid-transcription or right after completion —
-                # SSE progress does not refresh idle timers, and Download .txt
-                # would otherwise 401 immediately after a long job finishes.
-                if _should_extend_idle_session(
-                    username if isinstance(username, str) else None
-                ):
-                    meta["last"] = now
-                    meta["username"] = username
-                    logger.info(
-                        "Extended Gradio session for @%s — active/recent job.",
-                        username,
-                    )
-                else:
-                    tokens.pop(token, None)
-                    sessions.pop(token, None)
-                    expired = True
-                    logger.info(
-                        "Gradio session expired after %ss idle — login required.",
-                        ttl,
-                    )
             else:
-                meta["last"] = now
-                if "username" not in meta:
-                    meta["username"] = tokens.get(token)
+                expired = _expire_or_extend_token(
+                    app=app,
+                    tokens=tokens,
+                    sessions=sessions,
+                    token=token,
+                    meta=meta,
+                    ttl=ttl,
+                    now=now,
+                )
         elif token and token not in tokens:
             # Stale cookie after logout/expiry — force clean login screen.
             expired = True
 
-        # Track tokens created by Gradio /login during this request.
         before = set(tokens.keys())
         response = await call_next(request)
-        for new_token in set(tokens.keys()) - before:
-            sessions[new_token] = {
-                "last": time.time(),
-                "created": time.time(),
-                "username": tokens.get(new_token),
-            }
-
+        _register_new_login_tokens(tokens, sessions, before)
         if expired:
             _clear_auth_cookies(response, app)
-
         return response
 
 

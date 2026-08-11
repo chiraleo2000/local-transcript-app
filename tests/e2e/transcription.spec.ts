@@ -133,9 +133,9 @@ async function assertStopwatchDuringJob(page: Page): Promise<void> {
   await expect(timer).toBeVisible({ timeout: 60_000 });
   const first = (await timer.textContent()) ?? "";
   expect(first).toMatch(/Elapsed Time:/);
-  await page.waitForTimeout(1200);
-  const second = (await timer.textContent()) ?? "";
-  expect(second).not.toBe(first);
+  await expect.poll(async () => (await timer.textContent()) ?? "", {
+    timeout: 5000,
+  }).not.toBe(first);
 }
 
 

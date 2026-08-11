@@ -29,6 +29,8 @@ debug-*.log
 
 # Local runtime caches (never commit)
 .cache/
+.tools/
+.scannerwork/
 .nv/
 intel/
 coverage.xml

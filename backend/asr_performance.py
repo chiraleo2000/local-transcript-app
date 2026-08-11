@@ -121,28 +121,31 @@ def should_use_windowed_diar_asr(
     return audio_duration_s >= long_only_s
 
 
-def adaptive_turn_merge_gap_s(audio_duration_s: float) -> float:
-    """Wider merge on long audio → fewer turn-guided ASR passes.
-
-    In accuracy mode keep merges tight so speaker timeline boundaries stay sharp;
-    time pressure is handled by lowering beams instead.
-    """
+def _configured_turn_merge_gap_s(audio_duration_s: float) -> float | None:
+    """Honor ASR_TURN_GUIDED_MERGE_GAP_S when set; None means use adaptive defaults."""
     from backend.asr_quality import is_accuracy_mode
 
     configured = os.getenv("ASR_TURN_GUIDED_MERGE_GAP_S", "").strip()
-    if configured:
-        try:
-            value = float(configured)
-            if value >= 0:
-                if is_accuracy_mode():
-                    # Honor explicit env; only allow mild stretch on very long audio.
-                    if audio_duration_s < 45 * 60:
-                        return value
-                    return min(1.0, value + 0.25) if value < 1.0 else value
-                if value > 0 and audio_duration_s < 5 * 60:
-                    return value
-        except ValueError:
-            pass
+    if not configured:
+        return None
+    try:
+        value = float(configured)
+    except ValueError:
+        return None
+    if value < 0:
+        return None
+    if is_accuracy_mode():
+        # Honor explicit env; only allow mild stretch on very long audio.
+        if audio_duration_s < 45 * 60:
+            return value
+        return min(1.0, value + 0.25) if value < 1.0 else value
+    if value > 0 and audio_duration_s < 5 * 60:
+        return value
+    return None
+
+
+def _default_turn_merge_gap_s(audio_duration_s: float) -> float:
+    from backend.asr_quality import is_accuracy_mode
 
     if is_accuracy_mode():
         if audio_duration_s < 12 * 60:
@@ -164,6 +167,18 @@ def adaptive_turn_merge_gap_s(audio_duration_s: float) -> float:
     if audio_duration_s < 75 * 60:
         return 1.5
     return 2.0
+
+
+def adaptive_turn_merge_gap_s(audio_duration_s: float) -> float:
+    """Wider merge on long audio → fewer turn-guided ASR passes.
+
+    In accuracy mode keep merges tight so speaker timeline boundaries stay sharp;
+    time pressure is handled by lowering beams instead.
+    """
+    configured = _configured_turn_merge_gap_s(audio_duration_s)
+    if configured is not None:
+        return configured
+    return _default_turn_merge_gap_s(audio_duration_s)
 
 
 def adaptive_turn_max_s(audio_duration_s: float) -> float:

@@ -1,8 +1,29 @@
 # Local Transcript App — release notes
 
-**Current version: 1.2.10**
+**Current version: 1.2.11**
 
 See [README.md](README.md) for setup. Docker stacks live under [`deploy/docker/`](deploy/docker/).
+
+---
+
+## v1.2.11
+
+### Summary
+
+SonarQube clean-up (complexity / security / duplication), friendlier Gradio UI (guided steps + clearer download/history), and re-verified unit gates before redeploy.
+
+### SonarQube / quality
+
+- Reduced cognitive complexity in session, recover, job API, ASR switch, timestamps helpers
+- Fixed world-writable `/tmp` staging (private `lta_job_audio` dir with `0700`)
+- Deduplicated Thai ASR variant literals + safer speaker-prefix regex
+- E2E stopwatch waits use `expect.poll` instead of fixed timeouts
+
+### UI
+
+- Clear 1 → 2 → 3 upload / transcribe / download flow
+- Tip banner for Previous transcripts after re-login
+- Stronger primary Download actions and clearer history copy
 
 ---
 

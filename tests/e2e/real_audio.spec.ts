@@ -69,7 +69,7 @@ function elapsedTimer(page: Page) {
 
 async function assertPageAlive(page: Page): Promise<void> {
   expect(page.isClosed(), "browser tab should remain open").toBeFalsy();
-  expect(page.context().pages().length).toBe(1);
+  expect(page.context().pages()).toHaveLength(1);
   const title = await page.title();
   expect(title).not.toMatch(/Aw, Snap|Out of Memory/i);
 }
@@ -91,9 +91,9 @@ async function assertStopwatchTicks(page: Page, stableMs: number): Promise<void>
   await expect(timer).toBeVisible({ timeout: 60_000 });
   const first = (await timer.textContent()) ?? "";
   expect(first.length).toBeGreaterThan(0);
-  await page.waitForTimeout(Math.min(stableMs, 5000));
-  const second = (await timer.textContent()) ?? "";
-  expect(second).not.toBe(first);
+  await expect.poll(async () => (await timer.textContent()) ?? "", {
+    timeout: Math.min(stableMs, 5000) + 2000,
+  }).not.toBe(first);
 }
 
 async function readTranscript(page: Page): Promise<string> {

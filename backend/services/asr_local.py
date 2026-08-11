@@ -199,34 +199,75 @@ def should_unload_on_cancel() -> bool:
     return _env_bool("ASR_UNLOAD_ON_CANCEL", False)
 
 
+def _resolve_engine_for_switch(
+    selected_engine: str, *, language: str | None = None,
+) -> str:
+    selected_engine = _LEGACY_ENGINE_NAMES.get(selected_engine, selected_engine)
+    if is_auto_engine(selected_engine):
+        selected_engine = engine_for_preload(ENGINE_AUTO)
+        if language:
+            selected_engine = resolve_asr_engine(language, ENGINE_AUTO)
+    return selected_engine
+
+
+def _unload_other_asr_engines(selected_engine: str) -> None:
+    if _env_bool("ASR_KEEP_PRELOADED", False):
+        return
+    for engine in ALL_ENGINES:
+        if engine == selected_engine:
+            continue
+        try:
+            unload_model(engine)
+        except ValueError:
+            pass
+
+
 def switch_asr_engine(selected_engine: str, *, language: str | None = None) -> None:
     """Activate one ASR engine for the UI.
 
     When ASR_KEEP_PRELOADED=true, keep other engines resident so switching is fast
     and never triggers re-downloads (offline-only runtime).
     """
-    selected_engine = _LEGACY_ENGINE_NAMES.get(selected_engine, selected_engine)
-    if is_auto_engine(selected_engine):
-        selected_engine = engine_for_preload(ENGINE_AUTO)
-        if language:
-            selected_engine = resolve_asr_engine(language, ENGINE_AUTO)
+    selected_engine = _resolve_engine_for_switch(selected_engine, language=language)
     if selected_engine not in ALL_ENGINES:
         raise ValueError(f"Unknown ASR engine: {selected_engine}")
     # Default behaviour unloads other engines (memory-saving). In cache-first mode
     # we keep them resident so switching is instantaneous.
-    if not _env_bool("ASR_KEEP_PRELOADED", False):
-        for engine in ALL_ENGINES:
-            if engine != selected_engine:
-                try:
-                    unload_model(engine)
-                except ValueError:
-                    pass
+    _unload_other_asr_engines(selected_engine)
     if not model_is_loaded(selected_engine):
         load_model(selected_engine)
     if _env_bool("ASR_KEEP_PRELOADED", False):
         logger.info("ASR engine active: %s (preloaded engines kept resident).", selected_engine)
     else:
         logger.info("ASR engine active: %s (others unloaded).", selected_engine)
+
+
+def _parallel_worker_count(selected_count: int) -> int:
+    """Decide parallel ASR workers from ASR_PARALLEL_MODE and VRAM policy."""
+    mode = os.getenv("ASR_PARALLEL_MODE", "auto").strip().lower()
+    if strict_memory_mode_active() and not _env_bool("ASR_ALLOW_8GB_PARALLEL", False):
+        logger.info(
+            "ASR parallelism limited to 1 worker by strict low-VRAM mode. "
+            "Set ASR_ALLOW_8GB_PARALLEL=true only on machines with enough free VRAM."
+        )
+        return 1
+    if mode in {"parallel", "force", "true", "1"}:
+        return selected_count
+    if mode in {"memory_safe", "safe", "sequential", "false", "0"}:
+        return 1
+    min_parallel_mb = _env_int("ASR_PARALLEL_MIN_VRAM_MB", 12 * 1024)
+    vram_mb = _cuda_vram_mb()
+    if not vram_mb:
+        logger.info("ASR parallelism limited to 1 worker (CUDA VRAM not detected).")
+        return 1
+    if vram_mb < min_parallel_mb:
+        logger.info(
+            "ASR parallelism limited to 1 worker (%d MB VRAM < %d MB threshold).",
+            vram_mb,
+            min_parallel_mb,
+        )
+        return 1
+    return selected_count
 
 
 def asr_worker_count(selected_count: int) -> int:
@@ -237,30 +278,9 @@ def asr_worker_count(selected_count: int) -> int:
     ASR_PARALLEL_MODE=auto runs in parallel only when VRAM is comfortably above
     ASR_PARALLEL_MIN_VRAM_MB, avoiding Windows shared-memory spill on 8 GB cards.
     """
-    worker_count = 1
-    if selected_count > 1:
-        mode = os.getenv("ASR_PARALLEL_MODE", "auto").strip().lower()
-        if strict_memory_mode_active() and not _env_bool("ASR_ALLOW_8GB_PARALLEL", False):
-            logger.info(
-                "ASR parallelism limited to 1 worker by strict low-VRAM mode. "
-                "Set ASR_ALLOW_8GB_PARALLEL=true only on machines with enough free VRAM."
-            )
-        elif mode in {"parallel", "force", "true", "1"}:
-            worker_count = selected_count
-        elif mode not in {"memory_safe", "safe", "sequential", "false", "0"}:
-            min_parallel_mb = _env_int("ASR_PARALLEL_MIN_VRAM_MB", 12 * 1024)
-            vram_mb = _cuda_vram_mb()
-            if not vram_mb:
-                logger.info("ASR parallelism limited to 1 worker (CUDA VRAM not detected).")
-            elif vram_mb < min_parallel_mb:
-                logger.info(
-                    "ASR parallelism limited to 1 worker (%d MB VRAM < %d MB threshold).",
-                    vram_mb,
-                    min_parallel_mb,
-                )
-            else:
-                worker_count = selected_count
-    return worker_count
+    if selected_count <= 1:
+        return 1
+    return _parallel_worker_count(selected_count)
 
 
 def should_clear_models_after_job() -> bool:

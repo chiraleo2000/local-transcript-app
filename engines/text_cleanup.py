@@ -9,10 +9,13 @@ _THAI_CHAR_RE = re.compile(r"[\u0E00-\u0E7F]")
 _LATIN_OR_DIGIT_RE = re.compile(r"[A-Za-z0-9]")
 
 # Frequent Thai ASR spelling variants (Typhoon/Whisper).
+_POOL_VILLA = "พูลวิลล่า"
+_WAVE_WIND = "คลื่นลม"
+_TWO_BEDROOM = "2 ห้องนอน"
 _THAI_ASR_VARIANTS: tuple[tuple[str, str], ...] = (
-    ("พูนวิลล่า", "พูลวิลล่า"),
-    ("ภูวิลล่า", "พูลวิลล่า"),
-    ("พูนวิลลา", "พูลวิลล่า"),
+    ("พูนวิลล่า", _POOL_VILLA),
+    ("ภูวิลล่า", _POOL_VILLA),
+    ("พูนวิลลา", _POOL_VILLA),
     ("เช็ก", "เช็ค"),
     ("list", "ลิสต์"),
     ("เลยเลย", "เลย"),
@@ -20,25 +23,38 @@ _THAI_ASR_VARIANTS: tuple[tuple[str, str], ...] = (
     ("ล่องแพ้เปียก", "ล่องแพเปียก"),
     ("ล่องแพ้", "ล่องแพ"),
     ("นอนแพ้", "นอนแพ"),
-    ("คลื่นลม", "คลื่นลม"),
-    ("เคลื่อนลม", "คลื่นลม"),
+    (_WAVE_WIND, _WAVE_WIND),
+    ("เคลื่อนลม", _WAVE_WIND),
     ("ผ่อนคล้าย", "ผ่อนคลาย"),
     ("เลิศ", "เริ่ด"),
     ("ส่วนตัวสุดสุด", "ส่วนตัวสุด ๆ"),
     ("หารสี่", "หาร 4"),
-    ("สองห้องนอน", "2 ห้องนอน"),
-    ("Pool Villa", "พูลวิลล่า"),
-    ("pool villa", "พูลวิลล่า"),
+    ("สองห้องนอน", _TWO_BEDROOM),
+    ("Pool Villa", _POOL_VILLA),
+    ("pool villa", _POOL_VILLA),
     ("แพร่ริมน้ำ", "แพริมน้ำ"),
     ("ช่องเทศกาล", "ช่วงเทศกาล"),
     ("บ้านพัก2", "บ้านพัก 2"),
     ("หาร 4ออก", "หาร 4 ออก"),
     ("สดสด", "สด ๆ"),
     ("บ้านหลังหนึ่ง", "บ้านหลังนึง"),
-    ("2 ห้องนอน", "2 ห้องนอน"),
+    (_TWO_BEDROOM, _TWO_BEDROOM),
     ("คอได้ฟิล", "พอได้ฟีล"),
     ("พอได้ฟิล", "พอได้ฟีล"),
 )
+
+# Prefer a single captured prefix run (non-capturing repeats) to avoid backtracking.
+_SPEAKER_LABEL_RE = re.compile(r"(\[SPEAKER_\d+\]:\s*)")
+
+
+def _clean_loose_prefixed_line(line: str) -> str:
+    """Clean body after optional bracket prefixes / speaker label (linear scan)."""
+    match = _SPEAKER_LABEL_RE.search(line)
+    if not match:
+        return clean_transcript_text(line)
+    prefix = line[: match.end()]
+    body = clean_transcript_text(line[match.end() :])
+    return f"{prefix}{body}" if body else prefix.rstrip()
 
 
 def fix_common_thai_asr_variants(text: str) -> str:
@@ -157,10 +173,7 @@ def _clean_single_transcript_line(line: str, ts_speaker_re: re.Pattern[str]) -> 
     match = ts_speaker_re.match(line)
     if match:
         return _format_prefixed_line(match)
-    match = re.match(r"^(\[[^\]]+\]\s*)*(\[SPEAKER_\d+\]:\s*)?(.*)$", line)
-    if match:
-        return _format_prefixed_line(match)
-    return clean_transcript_text(line)
+    return _clean_loose_prefixed_line(line)
 
 
 def clean_transcript_lines(text: str) -> str:
