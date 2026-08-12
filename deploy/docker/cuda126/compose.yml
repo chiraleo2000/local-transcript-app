@@ -5,6 +5,8 @@
 #
 # Shared diarization/ASR policy: deploy/docker/gpu-app.env
 
+name: local-transcript-app
+
 services:
   transcription:
     image: local-transcript-app:cuda126

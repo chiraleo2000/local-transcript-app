@@ -27,14 +27,14 @@ _PBKDF2_ITERS = 200_000
 
 
 def session_ttl_s() -> int:
-    """API/UI session lifetime (APP_SESSION_TTL_S, default 15 minutes)."""
+    """API/UI session lifetime (APP_SESSION_TTL_S, default 60 minutes)."""
     try:
-        return max(60, int(os.getenv("APP_SESSION_TTL_S", "900")))
+        return max(60, int(os.getenv("APP_SESSION_TTL_S", "3600")))
     except ValueError:
-        return 900
+        return 3600
 
 
-_TOKEN_TTL_S = 900  # overwritten at issue time via session_ttl_s()
+_TOKEN_TTL_S = 3600  # overwritten at issue time via session_ttl_s()
 
 
 @dataclass(frozen=True)

@@ -136,6 +136,7 @@ if ($Backend -eq "auto") {
 }
 
 $proxyOverride = Join-Path $RepoRoot "deploy\docker\compose.proxy-override.yml"
+$composeProject = "local-transcript-app"
 $stacks = @(
     "deploy/docker/latest/compose.yml",
     "deploy/docker/cuda126/compose.yml",
@@ -147,17 +148,17 @@ Write-Step "Stopping conflicting containers"
 $prevEap = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
 foreach ($f in $stacks) {
-    docker compose -f $f down 2>&1 | Out-Null
+    docker compose -p $composeProject -f $f down 2>&1 | Out-Null
 }
 if (Test-Path $proxyOverride) {
-    docker compose -f deploy/docker/latest/compose.yml -f $proxyOverride down 2>&1 | Out-Null
+    docker compose -p $composeProject -f deploy/docker/latest/compose.yml -f $proxyOverride down 2>&1 | Out-Null
 }
 $ErrorActionPreference = $prevEap
 
 if ($resolved -eq "gpu") {
     $composeFile = "deploy/docker/$CudaStack/compose.yml"
     if (-not (Test-Path $composeFile)) { throw "Missing $composeFile" }
-    $composeArgs = @("-f", $composeFile)
+    $composeArgs = @("-p", $composeProject, "-f", $composeFile)
     Write-Host "  stack file: $composeFile"
     if ($Loopback -or ((Get-EnvValue "DEPLOY_LOOPBACK") -eq "1")) {
         $composeArgs += @("-f", "deploy/docker/compose.proxy-override.yml")
@@ -166,7 +167,7 @@ if ($resolved -eq "gpu") {
     $url = if ($Loopback -or ((Get-EnvValue "DEPLOY_LOOPBACK") -eq "1")) { "http://127.0.0.1:7988" } else { "http://localhost:7988" }
     $name = "transcription-service"
 } else {
-    $composeArgs = @("-f", "deploy/docker/openvino/compose.yml")
+    $composeArgs = @("-p", $composeProject, "-f", "deploy/docker/openvino/compose.yml")
     $url = "http://localhost:7987"
     $name = "transcription-service-openvino"
 }

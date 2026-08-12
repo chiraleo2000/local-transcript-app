@@ -22,10 +22,10 @@ from backend.ui_session import (
 
 
 class TestSessionTtl(unittest.TestCase):
-    def test_default_15_minutes(self) -> None:
+    def test_default_60_minutes(self) -> None:
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("APP_SESSION_TTL_S", None)
-            self.assertEqual(session_ttl_s(), 900)
+            self.assertEqual(session_ttl_s(), 3600)
 
     def test_env_override(self) -> None:
         with patch.dict(os.environ, {"APP_SESSION_TTL_S": "120"}, clear=False):

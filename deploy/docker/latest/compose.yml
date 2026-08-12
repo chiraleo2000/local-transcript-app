@@ -1,9 +1,11 @@
-# NVIDIA GPU — latest
+# NVIDIA GPU — latest (CUDA 13.3)
 # From repo root:
 #   docker compose -f deploy/docker/latest/compose.yml up -d --build
 # UI: http://localhost:7988
 #
 # Shared diarization/ASR policy: deploy/docker/gpu-app.env
+
+name: local-transcript-app
 
 services:
   transcription:

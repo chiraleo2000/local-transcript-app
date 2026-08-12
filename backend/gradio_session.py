@@ -1,4 +1,4 @@
-"""Gradio UI session idle timeout (default 15 minutes)."""
+"""Gradio UI session idle timeout (default 60 minutes)."""
 
 from __future__ import annotations
 
@@ -15,11 +15,11 @@ logger = logging.getLogger(__name__)
 
 
 def session_ttl_s() -> int:
-    """Idle session lifetime in seconds (APP_SESSION_TTL_S, default 900 = 15 min)."""
+    """Idle session lifetime in seconds (APP_SESSION_TTL_S, default 3600 = 60 min)."""
     try:
-        return max(60, int(os.getenv("APP_SESSION_TTL_S", "900")))
+        return max(60, int(os.getenv("APP_SESSION_TTL_S", "3600")))
     except ValueError:
-        return 900
+        return 3600
 
 
 def _cookie_names(app: Any) -> tuple[str, str]:

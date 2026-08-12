@@ -1,8 +1,21 @@
 # Local Transcript App — release notes
 
-**Current version: 1.2.11**
+**Current version: 1.2.12**
 
 See [README.md](README.md) for setup. Docker stacks live under [`deploy/docker/`](deploy/docker/).
+
+---
+
+## v1.2.12
+
+### Summary
+
+Extend idle login timeout to 60 minutes and name the Docker Compose project `local-transcript-app` (replacing the `latest_default` network label).
+
+### Session / deploy
+
+- `APP_SESSION_TTL_S=3600` in production env and code defaults
+- Compose `name: local-transcript-app` on all stacks; deploy script passes `-p local-transcript-app`
 
 ---
 
