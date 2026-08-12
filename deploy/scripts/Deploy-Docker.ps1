@@ -153,6 +153,11 @@ foreach ($f in $stacks) {
 if (Test-Path $proxyOverride) {
     docker compose -p $composeProject -f deploy/docker/latest/compose.yml -f $proxyOverride down 2>&1 | Out-Null
 }
+# Pre-v1.2.12 stacks used project name "latest" and fixed container names.
+docker compose -f deploy/docker/latest/compose.yml down 2>&1 | Out-Null
+foreach ($legacyName in @("transcription-service", "transcription-service-openvino")) {
+    docker rm -f $legacyName 2>&1 | Out-Null
+}
 $ErrorActionPreference = $prevEap
 
 if ($resolved -eq "gpu") {
