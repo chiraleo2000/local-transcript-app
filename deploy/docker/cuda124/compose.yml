@@ -25,6 +25,8 @@ services:
       - path: ../../../.env
         required: false
       - ../gpu-app.env
+      # Tesla P4 / Pascal overlay is auto-applied at runtime (backend/gpu_arch.py).
+      # Optional: ../gpu-p4.env if you need to force the profile without GPU detection.
     environment:
       - GRADIO_ROOT_PATH=${GRADIO_ROOT_PATH:-}
       - GRADIO_MAX_FILE_SIZE=${GRADIO_MAX_FILE_SIZE:-512mb}

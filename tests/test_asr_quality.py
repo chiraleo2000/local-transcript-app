@@ -26,23 +26,27 @@ class TestClampCudaMemoryFraction:
 
     def test_defaults_when_unset(self, monkeypatch):
         monkeypatch.delenv("ASR_CUDA_MEMORY_FRACTION", raising=False)
+        monkeypatch.delenv("ASR_CUDA_MEMORY_FRACTION_MAX", raising=False)
         forced: dict[str, str] = {}
         asr_quality._clamp_cuda_memory_fraction(forced)
         assert forced["ASR_CUDA_MEMORY_FRACTION"] == "0.92"
 
     def test_defaults_on_invalid_value(self, monkeypatch):
+        monkeypatch.delenv("ASR_CUDA_MEMORY_FRACTION_MAX", raising=False)
         monkeypatch.setenv("ASR_CUDA_MEMORY_FRACTION", "not-a-number")
         forced: dict[str, str] = {}
         asr_quality._clamp_cuda_memory_fraction(forced)
         assert forced["ASR_CUDA_MEMORY_FRACTION"] == "0.92"
 
     def test_clamps_values_above_cap(self, monkeypatch):
+        monkeypatch.delenv("ASR_CUDA_MEMORY_FRACTION_MAX", raising=False)
         monkeypatch.setenv("ASR_CUDA_MEMORY_FRACTION", "0.95")
         forced: dict[str, str] = {}
         asr_quality._clamp_cuda_memory_fraction(forced)
         assert forced["ASR_CUDA_MEMORY_FRACTION"] == "0.92"
 
     def test_leaves_value_at_cap_untouched(self, monkeypatch):
+        monkeypatch.delenv("ASR_CUDA_MEMORY_FRACTION_MAX", raising=False)
         monkeypatch.setenv("ASR_CUDA_MEMORY_FRACTION", "0.92")
         forced: dict[str, str] = {}
         asr_quality._clamp_cuda_memory_fraction(forced)

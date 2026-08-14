@@ -16,6 +16,33 @@ _STRIP_FROM_GENERATE_KWARGS = frozenset({"condition_on_previous_text"})
 WHISPER_MAX_CHUNK_S = 30
 
 
+def resolve_asr_cuda_dtype(torch_module):
+    """Select CUDA dtype: FP32 on Tesla P4 / Pascal, FP16 on Ampere+ (RTX 4060)."""
+    raw = os.getenv("ASR_CUDA_DTYPE", "auto").strip().lower()
+    if raw in {"float32", "fp32", "32"}:
+        return torch_module.float32
+    if raw in {"bfloat16", "bf16"}:
+        return getattr(torch_module, "bfloat16", torch_module.float16)
+    if raw in {"float16", "fp16", "16", "half"}:
+        return torch_module.float16
+    try:
+        from backend.gpu_arch import prefers_float32_compute
+
+        if prefers_float32_compute():
+            return torch_module.float32
+    except ImportError:
+        pass
+    return torch_module.float16
+
+
+def asr_cuda_dtypes_to_try(torch_module) -> tuple:
+    """Primary CUDA dtype, then FP16 if FP32 does not fit in 8 GB."""
+    primary = resolve_asr_cuda_dtype(torch_module)
+    if primary == torch_module.float32:
+        return (torch_module.float32, torch_module.float16)
+    return (primary,)
+
+
 def whisper_max_asr_turn_body_s() -> float:
     """Max diar turn length before ASR_TURN_PAD_S exceeds the encoder window."""
     pad = float(os.getenv("ASR_TURN_PAD_S", "0.25"))

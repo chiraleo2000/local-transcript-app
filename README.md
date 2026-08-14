@@ -3,7 +3,7 @@
 GPU-accelerated local audio/video transcription with speaker diarization.  
 No cloud APIs. No telemetry. All processing stays on your machine.
 
-**Version 1.2.12** — see [RELEASE_NOTES.md](RELEASE_NOTES.md)
+**Version 1.2.13** — see [RELEASE_NOTES.md](RELEASE_NOTES.md)
 
 ---
 
@@ -575,6 +575,8 @@ The app detects available resources and chooses the best local backend.
 **Minimum:** `MIN_CPU_THREADS=4`, `MIN_SYSTEM_RAM_MB=8192`. Hosts below that still run with a warning.
 
 The CUDA runtime uses a strict 8 GB-class policy. On GPUs up to `ASR_8GB_CLASS_MAX_MB` (default 9000 MB, covering RTX 4060 Laptop cards that report about 8187 MB), the app keeps configured ASR models resident for reuse, uses sequential ASR unless `ASR_ALLOW_8GB_PARALLEL=true`, and stages diarization vs ASR on 8 GB cards.
+
+**Tesla P4 / Pascal:** CUDA 13 cannot run compute 6.1. Deploy with `Deploy-Docker.bat gpu -CudaStack cuda124 -Build` (auto-selected when `nvidia-smi` shows P4). Runtime applies a faster profile (`deploy/docker/gpu-p4.env`: FP32, 2 beams, shorter temperature ladder) so jobs stay closer to this 4060 machine. RTX 4060 is unchanged.
 
 ## Windows Quick Start For Normal Users
 

@@ -383,4 +383,7 @@ def apply_quality_profile() -> str:
         f" applied: {', '.join(applied)}" if applied else " (no overrides; env already set)",
     )
     apply_low_vram_overrides()
+    from backend.gpu_arch import apply_pascal_p4_overrides
+
+    apply_pascal_p4_overrides()
     return profile

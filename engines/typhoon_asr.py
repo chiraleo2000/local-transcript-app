@@ -204,22 +204,36 @@ def _fmt_ts(seconds: float) -> str:
 
 def _load_cuda_pipeline_with_retry(hf_token: str | None):
     """Build CUDA pipeline; recover and retry once on cudaErrorUnknown."""
-    from backend.vram_state import recover_cuda
-    from engines.whisper_runtime import is_cuda_recoverable
+    import torch
 
-    for attempt in range(2):
-        try:
-            return _load_cuda_pipeline(hf_token)
-        except Exception as exc:  # pylint: disable=broad-exception-caught
-            if attempt == 0 and is_cuda_recoverable(exc):
-                logger.warning(
-                    "Typhoon CUDA load failed (%s); recovering and retrying.",
-                    exc,
-                )
-                recover_cuda()
-                continue
-            raise
-    raise RuntimeError("Typhoon CUDA load failed after retry")
+    from backend.vram_state import recover_cuda
+    from engines.whisper_runtime import is_cuda_oom, is_cuda_recoverable
+    from engines.whisper_utils import asr_cuda_dtypes_to_try
+
+    last_exc: Exception | None = None
+    for dtype in asr_cuda_dtypes_to_try(torch):
+        for attempt in range(2):
+            try:
+                return _load_cuda_pipeline(hf_token, dtype=dtype)
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                last_exc = exc
+                oom_fallback = is_cuda_oom(exc) and dtype != torch.float16
+                if oom_fallback:
+                    logger.warning(
+                        "Typhoon CUDA OOM with %s; falling back to float16.",
+                        dtype,
+                    )
+                    recover_cuda()
+                    break
+                if attempt == 0 and is_cuda_recoverable(exc):
+                    logger.warning(
+                        "Typhoon CUDA load failed (%s); recovering and retrying.",
+                        exc,
+                    )
+                    recover_cuda()
+                    continue
+                raise
+    raise last_exc or RuntimeError("Typhoon CUDA load failed after retry")
 
 
 def _reload_cuda_pipeline():
@@ -236,19 +250,23 @@ def _reload_cuda_pipeline():
     return pipe
 
 
-def _load_cuda_pipeline(hf_token: str | None):
-    """Build Typhoon pipeline on NVIDIA CUDA (float16)."""
+def _load_cuda_pipeline(hf_token: str | None, dtype=None):
+    """Build Typhoon pipeline on NVIDIA CUDA (FP32 on P4, FP16 on Ampere+)."""
     import torch
     from transformers.models.auto.modeling_auto import AutoModelForSpeechSeq2Seq
     from transformers import pipeline as hf_pipeline
     from transformers.models.whisper.processing_whisper import WhisperProcessor
 
+    from engines.whisper_utils import resolve_asr_cuda_dtype
+
+    if dtype is None:
+        dtype = resolve_asr_cuda_dtype(torch)
     _configure_torch_runtime()
-    logger.info("Using CUDA (float16) backend for Typhoon Whisper.")
+    logger.info("Using CUDA (%s) backend for Typhoon Whisper.", dtype)
     checkpoint = resolve_pretrained_checkpoint(MODEL_ID)
     model = AutoModelForSpeechSeq2Seq.from_pretrained(
         checkpoint,
-        **_model_load_kwargs(hf_token, torch.float16),
+        **_model_load_kwargs(hf_token, dtype),
     )
     # Fix meta tensors left over from sharded checkpoint loading
     meta_params = [

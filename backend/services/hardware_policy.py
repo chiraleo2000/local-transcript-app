@@ -69,11 +69,17 @@ def _check_torch() -> dict:
         "cuda_device_count": 0,
         "cuda_device_name": "",
         "cuda_vram_mb": 0,
+        "cuda_capability_major": 0,
+        "cuda_capability_minor": 0,
+        "cuda_is_pascal": False,
+        "cuda_is_tesla_p4": False,
         "rocm": False,
         "rocm_version": None,
     }
     try:
         import torch  # type: ignore[import-not-found]
+
+        from backend.gpu_arch import is_pascal_speed_gpu, is_tesla_p4_name, probe_cuda_device
 
         result["torch_version"] = torch.__version__
         # ROCm PyTorch exposes the same torch.cuda.* API but reports torch.version.hip.
@@ -84,9 +90,16 @@ def _check_torch() -> dict:
         if torch.cuda.is_available():
             result["cuda"] = not result["rocm"]  # NVIDIA CUDA only when HIP absent
             result["cuda_device_count"] = torch.cuda.device_count()
-            result["cuda_device_name"] = torch.cuda.get_device_name(0)
-            total = torch.cuda.get_device_properties(0).total_memory
-            result["cuda_vram_mb"] = int(total // (1024 * 1024))
+            gpu = probe_cuda_device()
+            result["cuda_device_name"] = gpu["cuda_device_name"]
+            result["cuda_vram_mb"] = gpu["cuda_vram_mb"]
+            result["cuda_capability_major"] = gpu["cuda_capability_major"]
+            result["cuda_capability_minor"] = gpu["cuda_capability_minor"]
+            result["cuda_is_tesla_p4"] = is_tesla_p4_name(gpu["cuda_device_name"])
+            result["cuda_is_pascal"] = is_pascal_speed_gpu(
+                gpu["cuda_device_name"],
+                gpu["cuda_capability_major"],
+            )
     except (ImportError, RuntimeError, OSError, AttributeError) as exc:
         logger.debug("Torch/CUDA probe failed: %s", exc)
     return result
@@ -419,6 +432,15 @@ def _vram_policy_lines(hw: dict) -> list[str]:
             "- **VRAM policy:** strict low-VRAM mode; "
             "preloaded ASR models retained for reuse, "
             "CPU diarization by default"
+        )
+    major = int(hw.get("cuda_capability_major") or 0)
+    minor = int(hw.get("cuda_capability_minor") or 0)
+    if major:
+        lines.append(f"- **CUDA capability:** {major}.{minor}")
+    if hw.get("cuda_is_pascal") or hw.get("cuda_is_tesla_p4"):
+        lines.append(
+            "- **GPU profile:** Tesla P4 / Pascal speed path "
+            "(CUDA 12.4, FP32, 2-beam decode) so jobs stay closer to RTX 4060 wall time"
         )
     return lines
 

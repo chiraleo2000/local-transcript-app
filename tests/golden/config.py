@@ -24,6 +24,7 @@ GOLDEN_ACCURACY_ENV: dict[str, str] = {
     "GOLDEN_CHECK_PERFORMANCE": "1",
     "GOLDEN_REFERENCE_DIAR": "0",
     "ASR_ADAPTIVE_PERFORMANCE": "false",
+    "ASR_GPU_PROFILE": "off",
     "ASR_QUALITY_PROFILE": "high",
     "DIARIZATION_ACCURACY_MODE": "true",
     "ASR_TURN_GUIDED": "true",

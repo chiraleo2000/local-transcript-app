@@ -53,6 +53,19 @@ function Test-DockerReady {
     } catch { return $false }
 }
 
+function Get-NvidiaGpuHint {
+    try {
+        $line = (nvidia-smi --query-gpu=name,compute_cap --format=csv,noheader 2>$null | Select-Object -First 1)
+        if ($line) { return [string]$line }
+    } catch { }
+    return ""
+}
+
+function Test-IsPascalOrP4([string]$Hint) {
+    if (-not $Hint) { return $false }
+    return [bool]($Hint -match 'Tesla P4|Quadro P4|P40|P100|\bP4\b' -or $Hint -match '\b6\.[0-2]\b')
+}
+
 function Test-NvidiaDocker {
     foreach ($img in @(
             "nvidia/cuda:12.4.1-base-ubuntu22.04",
@@ -103,6 +116,15 @@ if (-not $Backend) {
 if (-not $CudaStack) {
     $fromCuda = Get-EnvValue "DEPLOY_CUDA_STACK"
     $CudaStack = if ($fromCuda -in @("latest", "cuda126", "cuda124")) { $fromCuda } else { "latest" }
+}
+
+$gpuHint = Get-NvidiaGpuHint
+if (Test-IsPascalOrP4 $gpuHint) {
+    if ($CudaStack -ne "cuda124") {
+        Write-Host "  GPU '$gpuHint' is Tesla P4 / Pascal (sm_61)."
+        Write-Host "  CUDA 13 / 12.6 images drop Pascal kernels — using cuda124."
+        $CudaStack = "cuda124"
+    }
 }
 
 Write-Step "Docker deploy backend=$Backend cuda=$CudaStack"

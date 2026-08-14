@@ -1,8 +1,22 @@
 # Local Transcript App — release notes
 
-**Current version: 1.2.12**
+**Current version: 1.2.13**
 
 See [README.md](README.md) for setup. Docker stacks live under [`deploy/docker/`](deploy/docker/).
+
+---
+
+## v1.2.13
+
+### Summary
+
+Tesla P4 / Pascal path: keep RTX 4060 accuracy knobs on Ampere+, but auto-switch P4 to CUDA 12.4 + FP32 + 2-beam decode so jobs do not take many times longer.
+
+### GPU / deploy
+
+- Detect Tesla P4 (compute 6.1) and apply `deploy/docker/gpu-p4.env` knobs at runtime
+- `Deploy-Docker.ps1` selects the `cuda124` stack (CUDA 13 dropped Pascal kernels)
+- RTX 4060 is unchanged (`ASR_GPU_PROFILE=auto`)
 
 ---
 

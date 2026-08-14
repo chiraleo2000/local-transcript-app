@@ -27,7 +27,12 @@ class TestPerformanceTarget(unittest.TestCase):
 
     def test_ninety_minute_audio_two_thirds_realtime(self) -> None:
         # 90 min / 1.5 = 60 min wall
-        self.assertAlmostEqual(performance_target_seconds(90 * 60), 60 * 60)
+        with patch.dict(
+            os.environ,
+            {"ASR_TARGET_RT_RATIO_LONG": "1.5", "ASR_TARGET_LONG_MAX_S": "0"},
+            clear=False,
+        ):
+            self.assertAlmostEqual(performance_target_seconds(90 * 60), 60 * 60)
 
 
 class TestAdaptiveBeams(unittest.TestCase):
