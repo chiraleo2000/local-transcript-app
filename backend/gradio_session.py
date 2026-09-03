@@ -286,24 +286,45 @@ class BlankLoginFormMiddleware(BaseHTTPMiddleware):
         content_type = (response.headers.get("content-type") or "").lower()
         if "text/html" not in content_type:
             return response
-        # Only rewrite when the response body is available as bytes.
+
         body = getattr(response, "body", None)
-        if not isinstance(body, (bytes, bytearray)) or b"</body>" not in body.lower():
-            return response
-        # Avoid rewriting large authenticated app shells repeatedly when already blanked.
-        if b"blankLoginFields" in body:
-            return response
+        if not isinstance(body, (bytes, bytearray)):
+            body_chunks: list[bytes] = []
+            body_iterator = getattr(response, "body_iterator", None)
+            if body_iterator is None:
+                return response
+            async for chunk in body_iterator:
+                body_chunks.append(chunk if isinstance(chunk, bytes) else bytes(chunk))
+            body = b"".join(body_chunks)
+
+        if not body or b"blankLoginFields" in body:
+            return Response(
+                content=bytes(body or b""),
+                status_code=response.status_code,
+                headers={
+                    k: v
+                    for k, v in response.headers.items()
+                    if k.lower() not in {"content-length", "content-encoding"}
+                },
+                media_type=response.media_type,
+            ) if body is not None else response
+
         lower = body.lower()
-        looks_like_login = (
-            b'name="username"' in lower
-            or b'name="password"' in lower
-            or b"login" in lower
-        ) and b"gradio" in lower
-        if not looks_like_login:
-            return response
+        # Gradio login is a SPA shell; fields appear after JS mount.
+        looks_like_gradio = b"gradio_config" in lower or b"__gradio_mode__" in lower
+        if not looks_like_gradio or b"</body>" not in lower:
+            return Response(
+                content=bytes(body),
+                status_code=response.status_code,
+                headers={
+                    k: v
+                    for k, v in response.headers.items()
+                    if k.lower() not in {"content-length", "content-encoding"}
+                },
+                media_type=response.media_type,
+            )
+
         idx = lower.rfind(b"</body>")
-        if idx < 0:
-            return response
         new_body = body[:idx] + _BLANK_LOGIN_SCRIPT + body[idx:]
         headers = {
             k: v

@@ -25,8 +25,12 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && python3 -m pip install --no-cache-dir \
         --extra-index-url https://download.pytorch.org/whl/cu124 \
         torch==2.6.0+cu124 torchvision==0.21.0+cu124 torchaudio==2.6.0+cu124 \
+    && printf 'torch==2.6.0+cu124\ntorchvision==0.21.0+cu124\ntorchaudio==2.6.0+cu124\n' > /tmp/torch-pin.txt \
+    && python3 -m pip install --no-cache-dir \
+        --extra-index-url https://download.pytorch.org/whl/cu124 \
+        -c /tmp/torch-pin.txt \
+        -r requirements.txt \
     && python3 -m pip install --no-cache-dir --no-deps pyannote.audio==4.0.4 \
-    && python3 -m pip install --no-cache-dir -r requirements.txt \
     && (python3 -m pip uninstall -y torchcodec || true) \
     && python3 -c "import site,os; \
 stub=[os.path.join(p,'torchcodec-0.0.1.dist-info') for p in site.getsitepackages() if os.path.isdir(p)]; \

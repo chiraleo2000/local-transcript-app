@@ -1,8 +1,7 @@
-# CUDA 12.4 minimum (PyTorch cu124)
+# CUDA 12.4 minimum (PyTorch cu124) — Tesla P4 / Pascal
+# Torch + pyannote are installed in the Dockerfile (pyannote --no-deps)
+# so pip does not try to resolve torch>=2.8 for pyannote.audio 4.0.4.
 --extra-index-url https://download.pytorch.org/whl/cu124
-torch==2.6.0+cu124
-torchvision==0.21.0+cu124
-torchaudio==2.6.0+cu124
 accelerate>=1.6.0
 openvino==2026.1.0
 optimum[openvino]>=1.17.0
@@ -12,7 +11,25 @@ python-multipart>=0.0.9
 gradio==4.44.1
 gradio_client==1.3.0
 transformers>=4.57.3,<5
-pyannote.audio==4.0.4
+# pyannote runtime deps (package itself installed with --no-deps in Dockerfile)
+asteroid-filterbanks>=0.4.0
+einops>=0.8.1
+lightning>=2.4
+opentelemetry-api>=1.34.0
+opentelemetry-exporter-otlp>=1.34.0
+opentelemetry-sdk>=1.34.0
+pyannote-core>=6.0.1
+pyannote-database>=6.1.1
+pyannote-metrics>=4.0.0
+pyannote-pipeline>=4.0.0
+pyannoteai-sdk>=0.3.0
+pytorch-metric-learning>=2.8.1
+rich>=13.9.4
+safetensors>=0.5.2
+torch-audiomentations>=0.12.0
+# CT2 path for Tesla P4 (ASR_USE_FASTER_WHISPER)
+faster-whisper>=1.1.0
+ctranslate2>=4.5.0
 pedalboard
 noisereduce>=3.0
 librosa>=0.11.0
