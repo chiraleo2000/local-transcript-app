@@ -125,6 +125,7 @@ from backend.auth_users import (
 from backend.client_identity import client_ip_from_request
 from backend.gradio_session import (
     force_logout,
+    install_blank_login_form,
     install_gradio_session_timeout,
     session_ttl_s as gradio_session_ttl_s,
 )
@@ -132,6 +133,10 @@ from backend.job_api import build_api_routes
 from backend.job_cancel import cancel_tab_job
 from backend.job_queue import get_job_progress as get_api_job_progress
 from backend.job_status import job_is_in_flight, job_status_norm
+from backend.session_recovery import (
+    collect_recovery_job_candidates,
+    job_has_terminal_results,
+)
 from backend.pipeline import JobMeta, active_job_count, run_transcription_job
 from backend.progress import JobProgress, get_job_progress
 from backend.ui_session import (
@@ -165,6 +170,7 @@ from backend.storage import (
     ensure_app_dirs,
     list_jobs,
     load_job,
+    new_job_id,
 )
 from backend.services.hardware_policy import detect_hardware, hardware_summary
 from backend.ui_limits import (
@@ -1097,24 +1103,6 @@ def _stream_worker_progress(
     )
 
 
-def _append_tab_job_id(
-    row: dict,
-    *,
-    candidates: list[str],
-    completed: list[str],
-) -> None:
-    jid = str(row.get("job_id") or "")
-    if not jid:
-        return
-    if _job_is_in_flight(row) or _job_status_norm(row) == "running":
-        if jid not in candidates:
-            candidates.append(jid)
-        return
-    if _job_status_norm(row) == "completed" or row.get("results"):
-        if jid not in completed:
-            completed.append(jid)
-
-
 def _collect_tab_job_candidates(
     tab_id: str,
     runtime: dict | None,
@@ -1123,21 +1111,17 @@ def _collect_tab_job_candidates(
     user_id: int | None = None,
 ) -> tuple[list[str], list[str]]:
     """Return (in-flight candidates, completed ids) for a browser tab."""
-    candidates: list[str] = []
-    completed: list[str] = []
-    if runtime and runtime.get("active_job_id"):
-        candidates.append(str(runtime["active_job_id"]))
-    if runtime and runtime.get("last_completed_job_id"):
-        completed.append(str(runtime["last_completed_job_id"]))
-    for row in list_jobs(50, username=username, user_id=user_id):
-        if row.get("tab_id") != tab_id:
-            continue
-        _append_tab_job_id(row, candidates=candidates, completed=completed)
-    return candidates, completed
+    return collect_recovery_job_candidates(
+        tab_id,
+        runtime,
+        username=username,
+        user_id=user_id,
+        recent_completed_within_s=gradio_session_ttl_s(),
+    )
 
 
 def _job_has_terminal_results(job: dict) -> bool:
-    return _job_status_norm(job) == "completed" or bool(job.get("results"))
+    return job_has_terminal_results(job)
 
 
 def _yield_terminal_recovered_job(
@@ -1273,6 +1257,7 @@ def _transcription_worker_target(ctx: dict) -> None:
             diarize_kwargs=ctx["diarize_kwargs"],
             cancel_event=ctx["cancel_event"],
             progress=ctx["tracker"],
+            job_id=ctx["job_id"],
             meta=JobMeta(
                 tab_id=ctx["tid"],
                 display_name=ctx["display_name"],
@@ -1359,8 +1344,10 @@ def transcribe(*inputs, request: gr.Request | None = None):
 
     holder: dict = {}
     error_holder: dict = {}
+    job_id = new_job_id()
     worker_ctx = {
         "runtime": runtime,
+        "job_id": job_id,
         "media_path": req.media_path,
         "selected": selected,
         "language": req.language,
@@ -1382,13 +1369,14 @@ def transcribe(*inputs, request: gr.Request | None = None):
     }
 
     tracker.reset()
-    tracker.start()
+    tracker.start(job_id)
     worker = threading.Thread(
         target=_transcription_worker_target,
         args=(worker_ctx,),
         daemon=True,
+        name=f"ui-job-{job_id}",
     )
-    set_active_job(runtime, "", worker)
+    set_active_job(runtime, job_id, worker)
     worker.start()
 
     yield _running_transcript_outputs(tracker.snapshot(), engines_label, no_dl)
@@ -1557,7 +1545,7 @@ def register_account(username: str, password: str) -> str:
 
 
 def recover_session(tab_id: str, request: gr.Request | None = None):
-    """On page load, reattach to an in-flight worker or poll a running manifest."""
+    """On page load, reattach to an in-flight worker or poll a durable manifest."""
     runtime, tid = resolve_runtime(tab_id)
     tracker = runtime["progress"]
     worker = runtime.get("worker")
@@ -1578,6 +1566,7 @@ def recover_session(tab_id: str, request: gr.Request | None = None):
         )
         return
 
+    # Worker gone (refresh / disconnect / new tab) — recover from disk by tab or account.
     yield from _recover_manifest_or_idle(
         tid,
         tracker,
@@ -1915,12 +1904,12 @@ def build_ui() -> gr.Blocks:
 
         with gr.Accordion("Invite another user", open=False):
             gr.Markdown(
-                "Create an extra account (or send others to the public page "
-                "**[/register](/register)** before login). Same store as "
+                "Create an extra account below (or send others to the public "
+                "`/register` page before login). Same store as "
                 "`POST /api/auth/register`."
             )
-            reg_user = gr.Textbox(label="New username", max_lines=1)
-            reg_pass = gr.Textbox(label="Password", type="password", max_lines=1)
+            reg_user = gr.Textbox(label="New username", max_lines=1, value="")
+            reg_pass = gr.Textbox(label="Password", type="password", max_lines=1, value="")
             reg_btn = gr.Button("Create account")
             reg_status = gr.Markdown("")
             reg_btn.click(  # pylint: disable=no-member
@@ -2139,6 +2128,7 @@ def _mount_custom_routes(app) -> None:
     app.routes.insert(0, Route("/logout", force_logout, methods=["GET"]))
     app.routes.insert(0, Route("/logout/", force_logout, methods=["GET"]))
     install_gradio_session_timeout(app)
+    install_blank_login_form(app)
     app._lta_routes_mounted = True  # type: ignore[attr-defined]
 
 
@@ -2204,10 +2194,18 @@ def main() -> None:
         ttl_min = max(1, int(round(session_ttl_s() / 60)))
         launch_kwargs["auth"] = gradio_auth_credentials
         launch_kwargs["auth_message"] = (
-            f"Sign in to continue. Idle sessions expire after <b>{ttl_min} minutes</b> "
+            f"Sign in with your account. Idle sessions expire after <b>{ttl_min} minutes</b> "
             "(kept alive while this tab is open and during active transcriptions). "
-            "Finished transcripts stay under <b>Previous transcripts</b> after re-login. "
-            'New user? <a href="/register" target="_self">Create an account</a>.'
+            "Finished transcripts stay under <b>Previous transcripts</b> after re-login."
+            '<div style="margin-top:14px">'
+            '<p style="margin:0 0 8px 0">No account yet? (blank form — no default username)</p>'
+            '<form action="/register" method="get" style="display:inline;margin:0">'
+            '<button type="submit" '
+            'style="display:inline-block;padding:8px 16px;background:#2563eb;color:#fff;'
+            "border:none;border-radius:6px;font-weight:600;font-size:14px;cursor:pointer;"
+            '">Create account</button>'
+            "</form>"
+            "</div>"
         )
         logger.info(
             "Gradio auth enabled (APP_AUTH_ENABLED); idle timeout=%ss.",

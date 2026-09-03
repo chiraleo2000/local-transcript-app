@@ -195,6 +195,10 @@ def _cap_cuda_batch_in_forced(
     if co_resident or multi_pass_diar:
         forced.update(_sequential_staging_batch_env(co_resident, multi_pass_diar=multi_pass_diar))
         return
+    if _env_bool("ASR_USE_FASTER_WHISPER", False):
+        # CT2 int8 uses far less VRAM than PyTorch; honor compose batch caps.
+        forced.update(_sequential_staging_batch_env(co_resident, multi_pass_diar=False))
+        return
     # 8 GB sequential staging: one utterance at a time — batch>1 OOMs with beams+Typhoon.
     forced.update({
         "ASR_8GB_MAX_BATCH_SIZE": "1",

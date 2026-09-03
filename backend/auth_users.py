@@ -106,7 +106,7 @@ def _verify_password(password: str, encoded: str) -> bool:
 
 
 def init_user_db() -> None:
-    """Create schema and seed the bootstrap admin user when missing."""
+    """Create schema and optionally seed a bootstrap user when env is set."""
     with _DB_LOCK:
         conn = _connect()
         try:
@@ -128,9 +128,20 @@ def init_user_db() -> None:
 
 
 def _seed_user_unlocked(conn: sqlite3.Connection) -> None:
-    seed_user = os.getenv("APP_SEED_USER", "chira").strip() or "chira"
-    # Empty APP_SEED_PASSWORD= in dotenv must not create an empty-password user.
-    seed_password = (os.getenv("APP_SEED_PASSWORD") or "").strip() or "leo2569"
+    """Seed only when both APP_SEED_USER and APP_SEED_PASSWORD are set.
+
+    Fresh installs start with an empty user table so operators create accounts via
+    /register (no hardcoded default username/password).
+    """
+    seed_user = (os.getenv("APP_SEED_USER") or "").strip()
+    seed_password = (os.getenv("APP_SEED_PASSWORD") or "").strip()
+    if not seed_user and not seed_password:
+        return
+    if not seed_user or not seed_password:
+        logger.warning(
+            "Skipping seed user: set both APP_SEED_USER and APP_SEED_PASSWORD, or neither."
+        )
+        return
     if not _USERNAME_RE.match(seed_user):
         logger.warning("Invalid APP_SEED_USER=%r; skipping seed.", seed_user)
         return

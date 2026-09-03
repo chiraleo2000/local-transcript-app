@@ -1,4 +1,4 @@
-"""Shared Whisper ASR runtime: OOM retry, long-form windowing, transcription."""
+﻿"""Shared Whisper ASR runtime: OOM retry, long-form windowing, transcription."""
 
 from __future__ import annotations
 
@@ -147,7 +147,7 @@ def _vram_batch_boost(batch: int, window_duration_s: float = 0.0) -> int:
         snap = snapshot()
         max_8gb = max(1, _env_int("ASR_8GB_MAX_BATCH_SIZE", 1))
         target = min(max_8gb, max(batch, _env_int("ASR_CUDA_BATCH_SIZE", max_8gb)))
-        # After Whisper-large loads on 8 GB, ~1.5–2.5 GB free is normal; 5000 MB
+        # After Whisper-large loads on 8 GB, ~1.5ΓÇô2.5 GB free is normal; 5000 MB
         # was unreachable so batch never scaled above 1.
         min_free = _env_int("ASR_BATCH_MIN_FREE_MB", 1200)
         free_mb = snap.get("free_mb", 0)
@@ -161,7 +161,7 @@ def _vram_batch_boost(batch: int, window_duration_s: float = 0.0) -> int:
 
 
 def _maybe_teardown_between_windows(runtime: WhisperRuntime, window_index: int) -> None:
-    """Avoid clearing CUDA cache every window — kills GPU throughput."""
+    """Avoid clearing CUDA cache every window ΓÇö kills GPU throughput."""
     try:
         from backend.vram_state import snapshot, teardown
 
@@ -477,7 +477,7 @@ def run_long_form_asr_from_path(
     window_progress=None,
     diarization_active: bool = False,
 ) -> dict:
-    """Stream overlapped windows from disk — never load the full file into RAM."""
+    """Stream overlapped windows from disk ΓÇö never load the full file into RAM."""
     from engines.audio_io import count_audio_windows, iter_audio_windows_from_path
     from engines.timestamps import merge_window_results
     from backend import vram_state
@@ -580,7 +580,7 @@ def format_turn_guided_transcript(chunks: list[dict]) -> str:
         ts = chunk.get("timestamp") or (None, None)
         start, end = ts if ts else (0.0, 0.0)
         speaker = chunk.get("speaker") or "SPEAKER_01"
-        lines.append(f"[{_fmt_ts(start)} → {_fmt_ts(end)}] [{speaker}]: {text}")
+        lines.append(f"[{_fmt_ts(start)} ΓåÆ {_fmt_ts(end)}] [{speaker}]: {text}")
     if not lines:
         return _NO_SPEECH_MSG
     return clean_transcript_lines("\n".join(lines))
@@ -818,7 +818,7 @@ def _retry_turn_without_hallucination(params: _TurnDecodeParams) -> str | None:
 
 def _strip_leading_filler_bleed(text: str) -> str:
     """Drop short ASR bleed words duplicated from the prior turn boundary."""
-    for prefix in ("สวย ด้วย", "ด้วย", "ครับ", "นะครับ"):
+    for prefix in ("α╕¬α╕ºα╕ó α╕öα╣ëα╕ºα╕ó", "α╕öα╣ëα╕ºα╕ó", "α╕äα╕úα╕▒α╕Ü", "α╕Öα╕░α╕äα╕úα╕▒α╕Ü"):
         if text.startswith(prefix + " "):
             return text[len(prefix) + 1:].strip()
         if text == prefix:
@@ -1063,6 +1063,207 @@ def _merge_consecutive_speaker_chunks(chunks: list[dict]) -> list[dict]:
     return merged
 
 
+def _ct2_turn_batch_size(pipe: Any) -> int:
+    """How many diarization turns to encode together on CT2 (1 = serial)."""
+    supports = getattr(pipe, "supports_turn_batch", None)
+    if not callable(supports) or not supports():
+        return 1
+    if not hasattr(pipe, "transcribe_batch"):
+        return 1
+    configured = _env_int("ASR_TURN_BATCH_SIZE", 0)
+    if configured > 0:
+        return max(1, configured)
+    return max(1, _env_int("ASR_CUDA_BATCH_SIZE", 1))
+
+
+def _prepare_turn_window(
+    turn: dict,
+    index: int,
+    *,
+    runtime: WhisperRuntime,
+    audio_duration_s: float,
+) -> dict | None:
+    """Return slice metadata for a turn, or None when the turn should be skipped."""
+    dur = turn["end"] - turn["start"]
+    if dur < _env_float("ASR_TURN_GUIDED_MIN_TURN_S", 0.4):
+        return None
+    slice_start, slice_end, turn_start, turn_end = _turn_audio_window(
+        turn, audio_duration_s,
+    )
+    slice_dur = slice_end - slice_start
+    if slice_dur < _env_float("ASR_TURN_GUIDED_MIN_TURN_S", 0.4):
+        return None
+    from engines.whisper_utils import WHISPER_MAX_CHUNK_S
+
+    if slice_dur > WHISPER_MAX_CHUNK_S:
+        logger.warning(
+            "%s turn %d: slice %.1fs exceeds Whisper ceiling; clamping to %ds.",
+            runtime.engine_name,
+            index,
+            slice_dur,
+            WHISPER_MAX_CHUNK_S,
+        )
+        slice_dur = float(WHISPER_MAX_CHUNK_S)
+    return {
+        "turn": turn,
+        "index": index,
+        "dur": dur,
+        "slice_start": slice_start,
+        "slice_dur": slice_dur,
+        "turn_start": turn_start,
+        "turn_end": turn_end,
+    }
+
+
+def _finalize_turn_from_result(
+    prepared: dict,
+    result: dict,
+    *,
+    audio_path: str,
+    language: str,
+    ts_mode: Any,
+    pipe: Any,
+    run_pipe: Callable[..., dict],
+    runtime: WhisperRuntime,
+    audio_duration_s: float,
+) -> dict | None:
+    """Apply hallucination rejection and build the speaker transcript chunk."""
+    from backend import vram_state
+
+    index = prepared["index"]
+    turn = prepared["turn"]
+    dur = prepared["dur"]
+    vram_state.log_phase(f"{runtime.engine_name}_turn_{index}", before=False)
+    text = _extract_turn_text(
+        result,
+        turn_start=prepared["turn_start"],
+        turn_end=prepared["turn_end"],
+        slice_offset=prepared["slice_start"],
+    )
+    if text and _reject_hallucinated_turn(text, dur):
+        retry_min_s = _env_float("ASR_HALLUCINATION_RETRY_MIN_DURATION_S", 1.5)
+        if dur < retry_min_s:
+            logger.warning(
+                "%s turn %d: rejected hallucinated output on %.1fs turn; skipping.",
+                runtime.engine_name,
+                index,
+                dur,
+            )
+            return None
+        logger.warning(
+            "%s turn %d: rejected hallucinated output (%d chars, %.1fs); retrying.",
+            runtime.engine_name,
+            index,
+            len(text),
+            dur,
+        )
+        text = _retry_turn_without_hallucination(
+            _TurnDecodeParams(
+                turn=turn,
+                index=index,
+                audio_path=audio_path,
+                language=language,
+                ts_mode=ts_mode,
+                pipe=pipe,
+                run_pipe=run_pipe,
+                runtime=runtime,
+                audio_duration_s=audio_duration_s,
+                slice_start=prepared["slice_start"],
+                slice_dur=prepared["slice_dur"],
+                turn_start=prepared["turn_start"],
+                turn_end=prepared["turn_end"],
+            ),
+        )
+        if not text:
+            return None
+    if not text:
+        return None
+    line_start, line_end = _turn_line_timestamp_bounds(
+        turn,
+        result,
+        slice_offset=prepared["slice_start"],
+        turn_start=prepared["turn_start"],
+        turn_end=prepared["turn_end"],
+    )
+    return {
+        "text": text,
+        "timestamp": (line_start, line_end),
+        "speaker": turn["speaker"],
+    }
+
+
+def _run_turn_guided_asr_batched(
+    turns: list[dict],
+    *,
+    audio_path: str,
+    language: str,
+    ts_mode: Any,
+    pipe: Any,
+    run_pipe: Callable[..., dict],
+    runtime: WhisperRuntime,
+    audio_duration_s: float,
+    batch_size: int,
+    cancel_event=None,
+    window_progress=None,
+) -> list[dict]:
+    """Encode/decode many speaker turns per GPU launch via CT2 batching."""
+    from engines.audio_io import load_audio_slice
+    from engines.whisper_utils import whisper_generate_kwargs
+
+    prepared_turns: list[dict] = []
+    for index, turn in enumerate(turns, start=1):
+        prepared = _prepare_turn_window(
+            turn, index, runtime=runtime, audio_duration_s=audio_duration_s,
+        )
+        if prepared is not None:
+            prepared_turns.append(prepared)
+
+    total = len(turns)
+    output_chunks: list[dict] = []
+    generate_kwargs = whisper_generate_kwargs(language)
+    for start in range(0, len(prepared_turns), batch_size):
+        _check_job_cancelled(cancel_event)
+        batch = prepared_turns[start:start + batch_size]
+        audio_inputs = []
+        for item in batch:
+            audio_inputs.append(
+                load_audio_slice(
+                    audio_path, item["slice_start"], item["slice_dur"],
+                ),
+            )
+        from backend import vram_state
+
+        for item in batch:
+            vram_state.log_phase(
+                f"{runtime.engine_name}_turn_{item['index']}", before=True,
+            )
+        try:
+            batch_results = pipe.transcribe_batch(
+                audio_inputs,
+                batch_size=len(audio_inputs),
+                generate_kwargs=generate_kwargs,
+            )
+        finally:
+            del audio_inputs
+        for item, result in zip(batch, batch_results):
+            chunk = _finalize_turn_from_result(
+                item,
+                result if isinstance(result, dict) else {"text": ""},
+                audio_path=audio_path,
+                language=language,
+                ts_mode=ts_mode,
+                pipe=pipe,
+                run_pipe=run_pipe,
+                runtime=runtime,
+                audio_duration_s=audio_duration_s,
+            )
+            if chunk:
+                output_chunks.append(chunk)
+            if window_progress:
+                window_progress(item["index"], total)
+    return output_chunks
+
+
 def run_turn_guided_asr(
     audio_path: str,
     language: str,
@@ -1076,7 +1277,7 @@ def run_turn_guided_asr(
     cancel_event=None,
     window_progress=None,
 ) -> str:
-    """Transcribe each diarization turn in isolation — best accuracy for dialogue."""
+    """Transcribe each diarization turn in isolation ΓÇö best accuracy for dialogue."""
     from engines.diarization import prepare_asr_turns
 
     turns = prepare_asr_turns(diarization_segments, max_speakers)
@@ -1095,18 +1296,38 @@ def run_turn_guided_asr(
         audio_duration_s,
     )
     ts_mode = True if timestamp_mode == "word" else timestamp_mode
-    output_chunks: list[dict] = []
-
-    for index, turn in enumerate(turns, start=1):
-        _check_job_cancelled(cancel_event)
-        chunk = _transcribe_single_turn(
-            turn, index, audio_path, language, ts_mode, pipe, run_pipe, runtime,
-            audio_duration_s=audio_duration_s,
+    batch_size = _ct2_turn_batch_size(pipe)
+    if batch_size > 1:
+        logger.info(
+            "%s turn-guided ASR: CT2 batch_size=%d (shared GPU encode).",
+            runtime.engine_name,
+            batch_size,
         )
-        if chunk:
-            output_chunks.append(chunk)
-        if window_progress:
-            window_progress(index, total)
+        output_chunks = _run_turn_guided_asr_batched(
+            turns,
+            audio_path=audio_path,
+            language=language,
+            ts_mode=ts_mode,
+            pipe=pipe,
+            run_pipe=run_pipe,
+            runtime=runtime,
+            audio_duration_s=audio_duration_s,
+            batch_size=batch_size,
+            cancel_event=cancel_event,
+            window_progress=window_progress,
+        )
+    else:
+        output_chunks = []
+        for index, turn in enumerate(turns, start=1):
+            _check_job_cancelled(cancel_event)
+            chunk = _transcribe_single_turn(
+                turn, index, audio_path, language, ts_mode, pipe, run_pipe, runtime,
+                audio_duration_s=audio_duration_s,
+            )
+            if chunk:
+                output_chunks.append(chunk)
+            if window_progress:
+                window_progress(index, total)
 
     output_chunks = _dedupe_adjacent_turn_bleed(output_chunks)
     output_chunks = _merge_consecutive_speaker_chunks(output_chunks)
@@ -1136,7 +1357,7 @@ def format_asr_result(
             max_speakers=max_speakers,
             audio_duration_s=audio_duration_s,
         )
-        ts_re = re.compile(r"\[\d{2}:\d{2}:\d{2} → \d{2}:\d{2}:\d{2}\] \[SPEAKER_\d+\]:")
+        ts_re = re.compile(r"\[\d{2}:\d{2}:\d{2} ΓåÆ \d{2}:\d{2}:\d{2}\] \[SPEAKER_\d+\]:")
         for line in text.splitlines():
             if "[SPEAKER_" in line and not ts_re.match(line.strip()):
                 log.warning(

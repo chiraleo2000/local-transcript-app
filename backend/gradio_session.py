@@ -239,6 +239,94 @@ def force_logout(request: Request) -> Response:
     return response
 
 
+_BLANK_LOGIN_SCRIPT = b"""
+<script>
+(function blankLoginFields() {
+  function clearAuthInputs() {
+    var nodes = document.querySelectorAll(
+      'input[name="username"], input[name="password"], ' +
+      'input[type="password"], input#username, input#password, ' +
+      'form input[type="text"], form input[type="password"]'
+    );
+    nodes.forEach(function (el) {
+      if (!el || el.closest && el.closest('#reg')) return;
+      try {
+        el.value = '';
+        el.setAttribute('value', '');
+        el.setAttribute(
+          'autocomplete',
+          el.type === 'password' ? 'new-password' : 'off'
+        );
+        el.setAttribute('autocapitalize', 'off');
+        el.setAttribute('autocorrect', 'off');
+        el.setAttribute('spellcheck', 'false');
+      } catch (_err) { /* ignore */ }
+    });
+    var forms = document.querySelectorAll('form');
+    forms.forEach(function (form) {
+      if (form.id === 'reg') return;
+      form.setAttribute('autocomplete', 'off');
+    });
+  }
+  clearAuthInputs();
+  document.addEventListener('DOMContentLoaded', clearAuthInputs);
+  setTimeout(clearAuthInputs, 50);
+  setTimeout(clearAuthInputs, 250);
+  setTimeout(clearAuthInputs, 800);
+})();
+</script>
+"""
+
+
+class BlankLoginFormMiddleware(BaseHTTPMiddleware):
+    """Force Gradio login username/password inputs to start blank."""
+
+    async def dispatch(self, request: Request, call_next) -> Response:
+        response = await call_next(request)
+        content_type = (response.headers.get("content-type") or "").lower()
+        if "text/html" not in content_type:
+            return response
+        # Only rewrite when the response body is available as bytes.
+        body = getattr(response, "body", None)
+        if not isinstance(body, (bytes, bytearray)) or b"</body>" not in body.lower():
+            return response
+        # Avoid rewriting large authenticated app shells repeatedly when already blanked.
+        if b"blankLoginFields" in body:
+            return response
+        lower = body.lower()
+        looks_like_login = (
+            b'name="username"' in lower
+            or b'name="password"' in lower
+            or b"login" in lower
+        ) and b"gradio" in lower
+        if not looks_like_login:
+            return response
+        idx = lower.rfind(b"</body>")
+        if idx < 0:
+            return response
+        new_body = body[:idx] + _BLANK_LOGIN_SCRIPT + body[idx:]
+        headers = {
+            k: v
+            for k, v in response.headers.items()
+            if k.lower() not in {"content-length", "content-encoding"}
+        }
+        return Response(
+            content=bytes(new_body),
+            status_code=response.status_code,
+            headers=headers,
+            media_type=response.media_type,
+        )
+
+
+def install_blank_login_form(app: Any) -> None:
+    """Inject blank-field script into Gradio HTML login responses."""
+    if getattr(app, "_lta_blank_login_middleware", False):
+        return
+    app.add_middleware(BlankLoginFormMiddleware)
+    app._lta_blank_login_middleware = True
+    logger.info("Blank login form middleware enabled.")
+
+
 def install_gradio_session_timeout(app: Any) -> None:
     """Attach idle-timeout middleware once per Gradio FastAPI app."""
     if getattr(app, "_lta_session_middleware", False):

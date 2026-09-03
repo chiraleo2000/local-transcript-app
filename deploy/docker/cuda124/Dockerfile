@@ -22,6 +22,10 @@ RUN mkdir -p models/hf_cache models/ov_cache storage/input storage/audio \
 COPY deploy/docker/cuda124/requirements.txt requirements.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install --upgrade pip \
+    && python3 -m pip install --no-cache-dir \
+        --extra-index-url https://download.pytorch.org/whl/cu124 \
+        torch==2.6.0+cu124 torchvision==0.21.0+cu124 torchaudio==2.6.0+cu124 \
+    && python3 -m pip install --no-cache-dir --no-deps pyannote.audio==4.0.4 \
     && python3 -m pip install --no-cache-dir -r requirements.txt \
     && (python3 -m pip uninstall -y torchcodec || true) \
     && python3 -c "import site,os; \
@@ -61,7 +65,7 @@ USER appuser
 
 EXPOSE 7896
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=600s --retries=3 \
-    CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:7896/startup-events')" || exit 1
+HEALTHCHECK --interval=30s --timeout=20s --start-period=600s --retries=3 \
+    CMD python3 -S -c "import urllib.request; urllib.request.urlopen('http://localhost:7896/startup-events', timeout=10)" || exit 1
 
 ENTRYPOINT ["/bin/bash", "scripts/docker_entrypoint.sh"]

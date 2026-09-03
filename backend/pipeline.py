@@ -11,7 +11,7 @@ import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from typing import Any
 
 from backend.services.asr_local import (
     ALL_ENGINES,
@@ -766,14 +766,36 @@ def _execute_transcription_stages(
     )
 
 
+def _progress_manifest_patch(progress: JobProgress | None) -> dict[str, Any]:
+    if progress is None:
+        return {}
+    snap = progress.snapshot()
+    return {
+        "progress": {
+            "phase": snap["phase"],
+            "message": snap["message"],
+            "percent": snap["percent"],
+            "elapsed_s": snap["elapsed_s"],
+            "active": True,
+        },
+    }
+
+
 def _acquire_gpu_job_slot(
     cancel_event: threading.Event | None,
     progress: JobProgress | None,
+    *,
+    manifest_sync: Callable[..., None] | None = None,
 ) -> None:
     """Wait for a GPU pipeline slot; update queue status and honor cancel."""
     while True:
         _check_cancel(cancel_event)
         if _job_semaphore.acquire(blocking=False):
+            if manifest_sync is not None:
+                manifest_sync(
+                    {"status": "running", **_progress_manifest_patch(progress)},
+                    force=True,
+                )
             return
         if progress is not None:
             ahead = max(0, active_job_count() - _max_concurrent_jobs())
@@ -786,6 +808,10 @@ def _acquire_gpu_job_slot(
                 ),
                 1.0,
             )
+            if manifest_sync is not None:
+                manifest_sync(
+                    {"status": "queued", **_progress_manifest_patch(progress)},
+                )
         time.sleep(0.4)
 
 
@@ -804,9 +830,48 @@ def run_transcription_job(
     job_id: str | None = None,
 ) -> dict:
     """Run the full local transcript pipeline and persist outputs."""
+    job_id = (job_id or "").strip() or new_job_id()
+    meta = meta or JobMeta()
+    last_manifest_sync = 0.0
+
+    def _manifest_sync(patch: dict[str, Any], *, force: bool = False) -> None:
+        nonlocal last_manifest_sync
+        now = time.time()
+        if not force and now - last_manifest_sync < 2.0:
+            return
+        last_manifest_sync = now
+        write_job_record(job_id, patch)
+
+    if progress is not None:
+        progress.set_job_id(job_id)
+
+    _manifest_sync(
+        {
+            "job_id": job_id,
+            "status": "queued",
+            "tab_id": meta.tab_id,
+            "display_name": meta.display_name,
+            "source_filename": meta.source_filename,
+            "source_path": media_path,
+            "selected_engines": list(selected_engines or []),
+            "language": language,
+            "diarization": diarization,
+            "enhance": enhance,
+            "max_speakers": max_speakers,
+            "client_ip": meta.client_ip,
+            "user_id": meta.user_id,
+            "username": meta.username,
+        },
+        force=True,
+    )
+
     register_job_started()
     try:
-        _acquire_gpu_job_slot(cancel_event, progress)
+        _acquire_gpu_job_slot(
+            cancel_event,
+            progress,
+            manifest_sync=_manifest_sync,
+        )
         try:
             return _run_transcription_job_impl(
                 media_path,
@@ -818,8 +883,9 @@ def run_transcription_job(
                 diarize_kwargs,
                 cancel_event,
                 progress,
-                meta or JobMeta(),
+                meta,
                 job_id=job_id,
+                manifest_sync=_manifest_sync,
             )
         finally:
             _job_semaphore.release()
@@ -839,18 +905,21 @@ def _run_transcription_job_impl(
     progress: JobProgress | None,
     meta: JobMeta,
     job_id: str | None = None,
+    manifest_sync: Callable[..., None] | None = None,
 ) -> dict:
     """Inner job runner — limited by ``_job_semaphore`` (default 2 concurrent tabs)."""
     job_id = (job_id or "").strip() or new_job_id()
     last_manifest_sync = 0.0
 
-    def _manifest_sync(patch: dict, *, force: bool = False) -> None:
+    def _local_manifest_sync(patch: dict[str, Any], *, force: bool = False) -> None:
         nonlocal last_manifest_sync
         now = time.time()
         if not force and now - last_manifest_sync < 2.0:
             return
         last_manifest_sync = now
         write_job_record(job_id, patch)
+
+    _manifest_sync = manifest_sync or _local_manifest_sync
 
     def _phase(phase: str, message: str, percent: float) -> None:
         if progress is not None:

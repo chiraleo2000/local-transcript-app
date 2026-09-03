@@ -66,6 +66,27 @@ function Test-IsPascalOrP4([string]$Hint) {
     return [bool]($Hint -match 'Tesla P4|Quadro P4|P40|P100|\bP4\b' -or $Hint -match '\b6\.[0-2]\b')
 }
 
+function Sync-Ct2ModelVolume([string]$Image) {
+    # CT2 weights are ~2.9 GB. Reading them from the Windows bind mount took
+    # ~154s per job and once died with an I/O error mid-load, so they live in an
+    # ext4 named volume instead (mounted read-only at /opt/ct2-models).
+    Write-Step "Syncing CT2 models into volume lta-ct2-models"
+    $src = Join-Path $RepoRoot "models\ct2"
+    if (-not (Test-Path $src)) {
+        Write-Host "  models/ct2 missing - skipped (CT2 backend will be unavailable)."
+        return
+    }
+    docker image inspect $Image 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "  image $Image not built yet - rerun deploy with -Build to sync."
+        return
+    }
+    docker volume create lta-ct2-models 2>&1 | Out-Null
+    $syncScript = 'set -e; s=$(du -sb /src | cut -f1); d=$(du -sb /dst | cut -f1); if [ $s = $d ]; then echo CT2_VOLUME_CURRENT bytes=$d; else echo CT2_VOLUME_COPYING bytes=$s; rm -rf /dst/*; cp -a /src/. /dst/; chmod -R a+rX /dst; echo CT2_VOLUME_SYNCED bytes=$(du -sb /dst | cut -f1); fi'
+    & docker run --rm --user root -v "lta-ct2-models:/dst" -v "${src}:/src:ro" $Image bash -lc $syncScript
+    if ($LASTEXITCODE -ne 0) { throw "CT2 model volume sync failed" }
+}
+
 function Test-NvidiaDocker {
     foreach ($img in @(
             "nvidia/cuda:12.4.1-base-ubuntu22.04",
@@ -122,7 +143,7 @@ $gpuHint = Get-NvidiaGpuHint
 if (Test-IsPascalOrP4 $gpuHint) {
     if ($CudaStack -ne "cuda124") {
         Write-Host "  GPU '$gpuHint' is Tesla P4 / Pascal (sm_61)."
-        Write-Host "  CUDA 13 / 12.6 images drop Pascal kernels — using cuda124."
+        Write-Host "  CUDA 13 / 12.6 images drop Pascal kernels - using cuda124."
         $CudaStack = "cuda124"
     }
 }
@@ -187,6 +208,11 @@ if ($resolved -eq "gpu") {
     if (-not (Test-Path $composeFile)) { throw "Missing $composeFile" }
     $composeArgs = @("-p", $composeProject, "-f", $composeFile)
     Write-Host "  stack file: $composeFile"
+    if ((Test-IsPascalOrP4 $gpuHint) -and (Test-Path "deploy/docker/compose.tesla-p4.yml")) {
+        $composeArgs += @("-f", "deploy/docker/compose.tesla-p4.yml")
+        Write-Host "  Tesla P4 / low-RAM override: deploy/docker/compose.tesla-p4.yml"
+        $script:SyncCt2Volume = $true
+    }
     if ($Loopback -or ((Get-EnvValue "DEPLOY_LOOPBACK") -eq "1")) {
         $composeArgs += @("-f", "deploy/docker/compose.proxy-override.yml")
         Write-Host "  loopback: 127.0.0.1:7988"
@@ -204,6 +230,8 @@ if ($Build) {
     & docker compose @composeArgs build
     if ($LASTEXITCODE -ne 0) { throw "docker compose build failed" }
 }
+
+if ($script:SyncCt2Volume) { Sync-Ct2ModelVolume "local-transcript-app:$CudaStack" }
 
 Write-Step "Starting $resolved"
 & docker compose @composeArgs up -d

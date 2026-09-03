@@ -412,6 +412,30 @@ def _format_chunks(chunks):
     return clean_transcript_lines(body) if lines else body
 
 
+def _try_ct2_pipeline():
+    """Use CTranslate2 / faster-whisper when enabled (much faster on Tesla P4)."""
+    from engines.faster_whisper_asr import (
+        ct2_model_ready,
+        default_ct2_model_dir,
+        faster_whisper_enabled,
+        get_faster_whisper_pipeline,
+    )
+
+    if not faster_whisper_enabled():
+        return None
+    model_dir = default_ct2_model_dir()
+    if not ct2_model_ready(model_dir):
+        logger.warning(
+            "ASR_USE_FASTER_WHISPER=true but CT2 model not ready at %s; "
+            "falling back to PyTorch Whisper.",
+            model_dir,
+        )
+        return None
+    pipe = get_faster_whisper_pipeline()
+    logger.info("Typhoon Whisper using faster-whisper CT2 (%s).", model_dir)
+    return pipe
+
+
 def _get_pipeline():
     """Lazy-load the Typhoon Whisper pipeline (CUDA or OpenVINO)."""
     if _pipeline_cache:
@@ -426,6 +450,11 @@ def _get_pipeline():
 
     _sync_hub_constants()
     require_cached_model(MODEL_ID, logger)
+    ct2_pipe = _try_ct2_pipeline()
+    if ct2_pipe is not None:
+        _pipeline_cache.append(ct2_pipe)
+        logger.info("Typhoon Whisper pipeline ready (CT2).")
+        return ct2_pipe
     logger.info("Loading Typhoon Whisper (%s) on device=%s ...", MODEL_ID, device)
     if uses_pytorch_cuda_pipeline(hw):
         pipe = _load_cuda_pipeline_with_retry(hf_token)
@@ -446,7 +475,11 @@ def load_model():
 
 def unload_model():
     """Unload Typhoon Whisper from process memory and clear CUDA cache."""
+    from engines.faster_whisper_asr import clear_faster_whisper_cache, faster_whisper_enabled
+
     _pipeline_cache.clear()
+    if faster_whisper_enabled():
+        clear_faster_whisper_cache()
     _clear_cuda_cache()
     logger.info("Typhoon Whisper model cache cleared.")
 

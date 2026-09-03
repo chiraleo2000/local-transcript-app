@@ -36,8 +36,9 @@ Do this **before** Docker or the installer:
 5. **Accounts + workstation queue** (optional):
    ```dotenv
    APP_AUTH_ENABLED=true
-   APP_SEED_USER=chira
-   APP_SEED_PASSWORD=  # set in local .env only — never commit
+   # Leave seed unset for a blank start — create accounts at /register
+   # APP_SEED_USER=
+   # APP_SEED_PASSWORD=
    APP_AUTH_SECRET=
    UI_MAX_CONCURRENT_JOBS=1
    UI_GRADIO_TRANSCRIBE_CONCURRENCY=4
@@ -98,9 +99,9 @@ curl -s http://localhost:7896/api/jobs/JOB_ID/transcript -H "Authorization: Bear
 curl -s -X POST http://localhost:7896/api/jobs/JOB_ID/cancel -H "Authorization: Bearer YOUR_TOKEN"
 ```
 
-**New users (browser):** open **[/register](http://localhost:7988/register)** (Docker) or `http://localhost:7896/register` (direct). The Gradio login screen also links there. Or `POST /api/auth/register` with `{"username","password"}`.
+**New users (browser):** open **[/register](http://localhost:7988/register)** (Docker) or `http://localhost:7896/register` (direct). The Gradio login screen also links there. Or `POST /api/auth/register` with `{"username","password"}`. Login and register forms start blank (no default username).
 
-Seed user is created on first boot from `APP_SEED_USER` / `APP_SEED_PASSWORD` in host `.env` (password is hashed at seed time; do not put plaintext secrets in committed env files).
+Optional bootstrap user: set **both** `APP_SEED_USER` and `APP_SEED_PASSWORD` in host `.env` (password is hashed at seed time; do not put plaintext secrets in committed env files). If neither is set, the user table starts empty.
 
 Docker GPU UI port is **7988** (replace `7896` above when calling the container).
 

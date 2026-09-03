@@ -1,0 +1,53 @@
+﻿# Tesla P4 / low host-RAM override for the NVIDIA GPU stack.
+#
+#   docker compose `
+#     -f deploy/docker/latest/compose.yml `
+#     -f deploy/docker/compose.tesla-p4.yml `
+#     up -d --build
+#
+# Or: set DEPLOY_TESLA_P4=1 in .env and run Deploy-Docker.bat gpu -Build
+# Prefer cuda124 for Pascal GPUs (Tesla P4): Deploy-Docker.bat gpu -CudaStack cuda124 -Build
+services:
+  transcription:
+    shm_size: "512mb"
+    mem_limit: 6g
+    # 2 GB of swap headroom: the CT2 load spikes well above steady-state, and a
+    # hard 6g/6g cap turns that spike into a killed job.
+    memswap_limit: 8g
+    env_file:
+      - path: ../../../.env
+        required: false
+      - ../gpu-app.env
+      - ../gpu-p4.env
+      - ../tesla-p4.env
+    environment:
+      - APP_CPU_THREADS=4
+      - OMP_NUM_THREADS=4
+      - MKL_NUM_THREADS=4
+      - OPENBLAS_NUM_THREADS=4
+      - NUMEXPR_NUM_THREADS=4
+      - APP_CUDA_STACK=cuda124
+      # Read CT2 weights from the ext4 volume, not the Windows bind mount:
+      # the same 2.9 GB load took 154s over the bind mount (and once killed
+      # the process with an I/O error mid-job).
+      - ASR_CT2_MODEL_DIR=/opt/ct2-models/typhoon-ai__typhoon-whisper-large-v3
+    volumes:
+      - ct2-models:/opt/ct2-models:ro
+    deploy:
+      resources:
+        limits:
+          cpus: "${DOCKER_CPUS:-4}"
+          memory: 6G
+        reservations:
+          cpus: "${DOCKER_CPUS_RESERVE:-1}"
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  # Created and populated from models/ct2 by Deploy-Docker.ps1
+  # (Sync-Ct2ModelVolume) before `compose up`.
+  ct2-models:
+    name: lta-ct2-models
+    external: true

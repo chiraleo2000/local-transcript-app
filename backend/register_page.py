@@ -71,14 +71,17 @@ _REGISTER_HTML = """<!DOCTYPE html>
   <main>
     <h1>Create account</h1>
     <p class="lead">Register once, then sign in on the Gradio login screen to transcribe. Jobs keep running after you close the browser.</p>
-    <form id="reg" autocomplete="on">
+    <form id="reg" autocomplete="off" spellcheck="false">
       <label for="username">Username</label>
       <input id="username" name="username" required minlength="3" maxlength="64"
-             pattern="[A-Za-z0-9_.\\-]{3,64}" placeholder="e.g. alex" />
+             pattern="[A-Za-z0-9_.\\-]{3,64}" value="" autocomplete="username"
+             autocapitalize="off" autocorrect="off" />
       <label for="password">Password (min 6 characters)</label>
-      <input id="password" name="password" type="password" required minlength="6" />
+      <input id="password" name="password" type="password" required minlength="6"
+             value="" autocomplete="new-password" />
       <label for="password2">Confirm password</label>
-      <input id="password2" name="password2" type="password" required minlength="6" />
+      <input id="password2" name="password2" type="password" required minlength="6"
+             value="" autocomplete="new-password" />
       <button type="submit" id="btn">Create account</button>
       <div class="msg" id="msg" aria-live="polite"></div>
     </form>
@@ -88,6 +91,11 @@ _REGISTER_HTML = """<!DOCTYPE html>
     const form = document.getElementById("reg");
     const msg = document.getElementById("msg");
     const btn = document.getElementById("btn");
+    // Keep create-account fields blank (ignore browser autofill / saved passwords).
+    ["username", "password", "password2"].forEach((id) => {
+      const el = document.getElementById(id);
+      if (el) el.value = "";
+    });
     form.addEventListener("submit", async (e) => {
       e.preventDefault();
       msg.className = "msg";
