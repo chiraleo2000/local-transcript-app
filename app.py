@@ -167,6 +167,7 @@ from backend.storage import (
     JOB_DIR,
     STORAGE_DIR,
     TRANSCRIPT_DIR,
+    copy_input_file,
     ensure_app_dirs,
     list_jobs,
     load_job,
@@ -1345,10 +1346,15 @@ def transcribe(*inputs, request: gr.Request | None = None):
     holder: dict = {}
     error_holder: dict = {}
     job_id = new_job_id()
+    # Persist the Gradio temp upload immediately (same request thread) so closing
+    # the browser cannot delete the only copy before the worker archives it.
+    durable_media = (
+        copy_input_file(req.media_path, job_id, source_filename) or req.media_path
+    )
     worker_ctx = {
         "runtime": runtime,
         "job_id": job_id,
-        "media_path": req.media_path,
+        "media_path": durable_media,
         "selected": selected,
         "language": req.language,
         "diarization": req.diarization,
@@ -2008,12 +2014,12 @@ def build_ui() -> gr.Blocks:
             fn=_apply_ready_state,
             outputs=[load_status, media_input, transcribe_btn],
         )
+        # Init tab id first, then recover so account/tab jobs attach after re-login.
         demo.load(  # pylint: disable=no-member
             fn=init_tab_instance_id,
             inputs=[tab_instance_id],
             outputs=[tab_instance_id],
-        )
-        demo.load(  # pylint: disable=no-member
+        ).then(
             fn=recover_session,
             inputs=[tab_instance_id],
             outputs=transcribe_outputs,

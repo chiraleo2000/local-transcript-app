@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from typing import Any
 
 from backend.job_status import job_is_in_flight, job_status_norm
@@ -36,20 +35,6 @@ def _append_job_id(
         return
     if job_has_terminal_results(row):
         _append_unique(completed, jid)
-
-
-def _job_recently_updated(row: dict[str, Any], *, within_s: int) -> bool:
-    raw = row.get("updated_at") or row.get("created_at") or ""
-    if not isinstance(raw, str) or not raw:
-        return False
-    try:
-        stamp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-    except ValueError:
-        return False
-    if stamp.tzinfo is None:
-        stamp = stamp.replace(tzinfo=timezone.utc)
-    now = datetime.now(timezone.utc)
-    return (now - stamp).total_seconds() <= max(60, within_s)
 
 
 def _seed_from_runtime(
@@ -98,19 +83,20 @@ def _append_user_inflight(
             candidates.append(jid)
 
 
-def _append_recent_user_completed(
+def _append_latest_user_completed(
     rows: list[dict[str, Any]],
     *,
     completed: list[str],
-    within_s: int,
 ) -> None:
+    """Attach the newest finished job for this account (any age).
+
+    ``list_jobs`` returns newest-first, so the first completed row is the latest.
+    """
     for row in rows:
         jid = str(row.get("job_id") or "")
         if not jid or jid in completed:
             continue
-        if not job_has_terminal_results(row):
-            continue
-        if _job_recently_updated(row, within_s=within_s):
+        if job_has_terminal_results(row):
             completed.append(jid)
             return
 
@@ -128,8 +114,9 @@ def collect_recovery_job_candidates(
 
     Tab-scoped jobs are preferred. When the browser tab id changes (refresh,
     re-login, or sessionStorage loss), fall back to the logged-in account's
-    in-flight work and very recent completed jobs so disconnects do not lose output.
+    in-flight work and latest completed job so disconnects do not lose output.
     """
+    del recent_completed_within_s  # kept for API compatibility; latest completed always wins
     candidates: list[str] = []
     completed: list[str] = []
     _seed_from_runtime(runtime, candidates=candidates, completed=completed)
@@ -142,8 +129,6 @@ def collect_recovery_job_candidates(
     if username or user_id:
         _append_user_inflight(rows, candidates=candidates)
         if not tab_has_completed:
-            _append_recent_user_completed(
-                rows, completed=completed, within_s=recent_completed_within_s
-            )
+            _append_latest_user_completed(rows, completed=completed)
 
     return candidates, completed

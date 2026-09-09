@@ -50,7 +50,7 @@ class TestSessionRecovery(unittest.TestCase):
                 self.assertEqual(candidates, ["job_a"])
                 self.assertEqual(completed, [])
 
-    def test_recovers_recent_completed_job_for_user_on_new_tab(self) -> None:
+    def test_recovers_old_completed_job_for_user_on_new_tab(self) -> None:
         from backend import storage
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -64,8 +64,8 @@ class TestSessionRecovery(unittest.TestCase):
                         "username": "alice",
                         "user_id": 1,
                         "status": "completed",
-                        "created_at": _recent_iso(),
-                        "updated_at": _recent_iso(),
+                        "created_at": "2020-01-01T00:00:00+00:00",
+                        "updated_at": "2020-01-01T00:00:00+00:00",
                         "results": {"Typhoon": {"text": "hello", "download_path": "/x.txt"}},
                     }
                 ),
@@ -79,7 +79,7 @@ class TestSessionRecovery(unittest.TestCase):
                     None,
                     username="alice",
                     user_id=1,
-                    recent_completed_within_s=86400,
+                    recent_completed_within_s=60,
                 )
                 self.assertEqual(candidates, [])
                 self.assertEqual(completed, ["job_done"])

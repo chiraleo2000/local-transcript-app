@@ -12,6 +12,7 @@ import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from backend.services.asr_local import (
@@ -40,6 +41,7 @@ from backend.services.media_pipeline import (
     stage_audio_for_inference,
 )
 from backend.storage import (
+    INPUT_DIR,
     copy_input_file,
     new_job_id,
     now_iso,
@@ -729,7 +731,12 @@ def _execute_transcription_stages(
             force=True,
         )
     temp_files: list[str] = []
-    if ctx.meta.source_filename:
+    # Upload is archived at run_transcription_job start (before GPU queue). Skip if already durable.
+    try:
+        already_durable = Path(ctx.media_path).resolve().is_relative_to(INPUT_DIR.resolve())
+    except (OSError, ValueError, AttributeError):
+        already_durable = False
+    if ctx.meta.source_filename and not already_durable:
         archived = copy_input_file(ctx.media_path, ctx.job_id, ctx.meta.source_filename)
         if archived:
             logger.info("Job %s archived upload: %s", ctx.job_id, archived)
@@ -845,6 +852,20 @@ def run_transcription_job(
 
     if progress is not None:
         progress.set_job_id(job_id)
+
+    # Copy upload into storage/input BEFORE queue/GPU wait. Gradio may delete its
+    # temp file when the browser disconnects; the daemon worker must keep a durable path.
+    durable_media = media_path
+    try:
+        already_durable = Path(media_path).resolve().is_relative_to(INPUT_DIR.resolve())
+    except (OSError, ValueError, AttributeError):
+        already_durable = False
+    if meta.source_filename and not already_durable:
+        archived = copy_input_file(media_path, job_id, meta.source_filename)
+        if archived:
+            durable_media = archived
+            logger.info("Job %s durable upload: %s", job_id, archived)
+    media_path = durable_media
 
     _manifest_sync(
         {
