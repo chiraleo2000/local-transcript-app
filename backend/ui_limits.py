@@ -35,6 +35,9 @@ def ui_transcript_max_lines() -> int:
 
 def media_too_large_for_browser(path: str) -> tuple[bool, str]:
     """Return True when embedding this file in gr.Audio/gr.Video would crash the tab."""
+    if not isinstance(path, (str, bytes, os.PathLike)):
+        return False, ""
+    path = os.fspath(path)
     if not path or not os.path.isfile(path):
         return False, ""
     size_mb = os.path.getsize(path) / (1024 * 1024)
@@ -57,6 +60,9 @@ def media_too_large_for_browser(path: str) -> tuple[bool, str]:
 
 
 def format_media_info(path: str | None) -> str:
+    if not isinstance(path, (str, bytes, os.PathLike)):
+        return "No file selected."
+    path = os.fspath(path)
     if not path:
         return "No file selected."
     name = os.path.basename(path)

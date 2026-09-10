@@ -1,8 +1,21 @@
 # Local Transcript App — release notes
 
-**Current version: 2.0.0**
+**Current version: 2.0.1**
 
 See [README.md](README.md) for setup. Docker stacks live under [`deploy/docker/`](deploy/docker/).
+
+---
+
+## v2.0.1
+
+### Summary
+
+Fix Gradio multi-file upload error: `stat: path should be string … not list` when selecting files.
+
+### Fix
+
+- Normalize Gradio list / FileData uploads before preview (`backend/media_paths.py`)
+- `_on_media_upload` and UI limits reject non-path values instead of calling `os.stat` on a list
 
 ---
 

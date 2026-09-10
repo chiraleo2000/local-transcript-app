@@ -134,6 +134,7 @@ from backend.job_cancel import cancel_tab_job
 from backend.job_enqueue import EnqueueOptions, enqueue_media_batch
 from backend.job_queue import get_job_progress as get_api_job_progress
 from backend.job_status import job_is_in_flight, job_status_norm
+from backend.media_paths import normalize_media_paths as _normalize_media_paths
 from backend.queue_policy import max_batch_files
 from backend.session_recovery import (
     collect_recovery_job_candidates,
@@ -811,14 +812,6 @@ def _poll_job_manifest_live(
         return
 
 
-def _normalize_media_paths(media) -> list[str]:
-    if not media:
-        return []
-    if isinstance(media, (list, tuple)):
-        return [str(p) for p in media if p]
-    return [str(media)]
-
-
 def _default_output_names(media) -> str:
     paths = _normalize_media_paths(media)
     if not paths:
@@ -826,6 +819,18 @@ def _default_output_names(media) -> str:
     if len(paths) > 1:
         return ""
     return os.path.splitext(os.path.basename(paths[0]))[0]
+
+
+def _format_multi_media_info(paths: list[str]) -> str:
+    if not paths:
+        return "No file selected."
+    if len(paths) == 1:
+        return _format_media_info(paths[0])
+    lines = [f"**{len(paths)} files selected** (preview shows the first):", ""]
+    for path in paths:
+        lines.append(_format_media_info(path))
+        lines.append("")
+    return "\n".join(lines).strip()
 
 
 def _format_queue_summary(accepted, rejected, queue: dict) -> str:
@@ -1675,25 +1680,31 @@ def _on_engine_change(new_engine: str, tab_id: str):
     return gr.update()
 
 
-def _on_media_upload(path, tab_id):
-    """Update preview; cancel only this tab's in-flight job when the file changes."""
+def _on_media_upload(media, tab_id):
+    """Update preview; cancel only this tab's in-flight job when the file changes.
+
+    Gradio multi-file upload passes a list of paths — never call os.stat on the list.
+    """
     runtime, _ = resolve_runtime(tab_id)
-    path_changed = bool(path) and path != runtime.get("last_upload_path")
-    runtime["last_upload_path"] = path
+    paths = _normalize_media_paths(media)
+    upload_key = "|".join(paths)
+    path_changed = bool(paths) and upload_key != runtime.get("last_upload_path")
+    runtime["last_upload_path"] = upload_key
     if path_changed:
         if runtime["progress"].snapshot().get("active"):
             runtime["cancel_event"].set()
             runtime["progress"].reset()
         if active_job_count() == 0:
             clear_prejob_caches()
-    if not path:
+    if not paths:
         return (
             gr.update(value=None, visible=False),
             gr.update(value=None, visible=False),
             "No file selected.",
         )
+    path = paths[0]
+    info = _format_multi_media_info(paths)
     too_large, _ = _media_too_large_for_browser(path)
-    info = _format_media_info(path)
     if too_large:
         return (
             gr.update(value=None, visible=False),
