@@ -1,8 +1,16 @@
 # Local Transcript App — release notes
 
-**Current version: 2.0.2**
+**Current version: 2.0.3**
 
 See [README.md](README.md) for setup. Docker stacks live under [`deploy/docker/`](deploy/docker/).
+
+---
+
+## v2.0.3
+
+### Summary
+
+OpenVINO Docker image: run as non-root `appuser` and split long Dockerfile RUN lines (Sonar clean-up).
 
 ---
 

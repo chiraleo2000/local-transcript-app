@@ -38,7 +38,11 @@ COPY scripts/ scripts/
 COPY app.py .
 COPY sitecustomize.py .
 
-RUN python3 -c "import sys; sys.path.insert(0,'/app'); import torchcodec; assert hasattr(torchcodec,'decoders'); print('torchcodec stub OK')"
+RUN python3 -c "import sys; \
+    sys.path.insert(0, '/app'); \
+    import torchcodec; \
+    assert hasattr(torchcodec, 'decoders'); \
+    print('torchcodec stub OK')"
 
 ENV PYTHONPATH=/app \
     APP_MODEL_ROOT=/app/models \
@@ -51,7 +55,10 @@ ENV PYTHONPATH=/app \
     TORCH_HOME=/app/models/torch \
     OV_CACHE_DIR=/app/models/ov_cache
 
-RUN sed -i 's/\r$//' scripts/docker_entrypoint.sh && chmod +x scripts/docker_entrypoint.sh
+RUN sed -i 's/\r$//' scripts/docker_entrypoint.sh && chmod +x scripts/docker_entrypoint.sh \
+    && groupadd -r appuser && useradd -r -g appuser -d /app -s /sbin/nologin appuser \
+    && chown -R appuser:appuser /app
+USER appuser
 
 # Runtime data must be mounted from the host — never bake users or transcripts into the image.
 VOLUME ["/app/storage", "/app/models", "/app/config"]
@@ -59,6 +66,7 @@ VOLUME ["/app/storage", "/app/models", "/app/config"]
 EXPOSE 7896
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=600s --retries=3 \
-    CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:7896/startup-events')" || exit 1
+    CMD python3 -c "import urllib.request; \
+urllib.request.urlopen('http://localhost:7896/startup-events')" || exit 1
 
 ENTRYPOINT ["/bin/bash", "scripts/docker_entrypoint.sh"]

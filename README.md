@@ -3,7 +3,7 @@
 GPU-accelerated local audio/video transcription with speaker diarization.  
 No cloud APIs. No telemetry. All processing stays on your machine.
 
-**Version 2.0.2** — see [RELEASE_NOTES.md](RELEASE_NOTES.md)
+**Version 2.0.3** — see [RELEASE_NOTES.md](RELEASE_NOTES.md)
 
 ---
 
