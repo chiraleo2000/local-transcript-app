@@ -96,8 +96,29 @@ def _max_concurrent_jobs() -> int:
         return 1
 
 
-# Fixed at import — restart the process after changing UI_MAX_CONCURRENT_JOBS.
-_job_semaphore = threading.Semaphore(_max_concurrent_jobs())
+# Recreated by configure_job_semaphore() after queue_policy applies env at startup.
+_job_semaphore = threading.Semaphore(1)
+_semaphore_slots = 1
+_semaphore_lock = threading.Lock()
+
+
+def configure_job_semaphore(slots: int | None = None) -> int:
+    """Rebuild the GPU job semaphore from *slots* or UI_MAX_CONCURRENT_JOBS.
+
+    Safe to call at startup before any jobs run. Returns the active slot count.
+    """
+    global _job_semaphore, _semaphore_slots
+    n = max(1, int(slots if slots is not None else _max_concurrent_jobs()))
+    with _semaphore_lock:
+        _semaphore_slots = n
+        _job_semaphore = threading.Semaphore(n)
+    logger.info("GPU job semaphore slots=%d", n)
+    return n
+
+
+def job_semaphore_slots() -> int:
+    with _semaphore_lock:
+        return _semaphore_slots
 
 
 def register_job_started() -> None:

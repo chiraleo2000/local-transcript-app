@@ -131,8 +131,10 @@ from backend.gradio_session import (
 )
 from backend.job_api import build_api_routes
 from backend.job_cancel import cancel_tab_job
+from backend.job_enqueue import EnqueueOptions, enqueue_media_batch
 from backend.job_queue import get_job_progress as get_api_job_progress
 from backend.job_status import job_is_in_flight, job_status_norm
+from backend.queue_policy import max_batch_files
 from backend.session_recovery import (
     collect_recovery_job_candidates,
     job_has_terminal_results,
@@ -626,7 +628,55 @@ def _history_dropdown_update(
     return gr.update(choices=choices)
 
 
+def _transcript_path_from_jobs_db(job_id: str) -> str:
+    try:
+        from backend.jobs_db import get_job_row
+
+        row = get_job_row(job_id)
+        return str((row or {}).get("transcript_path") or "")
+    except Exception:  # pylint: disable=broad-exception-caught
+        return ""
+
+
+def _apply_transcript_file(hydrated: dict, path: str) -> dict:
+    from pathlib import Path
+
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return hydrated
+    engines = hydrated.get("selected_engines") or default_asr_engines()
+    engine = engines[0] if isinstance(engines, list) and engines else "transcript"
+    hydrated["results"] = {
+        engine: {
+            "text": text,
+            "elapsed": float(hydrated.get("total_elapsed_s") or 0.0),
+            "download_path": path,
+            "note": "",
+        }
+    }
+    return hydrated
+
+
+def _hydrate_job_transcript(job: dict) -> dict:
+    """Ensure job['results'] has text/download_path (from disk if needed)."""
+    from pathlib import Path
+
+    hydrated = dict(job)
+    if hydrated.get("results"):
+        return hydrated
+    path = str(hydrated.get("transcript_path") or "")
+    if not path:
+        path = _transcript_path_from_jobs_db(str(hydrated.get("job_id") or ""))
+        if path:
+            hydrated["transcript_path"] = path
+    if path and Path(path).is_file():
+        return _apply_transcript_file(hydrated, path)
+    return hydrated
+
+
 def _manifest_to_job_result(job: dict) -> dict:
+    job = _hydrate_job_transcript(job)
     job_id = job.get("job_id", "")
     return {
         "job_id": job_id,
@@ -761,10 +811,37 @@ def _poll_job_manifest_live(
         return
 
 
-def _default_output_names(media_path: str | None) -> str:
-    if not media_path:
+def _normalize_media_paths(media) -> list[str]:
+    if not media:
+        return []
+    if isinstance(media, (list, tuple)):
+        return [str(p) for p in media if p]
+    return [str(media)]
+
+
+def _default_output_names(media) -> str:
+    paths = _normalize_media_paths(media)
+    if not paths:
         return ""
-    return os.path.splitext(os.path.basename(media_path))[0]
+    if len(paths) > 1:
+        return ""
+    return os.path.splitext(os.path.basename(paths[0]))[0]
+
+
+def _format_queue_summary(accepted, rejected, queue: dict) -> str:
+    lines: list[str] = []
+    for job in accepted:
+        lines.append(f"Queued: {job.display_name}  ({job.job_id})")
+    for job in rejected:
+        lines.append(f"Rejected: {job.source_filename or job.display_name} — {job.error}")
+    lines.append(
+        f"Queue now: {queue.get('queued', 0)} waiting, "
+        f"{queue.get('active', 0)} active (max {queue.get('max', '?')})."
+    )
+    lines.append(
+        "Safe to leave this page. Refresh Previous transcripts later to load or download."
+    )
+    return "\n".join(lines)
 
 
 def _transcribe_btn_running() -> dict:
@@ -982,7 +1059,7 @@ def _transcription_error_outputs(tracker: JobProgress, exc: Exception) -> tuple:
 
 @dataclass
 class _TranscribeRequest:
-    media_path: str
+    media: object
     selected_engines: str
     language: str
     diarization: bool
@@ -1009,15 +1086,8 @@ def _progress_poll_interval() -> float:
         return 1.0
 
 
-def _transcribe_blocked_output(runtime, tracker, media_path):
-    if is_job_running(runtime):
-        return _empty_outputs(
-            "Job still running — wait or click Cancel.",
-            "running",
-            "Job still running — wait or click Cancel.",
-            tracker=tracker,
-        )
-    if not media_path:
+def _transcribe_blocked_output(tracker, media_paths: list[str]):
+    if not media_paths:
         tracker.reset()
         return _empty_outputs("(no media provided)", "error", "No media uploaded.", tracker=tracker)
     if not _models_ready.is_set():
@@ -1305,101 +1375,98 @@ def _yield_transcription_result(
     )
 
 
+def _enqueue_options_from_request(req: _TranscribeRequest, tid: str, client_ip, user_id, username):
+    selected = _selected_engines_for_job(req.selected_engines, req.language)
+    media_paths = _normalize_media_paths(req.media)
+    output_name = (req.output_name or "").strip() or None
+    if len(media_paths) > 1:
+        output_name = None
+    return media_paths, EnqueueOptions(
+        language=req.language,
+        diarization=req.diarization,
+        enhance=req.enhance,
+        max_speakers=int(req.max_speakers),
+        selected_engines=selected,
+        output_name=output_name,
+        diarize_kwargs=_diarize_kwargs_for_job(
+            req.diarization,
+            int(req.max_speakers),
+            req.diar_override_defaults,
+            req.diar_short_clip_preset,
+            req.diar_seg_threshold,
+            req.diar_min_off,
+            req.diar_clust_threshold,
+            req.diar_clust_min_size,
+        ),
+        tab_id=tid,
+        client_ip=client_ip or "",
+        user_id=user_id or 0,
+        username=username or "",
+    )
+
+
+def _queue_empty_outputs(batch, tracker, *, status_state, status_msg, client_ip, username, user_id):
+    return _empty_outputs(
+        _format_queue_summary(batch.accepted, batch.rejected, batch.queue),
+        status_state,
+        status_msg,
+        tracker=tracker,
+        client_ip=client_ip,
+        username=username or None,
+        user_id=user_id or None,
+    )
+
+
 def transcribe(*inputs, request: gr.Request | None = None):
-    """Gradio callback — per browser-tab isolation; stopwatch via gr.Timer."""
+    """Queue one or more files for backend processing (fire-and-forget).
+
+    Single-file uploads also stream live status until that job finishes so the
+    Output panel fills without a manual history load. Multi-file batches return
+    immediately with a queue summary.
+    """
     req = _parse_transcribe_request(inputs)
     client_ip = client_ip_from_request(request)
     user_id, username = _request_user_meta(request)
     runtime, tid = resolve_runtime(req.tab_id)
     tracker = runtime["progress"]
-    blocked = _transcribe_blocked_output(runtime, tracker, req.media_path)
+    media_paths, opts = _enqueue_options_from_request(
+        req, tid, client_ip, user_id, username,
+    )
+    blocked = _transcribe_blocked_output(tracker, media_paths)
     if blocked is not None:
         yield blocked
         return
 
-    worker = runtime.get("worker")
-    if worker is not None and worker.is_alive():
-        cancel_tab_job(runtime)
-
-    cancel_event = fresh_cancel_event(runtime, cancel_previous=False)
-    selected = _selected_engines_for_job(req.selected_engines, req.language)
-    diarize_kwargs = _diarize_kwargs_for_job(
-        req.diarization,
-        int(req.max_speakers),
-        req.diar_override_defaults,
-        req.diar_short_clip_preset,
-        req.diar_seg_threshold,
-        req.diar_min_off,
-        req.diar_clust_threshold,
-        req.diar_clust_min_size,
-    )
-
-    no_dl = gr.update(value=None, interactive=False)
-    auto_selected = is_auto_engine(req.selected_engines)
-    engines_label = f"Auto → {selected[0]}" if auto_selected else selected[0]
-    runtime["selected_asr_engine"] = req.selected_engines if auto_selected else selected[0]
-    output_name, display_name, source_filename = _resolve_job_names(
-        req.media_path,
-        req.output_name,
-    )
-
-    holder: dict = {}
-    error_holder: dict = {}
-    job_id = new_job_id()
-    # Persist the Gradio temp upload immediately (same request thread) so closing
-    # the browser cannot delete the only copy before the worker archives it.
-    durable_media = (
-        copy_input_file(req.media_path, job_id, source_filename) or req.media_path
-    )
-    worker_ctx = {
-        "runtime": runtime,
-        "job_id": job_id,
-        "media_path": durable_media,
-        "selected": selected,
-        "language": req.language,
-        "diarization": req.diarization,
-        "max_speakers": int(req.max_speakers),
-        "enhance": req.enhance,
-        "diarize_kwargs": diarize_kwargs,
-        "cancel_event": cancel_event,
-        "tracker": tracker,
-        "tid": tid,
-        "display_name": display_name,
-        "source_filename": source_filename,
-        "output_name": output_name,
-        "client_ip": client_ip,
-        "user_id": user_id,
-        "username": username,
-        "holder": holder,
-        "error_holder": error_holder,
-    }
-
-    tracker.reset()
-    tracker.start(job_id)
-    worker = threading.Thread(
-        target=_transcription_worker_target,
-        args=(worker_ctx,),
-        daemon=True,
-        name=f"ui-job-{job_id}",
-    )
-    set_active_job(runtime, job_id, worker)
-    worker.start()
-
-    yield _running_transcript_outputs(tracker.snapshot(), engines_label, no_dl)
-
-    poll_s = _progress_poll_interval()
-    yield from _poll_transcription_worker(
-        worker, cancel_event, tracker, runtime, engines_label, no_dl, poll_s,
-    )
-    if cancel_event.is_set():
+    batch = enqueue_media_batch(media_paths, opts, max_files=max_batch_files())
+    if not batch.accepted:
+        yield _queue_empty_outputs(
+            batch, tracker,
+            status_state="error",
+            status_msg="No jobs queued.",
+            client_ip=client_ip,
+            username=username,
+            user_id=user_id,
+        )
         return
 
-    worker.join()
-    yield from _yield_transcription_result(
-        holder,
-        error_holder,
-        selected,
-        tracker,
+    first_id = batch.accepted[0].job_id
+    set_active_job(runtime, first_id, None)
+    tracker.reset()
+    tracker.start(first_id)
+
+    if len(batch.accepted) > 1 or batch.rejected:
+        yield _queue_empty_outputs(
+            batch, tracker,
+            status_state="running",
+            status_msg=f"Queued {len(batch.accepted)} job(s). Safe to leave this page.",
+            client_ip=client_ip,
+            username=username,
+            user_id=user_id,
+        )
+        return
+
+    yield from _poll_job_manifest_live(
+        first_id,
         client_ip=client_ip,
         username=username or None,
         user_id=user_id or None,
@@ -1520,10 +1587,9 @@ def download_selected_job(job_id: str, request: gr.Request | None = None):
         return gr.update(value=None, interactive=False)
     if _job_access_denied(job, request):
         return gr.update(value=None, interactive=False)
-    for result in (job.get("results") or {}).values():
-        path = result.get("download_path")
-        if path:
-            return gr.update(value=path, interactive=True)
+    path = _transcript_download_path(job)
+    if path:
+        return gr.update(value=path, interactive=True)
     return gr.update(value=None, interactive=False)
 
 
@@ -1669,6 +1735,7 @@ def build_ui() -> gr.Blocks:
     models_ready = _models_ready.is_set()
 
     ttl_min = max(1, int(round(session_ttl_s() / 60)))
+    batch_cap = max_batch_files()
     with gr.Blocks(
         title="Local Transcript App",
         theme=_SoftTheme(),
@@ -1681,13 +1748,14 @@ def build_ui() -> gr.Blocks:
               <div>
                 <h1>Local Transcript App</h1>
                 <p>
-                  Private on-device transcription. Upload audio or video, click
-                  <strong>Transcribe</strong>, then download your .txt when the status turns green.
+                  Private on-device transcription. Upload one or more audio/video files,
+                  click <strong>Queue for processing</strong>, then leave anytime —
+                  reopen finished .txt under Previous transcripts.
                 </p>
               </div>
               <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
                 <span style="color:#475569;font-size:0.85rem;">
-                  Keep this tab open · idle login after {ttl_min} min
+                  Jobs keep running after you leave · idle login after {ttl_min} min
                 </span>
                 <a href="/logout"
                    style="display:inline-block;padding:8px 14px;border-radius:8px;
@@ -1697,14 +1765,14 @@ def build_ui() -> gr.Blocks:
               </div>
             </div>
             <div class="lta-steps">
-              <div class="lta-step"><strong>1. Upload</strong><span>Drop an audio/video file below.</span></div>
-              <div class="lta-step"><strong>2. Transcribe</strong><span>Optional: speakers + enhancement, then start.</span></div>
-              <div class="lta-step"><strong>3. Download</strong><span>Use Download .txt or Previous transcripts.</span></div>
+              <div class="lta-step"><strong>1. Upload</strong><span>Drop up to {batch_cap} audio/video files.</span></div>
+              <div class="lta-step"><strong>2. Queue</strong><span>Optional speakers + enhancement, then queue.</span></div>
+              <div class="lta-step"><strong>3. Retrieve</strong><span>Previous transcripts → Load or Download.</span></div>
             </div>
             <div class="lta-tip">
-              Tip: finished jobs are saved automatically. If you ever need to sign in again,
-              open <strong>Previous transcripts</strong> → <em>Load into editor</em> or
-              <em>Download selected</em> — your .txt is still there.
+              Tip: outputs are saved to disk and indexed per account (SQLite). You do not need
+              to keep this page open. After re-login, use <strong>Previous transcripts</strong>
+              → <em>Refresh list</em> → <em>Load into editor</em> or <em>Download selected</em>.
             </div>
             """
         )
@@ -1719,8 +1787,9 @@ def build_ui() -> gr.Blocks:
         )
 
         media_input = gr.File(
-            label="1) Upload audio or video",
+            label=f"1) Upload audio or video (up to {batch_cap} files)",
             file_types=["audio", "video"],
+            file_count="multiple",
             type="filepath",
             interactive=models_ready,
             elem_id="media-input",
@@ -1761,7 +1830,7 @@ def build_ui() -> gr.Blocks:
                 max_speakers = gr.Slider(1, 10, step=1, value=6, label="Max Speakers")
             with gr.Column(scale=1, min_width=180):
                 transcribe_btn = gr.Button(
-                    "2) Transcribe",
+                    "2) Queue for processing",
                     variant="primary",
                     interactive=models_ready,
                     elem_id="transcribe-btn",
@@ -1926,12 +1995,12 @@ def build_ui() -> gr.Blocks:
 
         gr.Markdown(
             "### Previous transcripts\n"
-            "Your finished jobs stay here even after refresh or re-login.\n\n"
-            "1. Click **Refresh list**\n"
+            "Finished jobs stay here after refresh or re-login (SQLite history per account).\n\n"
+            "1. Click **Refresh list** (also auto-loads on page open)\n"
             "2. Pick a job\n"
             "3. **Load into editor** (view/edit) or **Download selected** (.txt)\n\n"
-            "Running jobs re-attach and stream live status. "
-            "**Cancel & Reset** stops your job and frees the GPU for the next user."
+            "Queued/running jobs re-attach and stream live status. "
+            "You can close the browser while jobs run on the server."
         )
         with gr.Row():
             history_dropdown = gr.Dropdown(
@@ -2014,6 +2083,10 @@ def build_ui() -> gr.Blocks:
             fn=_apply_ready_state,
             outputs=[load_status, media_input, transcribe_btn],
         )
+        demo.load(  # pylint: disable=no-member
+            fn=load_history,
+            outputs=[history_dropdown],
+        )
         # Init tab id first, then recover so account/tab jobs attach after re-login.
         demo.load(  # pylint: disable=no-member
             fn=init_tab_instance_id,
@@ -2074,9 +2147,20 @@ def _job_owned_by_username(job: dict, username: str) -> bool:
 
 
 def _transcript_download_path(job: dict) -> str | None:
+    path = job.get("transcript_path")
+    if path:
+        return str(path)
     for payload in (job.get("results") or {}).values():
         if isinstance(payload, dict) and payload.get("download_path"):
             return payload["download_path"]
+    try:
+        from backend.jobs_db import get_job_row
+
+        row = get_job_row(str(job.get("job_id") or ""))
+        if row and row.get("transcript_path"):
+            return str(row["transcript_path"])
+    except Exception:  # pylint: disable=broad-exception-caught
+        pass
     return None
 
 
@@ -2163,11 +2247,18 @@ def _patch_gradio_create_app_for_custom_routes() -> None:
 def main() -> None:
     """Start the Gradio server (CLI, launcher subprocess, or PyInstaller --app-server)."""
     from backend.asr_quality import apply_quality_profile
+    from backend.job_enqueue import resume_interrupted_jobs
+    from backend.jobs_db import init_jobs_db, migrate_json_jobs
+    from backend.queue_policy import apply_queue_policy
 
     ensure_app_dirs()
     init_user_db()
+    init_jobs_db()
     apply_cpu_thread_limits()
     apply_quality_profile()
+    apply_queue_policy()
+    migrate_json_jobs()
+    resume_interrupted_jobs()
     hardware = detect_hardware()
     logger.info("Selected backend: %s / %s", hardware["backend"], hardware["selected_device"])
     public_base = os.getenv("APP_PUBLIC_BASE_URL", "").strip()

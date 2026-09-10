@@ -1,8 +1,46 @@
 # Local Transcript App — release notes
 
-**Current version: 1.2.13**
+**Current version: 2.0.0**
 
 See [README.md](README.md) for setup. Docker stacks live under [`deploy/docker/`](deploy/docker/).
+
+---
+
+## v2.0.0
+
+### Summary
+
+Major release: per-user SQLite job history, multi-file fire-and-forget queue in the UI, and hardware-aware concurrency defaults (safe on Tesla P4 / 8 GB; scales on modern high-VRAM GPUs).
+
+### Breaking / operator notes
+
+- UI **Queue for processing** enqueues jobs and returns immediately — you do not need to keep the browser open. Retrieve outputs under **Previous transcripts** (or `GET /api/jobs` / transcript download).
+- Job list/history prefers **`storage/jobs.db`**. Existing `storage/jobs/*.json` manifests are imported on first 2.x startup (no re-transcribe). JSON dual-write continues for one major cycle.
+- Transcript text remains in `storage/transcripts/*.txt` (not stored as SQLite BLOBs).
+- Queue caps: if `UI_MAX_CONCURRENT_JOBS` / `API_MAX_QUEUED_JOBS` / `UI_MAX_BATCH_FILES` are **unset**, startup applies tier defaults. Explicit env (including Docker) always wins.
+
+### Hardware tiers
+
+| Tier | Hardware | GPU slots | Queue / batch (when env unset) |
+| --- | --- | --- | --- |
+| A | Tesla P4 / Pascal / ~8 GB | 1 | 4 / 3 |
+| B | Ampere+ under parallel VRAM threshold | 1 | 4 / 3 |
+| C | VRAM ≥ `ASR_PARALLEL_MIN_VRAM_MB` (default 12288) | 2 | 8 / 5 |
+
+Docker GPU / Tesla P4 overlays keep **1** GPU slot explicitly.
+
+### Features
+
+- `backend/jobs_db.py` — SQLite index with `schema_version`
+- `backend/job_enqueue.py` — shared UI/API enqueue + resume interrupted jobs on startup
+- `backend/queue_policy.py` — tier detection and auto env fill
+- Gradio multi-file upload (`UI_MAX_BATCH_FILES`)
+
+### Migration from 1.2.x
+
+1. Deploy 2.0.0 with the same `storage/` volume.
+2. On first start, JSON job manifests are upserted into `jobs.db`.
+3. Sign in and open **Previous transcripts** → Refresh list.
 
 ---
 

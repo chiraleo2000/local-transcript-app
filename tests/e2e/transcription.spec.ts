@@ -328,7 +328,7 @@ test.describe("Local Transcript App — container UI", () => {
 
 
 
-    await expect(page.getByRole("button", { name: "Transcribe" })).toBeEnabled();
+    await expect(page.getByRole("button", { name: /Queue for processing/i })).toBeEnabled();
 
     await expect(page.getByRole("heading", { name: "Local Transcript App" })).toBeVisible();
 

@@ -111,7 +111,7 @@ def save_transcript(
 
 
 def write_job_record(job_id: str, patch: dict[str, Any]) -> str:
-    """Create or merge-update a per-job manifest JSON file."""
+    """Create or merge-update a per-job manifest JSON file and SQLite index."""
     ensure_app_dirs()
     path = JOB_DIR / f"{job_id}.json"
     existing: dict[str, Any] = {}
@@ -131,6 +131,16 @@ def write_job_record(job_id: str, patch: dict[str, Any]) -> str:
         json.dumps(existing, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    try:
+        from backend.jobs_db import upsert_job
+
+        upsert_job(job_id, existing)
+    except Exception:  # pylint: disable=broad-exception-caught
+        import logging
+
+        logging.getLogger(__name__).debug(
+            "SQLite job upsert failed for %s (JSON written)", job_id, exc_info=True
+        )
     return str(path)
 
 
@@ -188,10 +198,25 @@ def list_jobs(
 ) -> list[dict[str, Any]]:
     """Return job summary rows sorted by created_at descending.
 
-    Prefer *user_id* / *username* for account history. *client_ip* remains as a
-    legacy workstation filter when no user identity is provided.
+    Prefer SQLite index (v2). Fall back to scanning JSON manifests when the DB
+    file is missing. Prefer *user_id* / *username* for account history;
+    *client_ip* remains as a legacy workstation filter when no user identity
+    is provided.
     """
     ensure_app_dirs()
+    try:
+        from backend.jobs_db import jobs_db_path, list_job_rows
+
+        if jobs_db_path().is_file():
+            return list_job_rows(
+                limit,
+                client_ip=client_ip,
+                username=username,
+                user_id=user_id,
+            )
+    except Exception:  # pylint: disable=broad-exception-caught
+        pass
+
     rows: list[dict[str, Any]] = []
     for path in JOB_DIR.glob("*.json"):
         row = _job_row_from_path(path)

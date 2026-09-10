@@ -161,6 +161,27 @@ def _read_ref_commit(repo_dir: Path) -> str | None:
         return None
 
 
+def _snapshot_dirs_for_repo(repo: Path, commit: str | None) -> list[Path]:
+    snap_root = repo / "snapshots"
+    if commit and (snap_root / commit).is_dir():
+        return [snap_root / commit]
+    if not snap_root.is_dir():
+        return []
+    return [p for p in snap_root.iterdir() if p.is_dir()]
+
+
+def _copy_snapshot_files(snap: Path, dest_snap: Path) -> None:
+    dest_snap.mkdir(parents=True, exist_ok=True)
+    for child in snap.iterdir():
+        if child.is_dir():
+            continue
+        resolved = _resolve_portable_source(child)
+        if resolved is None:
+            print(f"[package] skip unreadable: {_rel(child)}")
+            continue
+        shutil.copy2(resolved, dest_snap / child.name)
+
+
 def _materialize_hf_hub(src_hub: Path, dst_hub: Path) -> None:
     """Copy HF hub repos with reparse points turned into real files.
 
@@ -177,31 +198,30 @@ def _materialize_hf_hub(src_hub: Path, dst_hub: Path) -> None:
         dest_repo = dst_hub / repo.name
         dest_repo.mkdir(parents=True, exist_ok=True)
 
-        # refs
         refs_src = repo / "refs"
         if refs_src.is_dir():
             shutil.copytree(refs_src, dest_repo / "refs", dirs_exist_ok=True)
 
-        # snapshots/<current>
-        snap_root = repo / "snapshots"
-        if commit and (snap_root / commit).is_dir():
-            snap_dirs = [snap_root / commit]
-        else:
-            snap_dirs = [p for p in snap_root.iterdir() if p.is_dir()] if snap_root.is_dir() else []
+        for snap in _snapshot_dirs_for_repo(repo, commit):
+            _copy_snapshot_files(snap, dest_repo / "snapshots" / snap.name)
 
-        for snap in snap_dirs:
-            dest_snap = dest_repo / "snapshots" / snap.name
-            dest_snap.mkdir(parents=True, exist_ok=True)
-            for child in snap.iterdir():
-                if child.is_dir():
-                    continue
-                resolved = _resolve_portable_source(child)
-                if resolved is None:
-                    print(f"[package] skip unreadable: {_rel(child)}")
-                    continue
-                shutil.copy2(resolved, dest_snap / child.name)
 
-        # Keep refs only; no blobs needed after materialization.
+def _should_prune_dir(name: str) -> bool:
+    return name in EXCLUDE_DIR_NAMES or name == "logs" or name.startswith(".")
+
+
+def _copy_one_walk_file(src_file: Path, dest_file: Path) -> None:
+    if _is_reparse_point(src_file):
+        resolved = _resolve_portable_source(src_file)
+        if resolved is None:
+            print(f"[package] skip unreadable: {src_file}")
+            return
+        shutil.copy2(resolved, dest_file)
+        return
+    try:
+        shutil.copy2(src_file, dest_file)
+    except OSError as exc:
+        print(f"[package] skip {src_file}: {exc}")
 
 
 def _copy_tree_files(src: Path, dst: Path) -> None:
@@ -211,30 +231,13 @@ def _copy_tree_files(src: Path, dst: Path) -> None:
     for root, dirs, files in os.walk(src):
         root_path = Path(root)
         rel = root_path.relative_to(src)
-        # prune caches/logs
-        dirs[:] = [
-            d
-            for d in dirs
-            if d not in EXCLUDE_DIR_NAMES and d != "logs" and not d.startswith(".")
-        ]
+        dirs[:] = [d for d in dirs if not _should_prune_dir(d)]
         target_dir = dst / rel
         target_dir.mkdir(parents=True, exist_ok=True)
         for name in files:
             if Path(name).suffix.lower() in EXCLUDE_SUFFIXES:
                 continue
-            src_file = root_path / name
-            if _is_reparse_point(src_file):
-                resolved = _resolve_portable_source(src_file)
-                if resolved is None:
-                    print(f"[package] skip unreadable: {src_file}")
-                    continue
-                shutil.copy2(resolved, target_dir / name)
-            else:
-                try:
-                    shutil.copy2(src_file, target_dir / name)
-                except OSError as exc:
-                    print(f"[package] skip {src_file}: {exc}")
-
+            _copy_one_walk_file(root_path / name, target_dir / name)
 
 def _write_manifest(version: str) -> Path:
     model_root = PROJECT_ROOT / "models"
@@ -382,7 +385,7 @@ def _zip_stage(stage_root: Path, zip_path: Path, prefix: str) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Package offline release zip + installers.")
-    parser.add_argument("--version", default="1.2.13")
+    parser.add_argument("--version", default="2.0.0")
     parser.add_argument("--max-part-mib", type=int, default=1900)
     parser.add_argument("--keep-stage", action="store_true")
     parser.add_argument("--skip-manifest", action="store_true")

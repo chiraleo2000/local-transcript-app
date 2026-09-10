@@ -38,6 +38,7 @@ class TestHistoryIsolation(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             job_dir = Path(tmp) / "jobs"
             job_dir.mkdir()
+            jobs_db = Path(tmp) / "jobs.db"
             for job_id, user in (("a", "alice"), ("b", "bob"), ("c", "alice")):
                 (job_dir / f"{job_id}.json").write_text(
                     json.dumps(
@@ -51,9 +52,10 @@ class TestHistoryIsolation(unittest.TestCase):
                     ),
                     encoding="utf-8",
                 )
-            with patch.object(storage, "JOB_DIR", job_dir), patch.object(
-                storage, "ensure_app_dirs", lambda: None
-            ):
+            with patch.dict(os.environ, {"APP_JOBS_DB": str(jobs_db)}, clear=False            ), patch.object(
+                storage, "JOB_DIR", job_dir
+            ), patch.object(storage, "ensure_app_dirs", return_value=None):
+                # No SQLite file yet → JSON scan fallback
                 rows = storage.list_jobs(10, username="alice")
                 self.assertEqual({row["job_id"] for row in rows}, {"a", "c"})
                 rows_b = storage.list_jobs(10, user_id=2)

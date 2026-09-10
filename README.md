@@ -3,7 +3,7 @@
 GPU-accelerated local audio/video transcription with speaker diarization.  
 No cloud APIs. No telemetry. All processing stays on your machine.
 
-**Version 1.2.13** — see [RELEASE_NOTES.md](RELEASE_NOTES.md)
+**Version 2.0.0** — see [RELEASE_NOTES.md](RELEASE_NOTES.md)
 
 ---
 
@@ -67,7 +67,10 @@ Do this **before** Docker or the installer:
 - **Native desktop window** — pywebview wraps the Gradio UI; no browser required when using `launcher.py` or `LocalTranscriptApp.exe`
 - **Docker GPU mode** — stacks under [`deploy/docker/`](deploy/docker/): **latest** (CUDA 13.3), **cuda126**, **cuda124**, plus **openvino** — see [`deploy/docker/README.md`](deploy/docker/README.md)
 - **Fast diarization + accuracy** — shared policy in [`deploy/docker/gpu-app.env`](deploy/docker/gpu-app.env)
-- **Strict 6–8 GB VRAM policy** — one GPU pipeline at a time; up to 4 queued jobs (UI + REST); ASR↔diar staging; CUDA-only diarization
+- **Strict 6–8 GB VRAM policy** — one GPU pipeline at a time by default; up to 4 queued jobs (UI + REST); ASR↔diar staging; CUDA-only diarization
+- **Multi-file queue (v2)** — upload 2–3 files, queue for backend processing, leave the page; reopen under Previous transcripts
+- **SQLite job history (v2)** — per-user index in `storage/jobs.db` (transcript `.txt` files stay on disk)
+- **Hardware-aware queue defaults (v2)** — auto 2 GPU slots / larger queue when VRAM ≥ `ASR_PARALLEL_MIN_VRAM_MB` and env is unset; Tesla P4 / 8 GB stay at 1
 - **User accounts** — SQLite store (`storage/users.db`); Gradio login + REST share the same credentials
 - **Headless job API** — submit/status/transcript/cancel without keeping a browser open (see below)
 - **OOM-safe long jobs** — disk-window ASR streaming (one slice in RAM), iterative CUDA chunk halving, UI transcript line/char caps, exclusive GPU model ownership
@@ -334,6 +337,9 @@ APP_CPU_THREADS=0                 # 0 = auto-detect logical CPUs
 OV_DEVICE=GPU
 UI_MAX_CONCURRENT_JOBS=1
 UI_GRADIO_TRANSCRIBE_CONCURRENCY=4
+API_MAX_QUEUED_JOBS=4
+UI_MAX_BATCH_FILES=3
+# Leave the three queue vars unset to auto-scale on high-VRAM hosts (see RELEASE_NOTES v2.0.0)
 ```
 
 Installer examples:

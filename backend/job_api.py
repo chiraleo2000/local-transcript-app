@@ -21,15 +21,14 @@ from backend.auth_users import (
     user_public_dict,
     verify_session_token,
 )
+from backend.job_enqueue import EnqueueOptions, enqueue_media_job
 from backend.job_queue import (
     cancel_job_by_id,
     get_job_progress,
     release_queue_slot,
     snapshot_queue,
-    submit_background_job,
     try_reserve_queue_slot,
 )
-from backend.pipeline import JobMeta, run_transcription_job
 from backend.register_page import build_register_routes
 from backend.storage import (
     INPUT_DIR,
@@ -183,139 +182,59 @@ def _store_job_upload(upload, job_id: str) -> tuple[str, Path] | tuple[None, Res
         with dest.open("wb") as out:
             shutil.copyfileobj(upload.file, out)
     except OSError as exc:
-        release_queue_slot(started=False)
         return None, _error(f"Failed to store upload: {exc}", status=500)
     return filename, dest
-
-
-def _api_job_worker(
-    handle,
-    *,
-    job_id: str,
-    dest: Path,
-    filename: str,
-    selected_engines: list,
-    language: str,
-    diarization: bool,
-    max_speakers: int,
-    enhance: bool,
-    client_ip: str,
-    user_id: int,
-    username: str,
-) -> None:
-    try:
-        run_transcription_job(
-            media_path=str(dest),
-            selected_engines=selected_engines,
-            language=language,
-            diarization=diarization,
-            max_speakers=max_speakers,
-            enhance=enhance,
-            cancel_event=handle.cancel_event,
-            progress=handle.progress,
-            meta=JobMeta(
-                tab_id=f"api:{job_id}",
-                display_name=Path(filename).stem,
-                source_filename=filename,
-                output_name=Path(filename).stem,
-                client_ip=client_ip,
-                user_id=user_id,
-                username=username,
-            ),
-            job_id=job_id,
-        )
-    except RuntimeError as exc:
-        status = "cancelled" if "cancel" in str(exc).lower() else "failed"
-        write_job_record(
-            job_id,
-            {
-                "status": status,
-                "error": str(exc),
-                "user_id": user_id,
-                "username": username,
-            },
-        )
-    except Exception as exc:  # pylint: disable=broad-exception-caught
-        logger.exception("API job %s failed", job_id)
-        write_job_record(
-            job_id,
-            {
-                "status": "failed",
-                "error": str(exc),
-                "user_id": user_id,
-                "username": username,
-            },
-        )
 
 
 async def jobs_create(request: Request) -> Response:
     user, err = _require_user(request)
     if err is not None:
         return err
-    if not try_reserve_queue_slot():
-        return _error(
-            f"Job queue full (max {os.getenv('API_MAX_QUEUED_JOBS', '4')} jobs).",
-            status=429,
-        )
 
     ensure_app_dirs()
     form = await request.form()
     upload = form.get("file") or form.get("audio") or form.get("media")
     if upload is None or not hasattr(upload, "filename"):
-        release_queue_slot(started=False)
         return _error("Missing multipart file field (file|audio|media).")
 
     opts = _parse_job_create_form(form)
     job_id = new_job_id()
+    # Reserve early so we can reject before writing large uploads when full.
+    if not try_reserve_queue_slot():
+        return _error(
+            f"Job queue full (max {os.getenv('API_MAX_QUEUED_JOBS', '4')} jobs).",
+            status=429,
+        )
     stored = _store_job_upload(upload, job_id)
     if stored[0] is None:
+        release_queue_slot(started=False)
         return stored[1]
     filename, dest = stored
+    # Slot already reserved — release so enqueue_media_job can reserve cleanly.
+    release_queue_slot(started=False)
+
     client_ip = request.client.host if request.client else ""
-    user_id = user.id
-    username = user.username
-
-    write_job_record(
-        job_id,
-        {
-            "job_id": job_id,
-            "status": "queued",
-            "display_name": Path(filename).stem,
-            "source_filename": filename,
-            "source_path": str(dest),
-            "user_id": user_id,
-            "username": username,
-            "language": opts["language"],
-            "diarization": opts["diarization"],
-            "enhance": opts["enhance"],
-            "max_speakers": opts["max_speakers"],
-            "selected_engines": opts["selected_engines"],
-            "client_ip": client_ip,
-        },
-    )
-
-    def _worker(handle) -> None:
-        _api_job_worker(
-            handle,
-            job_id=job_id,
-            dest=dest,
-            filename=filename,
-            selected_engines=opts["selected_engines"],
+    result = enqueue_media_job(
+        str(dest),
+        EnqueueOptions(
             language=opts["language"],
             diarization=opts["diarization"],
-            max_speakers=opts["max_speakers"],
             enhance=opts["enhance"],
+            max_speakers=opts["max_speakers"],
+            selected_engines=opts["selected_engines"],
+            output_name=Path(filename).stem,
+            tab_id=f"api:{job_id}",
             client_ip=client_ip,
-            user_id=user_id,
-            username=username,
-        )
-
-    try:
-        submit_background_job(job_id, _worker)
-    except Exception as exc:  # pylint: disable=broad-exception-caught
-        release_queue_slot(started=False)
-        write_job_record(job_id, {"status": "failed", "error": str(exc)})
-        return _error(f"Failed to start job: {exc}", status=500)
+            user_id=user.id,
+            username=user.username,
+        ),
+        job_id=job_id,
+        already_archived=True,
+    )
+    if result.status == "rejected":
+        return _error(result.error or "Job queue full.", status=429)
+    if result.status == "failed":
+        return _error(result.error or "Failed to start job.", status=500)
     return _json(
         {
             "ok": True,
@@ -356,6 +275,29 @@ def jobs_get(request: Request) -> Response:
     return _json({"ok": True, "job": payload})
 
 
+def _transcript_path_from_results(job: dict[str, Any]) -> str | None:
+    for payload in (job.get("results") or {}).values():
+        if isinstance(payload, dict) and payload.get("download_path"):
+            return payload["download_path"]
+    return None
+
+
+def _transcript_path_from_db(job_id: str) -> str | None:
+    try:
+        from backend.jobs_db import get_job_row
+
+        row = get_job_row(job_id)
+        path = (row or {}).get("transcript_path")
+        return str(path) if path else None
+    except Exception:  # pylint: disable=broad-exception-caught
+        return None
+
+
+def _resolve_job_transcript_path(job: dict[str, Any], job_id: str) -> str | None:
+    path = job.get("transcript_path") or _transcript_path_from_results(job)
+    return path or _transcript_path_from_db(job_id)
+
+
 def jobs_transcript(request: Request) -> Response:
     user, err = _require_user(request)
     if err is not None:
@@ -366,12 +308,7 @@ def jobs_transcript(request: Request) -> Response:
         return _error(_ERR_JOB_NOT_FOUND, status=404)
     if not _job_owned_by(job, user):
         return _error(_ERR_FORBIDDEN, status=403)
-    results = job.get("results") or {}
-    path = None
-    for payload in results.values():
-        if isinstance(payload, dict) and payload.get("download_path"):
-            path = payload["download_path"]
-            break
+    path = _resolve_job_transcript_path(job, job_id)
     if not path or not Path(path).is_file():
         return _error("Transcript not ready.", status=404)
     return FileResponse(
