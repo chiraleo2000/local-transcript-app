@@ -1,6 +1,8 @@
 # OpenVINO / CPU AI
 #   docker compose -f deploy/docker/openvino/compose.yml up -d --build
 # UI: http://localhost:7987
+#
+# App code lives in the image. Persistent data is bind-mounted separately.
 
 name: local-transcript-app
 
@@ -31,8 +33,9 @@ services:
       - GRADIO_AUTH_PASSWORD=${GRADIO_AUTH_PASSWORD:-}
       - APP_PUBLIC_BASE_URL=${APP_PUBLIC_BASE_URL:-}
     volumes:
-      - ../../../models:/app/models
       - ../../../storage:/app/storage
+      - ../../../models:/app/models
+      - ../../../config:/app/config
     healthcheck:
       test: ["CMD", "python3", "-c",
         "import urllib.request; urllib.request.urlopen('http://localhost:7896/startup-events')"]

@@ -14,3 +14,7 @@ build/
 *.md
 setup.bat
 setup.sh
+# Never bake runtime data or model weights into the app image
+storage/
+models/
+release/

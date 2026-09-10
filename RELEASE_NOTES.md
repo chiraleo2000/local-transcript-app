@@ -1,8 +1,23 @@
 # Local Transcript App — release notes
 
-**Current version: 2.0.1**
+**Current version: 2.0.2**
 
 See [README.md](README.md) for setup. Docker stacks live under [`deploy/docker/`](deploy/docker/).
+
+---
+
+## v2.0.2
+
+### Summary
+
+Separate the Docker **app image** from durable **storage** so rebuilds do not wipe users or transcripts.
+
+### Deploy
+
+- Removed full-repo bind mount `.:/app` from GPU compose stacks (code comes from the image)
+- Keep host binds: `storage/` → `/app/storage`, `models/` → `/app/models`, `config/` → `/app/config`
+- `.dockerignore` excludes `storage/` and `models/` from the build context
+- Dockerfile `VOLUME` markers + deploy script ensures host dirs exist before `compose up`
 
 ---
 

@@ -32,3 +32,15 @@ Tesla P4 / Pascal overlay: [`gpu-p4.env`](gpu-p4.env) (auto-applied at runtime; 
 OpenVINO policy: [`openvino-app.env`](openvino-app.env)
 
 Root `docker-compose.gpu.yml` / `Dockerfile*` are compatibility shims → these folders.
+
+## App image vs persistent data
+
+| What | Where | Survives `docker compose build` / image update? |
+|------|--------|--------------------------------------------------|
+| App code (`app.py`, `backend/`, …) | **Image** `local-transcript-app:*` | Replaced on rebuild (expected) |
+| Users / jobs / transcripts | Host **`storage/`** → `/app/storage` | **Yes** — bind mount, not in image |
+| Model weights | Host **`models/`** → `/app/models` | **Yes** |
+| Runtime config | Host **`config/`** → `/app/config` | **Yes** |
+
+Compose does **not** mount the whole repo over `/app` (that used to hide image updates and mix code with data).  
+`.dockerignore` excludes `storage/` and `models/` so they are never baked into the image.

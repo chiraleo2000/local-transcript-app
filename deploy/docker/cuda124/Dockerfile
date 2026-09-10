@@ -67,6 +67,9 @@ RUN sed -i 's/\r$//' scripts/docker_entrypoint.sh && chmod +x scripts/docker_ent
     && chown -R appuser:appuser /app
 USER appuser
 
+# Runtime data must be mounted from the host / named volumes — never bake users or transcripts into the image.
+VOLUME ["/app/storage", "/app/models", "/app/config"]
+
 EXPOSE 7896
 
 HEALTHCHECK --interval=30s --timeout=20s --start-period=600s --retries=3 \

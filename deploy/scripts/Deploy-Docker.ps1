@@ -101,6 +101,29 @@ function Test-NvidiaDocker {
     return $false
 }
 
+function Ensure-PersistentHostDirs {
+    # App image is separate from durable data. Always create host dirs before compose
+    # mounts them so rebuilds never replace users.db / jobs with empty image folders.
+    Write-Step "Ensuring persistent host dirs (storage, models, config)"
+    $dirs = @(
+        (Join-Path $RepoRoot "storage"),
+        (Join-Path $RepoRoot "storage\input"),
+        (Join-Path $RepoRoot "storage\audio"),
+        (Join-Path $RepoRoot "storage\transcripts"),
+        (Join-Path $RepoRoot "storage\jobs"),
+        (Join-Path $RepoRoot "storage\logs"),
+        (Join-Path $RepoRoot "models"),
+        (Join-Path $RepoRoot "config")
+    )
+    foreach ($d in $dirs) {
+        if (-not (Test-Path $d)) {
+            New-Item -ItemType Directory -Path $d -Force | Out-Null
+            Write-Host "  created $d"
+        }
+    }
+    Write-Host "  storage/users.db and jobs survive image updates (bind-mounted, not in image)."
+}
+
 function Clear-LocalCaches {
     Write-Step "Clearing local caches (models/ untouched)"
     foreach ($d in @(
@@ -168,6 +191,8 @@ if (-not (Test-DockerReady)) {
     }
     if (-not (Test-DockerReady)) { throw "Docker Engine is not reachable." }
 }
+
+Ensure-PersistentHostDirs
 
 if ($ClearCache) { Clear-LocalCaches }
 

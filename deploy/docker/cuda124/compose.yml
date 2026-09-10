@@ -3,6 +3,8 @@
 #   docker compose -f deploy/docker/cuda124/compose.yml up -d --build
 # UI: http://localhost:7988
 #
+# App code lives in the image. Persistent data is bind-mounted separately so
+# rebuilds / image updates never wipe users, jobs, or transcripts.
 # Shared diarization/ASR policy: deploy/docker/gpu-app.env
 
 name: local-transcript-app
@@ -41,9 +43,12 @@ services:
       - APP_CUDA_STACK=cuda124
       - NVIDIA_REQUIRE_CUDA=cuda>=12.4
     volumes:
-      - ../../../:/app
-      - ../../../models:/app/models
+      # Persistent — survives image rebuild (users.db, jobs.db, transcripts, …)
       - ../../../storage:/app/storage
+      # Model weights — large; kept on host, not in the image
+      - ../../../models:/app/models
+      # Optional runtime config JSON
+      - ../../../config:/app/config
     deploy:
       resources:
         limits:

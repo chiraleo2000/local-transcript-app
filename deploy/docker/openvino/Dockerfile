@@ -53,6 +53,9 @@ ENV PYTHONPATH=/app \
 
 RUN sed -i 's/\r$//' scripts/docker_entrypoint.sh && chmod +x scripts/docker_entrypoint.sh
 
+# Runtime data must be mounted from the host — never bake users or transcripts into the image.
+VOLUME ["/app/storage", "/app/models", "/app/config"]
+
 EXPOSE 7896
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=600s --retries=3 \
