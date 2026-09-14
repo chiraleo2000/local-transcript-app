@@ -6,8 +6,10 @@ import re
 from collections.abc import Callable
 from difflib import SequenceMatcher
 
+# cp437 misread of UTF-8 "→" (E2 86 92) shows up as ΓåÆ on some Windows mounts.
+_TS_ARROW = "(?:→|" + "\u0393\u00e5\u00c6" + ")"
 _LINE_PREFIX_RE = re.compile(
-    r"^\[(?P<start>\d{2}:\d{2}:\d{2})\s*→\s*(?P<end>\d{2}:\d{2}:\d{2})\]\s*"
+    rf"^\[(?P<start>\d{{2}}:\d{{2}}:\d{{2}})\s*{_TS_ARROW}\s*(?P<end>\d{{2}}:\d{{2}}:\d{{2}})\]\s*"
     r"(?:\[(?P<speaker>SPEAKER_\d+|เสียง[^\]]*)\]:\s*)?",
     re.IGNORECASE,
 )

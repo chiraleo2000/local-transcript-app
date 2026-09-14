@@ -25,8 +25,10 @@ from pathlib import Path
 
 _NAMED_TURN_RE = re.compile(r"^(\d{1,2}:\d{2}:\d{2})\s+(\S.*)$")
 _HYP_LINE_RE = re.compile(
-    r"^\[(?P<start>\d{2}:\d{2}:\d{2})\s*→\s*(?P<end>\d{2}:\d{2}:\d{2})\]\s*"
-    r"(?:\[(?P<speaker>SPEAKER_\d+)\]:\s*)?(?P<body>.*)$",
+    "^\\[(?P<start>\\d{2}:\\d{2}:\\d{2})\\s*(?:→|"
+    + "\u0393\u00e5\u00c6"
+    + ")\\s*(?P<end>\\d{2}:\\d{2}:\\d{2})\\]\\s*"
+    + r"(?:\[(?P<speaker>SPEAKER_\d+)\]:\s*)?(?P<body>.*)$",
     re.IGNORECASE,
 )
 

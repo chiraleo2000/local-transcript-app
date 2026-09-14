@@ -23,6 +23,7 @@ def test_repeat_collapse_without_spaces(monkeypatch):
 
 def test_whisper_forces_thai_code_and_beams(monkeypatch):
     monkeypatch.setenv("ASR_GPU_PROFILE", "off")
+    monkeypatch.delenv("ASR_THAI_TEMPERATURE", raising=False)
     monkeypatch.setenv("ASR_THAI_NUM_BEAMS", "5")
     monkeypatch.setenv("ASR_THAI_ADAPTIVE_PERFORMANCE", "false")
     monkeypatch.setenv("ASR_NUM_BEAMS", "2")

@@ -126,6 +126,12 @@ PASCAL_P4_SPEED_ENV: dict[str, str] = {
     "DIARIZATION_MULTI_SAMPLE": "false",
     "DIARIZATION_MULTI_SAMPLE_PASSES": "0",
     "AUDIO_ENHANCE_USE_GPU": "false",
+    # Do not inherit the RTX 4060 Thai 5-beam lock.
+    "ASR_THAI_ADAPTIVE_PERFORMANCE": "true",
+    "ASR_THAI_NUM_BEAMS": "2",
+    "ASR_THAI_TEMPERATURE": "0.0,0.2,0.4",
+    "ASR_THAI_LINGUISTIC_CLEANUP": "true",
+    "ASR_MERGE_SHORT_TURNS": "true",
 }
 
 

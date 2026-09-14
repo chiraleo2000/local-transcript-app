@@ -1,8 +1,27 @@
 # Local Transcript App — release notes
 
-**Current version: 2.1.0**
+**Current version: 2.1.1**
 
 See [README.md](README.md) for setup. Docker stacks live under [`deploy/docker/`](deploy/docker/).
+
+---
+
+## v2.1.1
+
+### Summary
+
+Point the GPU golden suite at the two audio files that ship with this checkout, and keep the Tesla P4 deploy path on its fast decode profile so it does not inherit the RTX 4060 Thai 5-beam lock.
+
+### Tesla P4
+
+- `Deploy-Docker.bat gpu -CudaStack cuda124 -Build` still selects CUDA 12.4 and the storage sidecar
+- `deploy/docker/tesla-p4.env` keeps the CT2 path and sets `ASR_THAI_ADAPTIVE_PERFORMANCE=true` (3 beams, not 5)
+- Runtime Pascal detection applies the same Thai exclusion
+
+### Tests
+
+- Required GPU fixtures are `tests/test-sample01.m4a` and `tests/309.m4a`
+- Missing recording wavs are no longer part of the default run
 
 ---
 

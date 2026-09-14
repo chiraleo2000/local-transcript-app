@@ -97,8 +97,8 @@ def _run_perf_fixture(fixture: GoldenFixture) -> int:
     from tests.golden.runner import run_golden_fixture
 
     if not fixture.audio.is_file():
-        print(f"SKIP {fixture.name}: audio missing ({fixture.audio})")
-        return 0
+        print(f"FAILED {fixture.name}: audio missing ({fixture.audio})")
+        return 1
 
     duration = fixture.audio_duration_s()
     target = fixture.performance_target_s()
@@ -147,11 +147,7 @@ def _run_pytest(fixtures: list[str] | None) -> int:
     tests: list[str] = []
     mapping = {
         "sample01": "tests/test_golden_automation.py::test_sample01_meets_golden_transcript",
-        "recording172": "tests/test_golden_automation.py::test_recording172_meets_performance_target",
-        "recording19": "tests/test_golden_automation.py::test_recording19_meets_performance_target",
-        "recording47": "tests/test_golden_automation.py::test_recording47_meets_performance_target",
-        # Legacy alias used in older CLI docs / scripts.
-        "sample47": "tests/test_golden_automation.py::test_recording47_meets_performance_target",
+        "meeting309": "tests/test_golden_automation.py::test_meeting309_meets_golden_transcript",
     }
     for name, node in mapping.items():
         if selected is None or name in selected:
@@ -316,7 +312,7 @@ def main() -> int:
     parser.add_argument(
         "--skip-long",
         action="store_true",
-        help="skip long-audio performance tests (recording172, recording19, sample47)",
+        help="skip the long meeting309 test and run sample01 only",
     )
     args = parser.parse_args()
 

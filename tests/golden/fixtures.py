@@ -147,11 +147,10 @@ FIXTURES: dict[str, GoldenFixture] = {
 }
 
 ACCURACY_FIXTURES = ("sample01",)
+# Default GPU suite uses the two audio files that ship with this checkout.
+# recording172 / recording19 / recording47 / sm_kmutt stay selectable by name
+# when those files are present, but they are not part of the required run.
 LONG_PERF_FIXTURES = (
-    "recording172",
-    "recording19",
-    "sm_kmutt",
-    "recording47",
     "meeting309",
 )
 
