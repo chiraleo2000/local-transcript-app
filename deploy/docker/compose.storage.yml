@@ -19,12 +19,13 @@ services:
       - lta-sqlite:/data
       - ../../storage:/import:ro
     healthcheck:
-      test: ["CMD", "python3", "-c",
-        "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/health')"]
+      # -S skips sitecustomize (Transformers import exceeds the check timeout).
+      test: ["CMD", "python3", "-S", "-c",
+        "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/health', timeout=3)"]
       interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 20s
+      timeout: 8s
+      retries: 12
+      start_period: 30s
 
 volumes:
   lta-sqlite:

@@ -262,7 +262,15 @@ Write-Step "Starting $resolved"
 & docker compose @composeArgs up -d
 if ($LASTEXITCODE -ne 0) { throw "docker compose up failed" }
 
-Write-Step "Waiting for health ($name)"
+Write-Step "Waiting for storage node (transcript-storage)"
+$storageOk = $false
+for ($i = 0; $i -lt 40; $i++) {
+    $state = docker inspect --format "{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}" transcript-storage 2>$null
+    if ($state -eq "healthy") { $storageOk = $true; break }
+    Start-Sleep -Seconds 2
+}
+
+Write-Step "Waiting for app node ($name)"
 $ok = $false
 $healthUrl = if ($resolved -eq "gpu") { "http://127.0.0.1:7988/startup-events" } else { "http://127.0.0.1:7987/startup-events" }
 for ($i = 0; $i -lt 90; $i++) {
@@ -277,9 +285,10 @@ Write-Host "========================================" -ForegroundColor Green
 Write-Host " Deployed: $resolved / $CudaStack" -ForegroundColor Green
 Write-Host "========================================" -ForegroundColor Green
 Write-Host " UI:        $url"
-Write-Host " Container: $name"
+Write-Host " App node:  $name  $(if ($ok) { 'OK' } else { 'starting' })"
+Write-Host " Storage:   transcript-storage  $(if ($storageOk) { 'OK' } else { 'starting' })"
 Write-Host " Ports:     $(docker port $name 2>$null)"
-Write-Host " Health:    $(if ($ok) { 'OK' } else { 'starting' })"
+Write-Host " Data vol:  lta-sqlite (survives app image rebuilds)"
 Write-Host " Layout:    deploy/docker/"
 Write-Host ""
 
