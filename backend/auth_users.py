@@ -107,6 +107,13 @@ def _verify_password(password: str, encoded: str) -> bool:
 
 def init_user_db() -> None:
     """Create schema and optionally seed a bootstrap user when env is set."""
+    from backend.storage_client import storage_configured
+
+    if storage_configured():
+        from backend.storage_client import schema_version
+
+        schema_version()
+        return
     with _DB_LOCK:
         conn = _connect()
         try:
@@ -172,6 +179,22 @@ def register_user(username: str, password: str) -> UserRecord:
     name = validate_username(username)
     if not password or len(password) < 6:
         raise ValueError("Password must be at least 6 characters.")
+    from backend.storage_client import StorageUnavailable, storage_configured
+
+    if storage_configured():
+        from backend.storage_client import register_user as remote_register
+
+        try:
+            row = remote_register(name, password)
+        except StorageUnavailable as exc:
+            if getattr(exc, "status", None) == 409:
+                raise ValueError("Username already taken.") from exc
+            raise
+        return UserRecord(
+            id=int(row["id"]),
+            username=str(row["username"]),
+            is_active=bool(row.get("is_active", True)),
+        )
     init_user_db()
     with _DB_LOCK:
         conn = _connect()
@@ -194,10 +217,19 @@ def register_user(username: str, password: str) -> UserRecord:
 
 
 def authenticate_user(username: str, password: str) -> UserRecord | None:
-    init_user_db()
     name = (username or "").strip()
     if not name or not password:
         return None
+    from backend.storage_client import storage_configured
+
+    if storage_configured():
+        from backend.storage_client import authenticate_user as remote_auth
+
+        row = remote_auth(name, password)
+        if not row or not row.get("is_active", True):
+            return None
+        return UserRecord(id=int(row["id"]), username=str(row["username"]), is_active=True)
+    init_user_db()
     with _DB_LOCK:
         conn = _connect()
         try:
@@ -220,6 +252,15 @@ def authenticate_user(username: str, password: str) -> UserRecord | None:
 
 
 def get_user_by_id(user_id: int) -> UserRecord | None:
+    from backend.storage_client import storage_configured
+
+    if storage_configured():
+        from backend.storage_client import get_user_by_id as remote_get
+
+        row = remote_get(int(user_id))
+        if row is None or not row.get("is_active", True):
+            return None
+        return UserRecord(id=int(row["id"]), username=str(row["username"]), is_active=True)
     init_user_db()
     with _DB_LOCK:
         conn = _connect()
@@ -240,6 +281,18 @@ def get_user_by_id(user_id: int) -> UserRecord | None:
 
 
 def get_user_by_username(username: str) -> UserRecord | None:
+    name = (username or "").strip()
+    if not name:
+        return None
+    from backend.storage_client import storage_configured
+
+    if storage_configured():
+        from backend.storage_client import get_user_by_username as remote_get
+
+        row = remote_get(name)
+        if row is None or not row.get("is_active", True):
+            return None
+        return UserRecord(id=int(row["id"]), username=str(row["username"]), is_active=True)
     init_user_db()
     name = (username or "").strip()
     if not name:

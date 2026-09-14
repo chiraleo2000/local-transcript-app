@@ -133,8 +133,11 @@ def write_job_record(job_id: str, patch: dict[str, Any]) -> str:
     )
     try:
         from backend.jobs_db import upsert_job
+        from backend.storage_client import StorageUnavailable
 
         upsert_job(job_id, existing)
+    except StorageUnavailable:
+        raise
     except Exception:  # pylint: disable=broad-exception-caught
         import logging
 
@@ -148,12 +151,29 @@ def load_job(job_id: str) -> dict[str, Any] | None:
     """Load a full job manifest dict, or None if missing/invalid."""
     ensure_app_dirs()
     path = JOB_DIR / f"{job_id}.json"
-    if not path.exists():
-        return None
+    data: dict[str, Any] | None = None
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            data = None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
+        from backend.jobs_db import get_job_row
+        from backend.storage_client import StorageUnavailable, storage_configured
+
+        row = get_job_row(job_id) if storage_configured() or data is None else None
+    except StorageUnavailable:
+        raise
+    except Exception:  # pylint: disable=broad-exception-caught
+        row = None
+    if data is None:
+        return row
+    if row:
+        if not data.get("results") and row.get("results"):
+            data["results"] = row["results"]
+        if not data.get("transcript_path") and row.get("transcript_path"):
+            data["transcript_path"] = row["transcript_path"]
+    return data
 
 
 def _job_timestamp(value: Any) -> str:
@@ -204,18 +224,28 @@ def list_jobs(
     is provided.
     """
     ensure_app_dirs()
-    try:
-        from backend.jobs_db import jobs_db_path, list_job_rows
+    from backend.jobs_db import jobs_db_path, list_job_rows
+    from backend.storage_client import storage_configured
 
-        if jobs_db_path().is_file():
-            return list_job_rows(
+    if storage_configured():
+        return list_job_rows(
+            limit,
+            client_ip=client_ip,
+            username=username,
+            user_id=user_id,
+        )
+    if jobs_db_path().is_file():
+        try:
+            indexed = list_job_rows(
                 limit,
                 client_ip=client_ip,
                 username=username,
                 user_id=user_id,
             )
-    except Exception:  # pylint: disable=broad-exception-caught
-        pass
+        except Exception:  # pylint: disable=broad-exception-caught
+            indexed = []
+        if indexed:
+            return indexed
 
     rows: list[dict[str, Any]] = []
     for path in JOB_DIR.glob("*.json"):

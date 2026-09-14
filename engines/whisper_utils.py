@@ -158,13 +158,48 @@ def _parse_temperature(value: str | None):
     return temps[0] if len(temps) == 1 else tuple(temps)
 
 
+def whisper_language_code(language: str) -> str:
+    """Force a Whisper language id. Thai must not be left to auto-detect."""
+    raw = (language or "").strip().lower()
+    if raw in {"thai", "th", "th-th"}:
+        return "th"
+    if raw in {"english", "en", "en-us", "en-gb"}:
+        return "en"
+    if raw in {"chinese", "zh", "zh-cn"}:
+        return "zh"
+    if raw in {"japanese", "ja"}:
+        return "ja"
+    if raw in {"korean", "ko"}:
+        return "ko"
+    return raw or "th"
+
+
+def _thai_decode_locked(language: str) -> bool:
+    if whisper_language_code(language) != "th":
+        return False
+    if os.getenv("ASR_GPU_PROFILE", "").strip().lower() == "p4":
+        return False
+    return os.getenv("ASR_THAI_ADAPTIVE_PERFORMANCE", "false").strip().lower() not in {
+        "1", "true", "yes", "on",
+    }
+
+
 def whisper_generate_kwargs(language: str) -> dict:
     """Build generate_kwargs with temperature fallback + hallucination guards."""
+    lang = whisper_language_code(language)
+    if _thai_decode_locked(lang):
+        beams = max(1, _env_int("ASR_THAI_NUM_BEAMS", 5))
+        temperature = _parse_temperature(
+            os.getenv("ASR_THAI_TEMPERATURE", "0.0,0.2,0.4,0.6,0.8,1.0")
+        )
+    else:
+        beams = max(1, _env_int("ASR_NUM_BEAMS", 1))
+        temperature = _parse_temperature(os.getenv("ASR_TEMPERATURE"))
     kwargs: dict = {
-        "language": language,
+        "language": lang,
         "task": "transcribe",
-        "num_beams": max(1, _env_int("ASR_NUM_BEAMS", 1)),
-        "temperature": _parse_temperature(os.getenv("ASR_TEMPERATURE")),
+        "num_beams": beams,
+        "temperature": temperature,
     }
     if _env_bool("ASR_SUPPRESS_HALLUCINATIONS", True):
         # Whisper defaults; anything tighter drops genuine (quiet/tonal) speech.

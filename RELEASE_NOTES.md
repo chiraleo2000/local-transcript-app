@@ -1,8 +1,30 @@
 # Local Transcript App — release notes
 
-**Current version: 2.0.3**
+**Current version: 2.1.0**
 
 See [README.md](README.md) for setup. Docker stacks live under [`deploy/docker/`](deploy/docker/).
+
+---
+
+## v2.1.0
+
+### Summary
+
+Store job history and transcript results in a dedicated SQLite service, and tighten Thai ASR decoding without dropping the RTX 4060 FP16 / 7.4 GB VRAM path.
+
+### Storage
+
+- New Compose service `storage` (`transcript-storage`) owns `lta-sqlite` at `/data/app.db`
+- Schema: users, jobs, transcript text, and speaker segments
+- App reads and writes through `APP_STORAGE_URL`; a down sidecar fails the write instead of dropping history
+- First start imports existing `users.db`, `jobs.db`, job JSON, and `storage/transcripts/*.txt`
+
+### Thai ASR
+
+- Force Whisper language `th`
+- Thai decode lock: 5 beams and the full temperature ladder (P4 profile unchanged)
+- Cleanup for Thai repeats, questions, and optional pythainlp normalization
+- Merge short same-speaker turns instead of dropping them
 
 ---
 

@@ -23,6 +23,7 @@ soundfile
 python-dotenv
 psutil>=6.0
 pywebview>=5.0
+pythainlp>=5.0
 
 # --- Build / packaging (maintainer machine only) ----------------------------
 # Install with: pip install -r requirements.txt pyinstaller

@@ -24,11 +24,11 @@ FAST_8GB_ENGINES = [ENGINE_PATHUMMA]
 _AUTO_ALIASES = frozenset({"auto", ENGINE_AUTO.lower(), "auto (best for language)"})
 
 LANGUAGES = {
-    "Thai": "thai",
-    "English": "english",
-    "Chinese": "chinese",
-    "Japanese": "japanese",
-    "Korean": "korean",
+    "Thai": "th",
+    "English": "en",
+    "Chinese": "zh",
+    "Japanese": "ja",
+    "Korean": "ko",
 }
 
 
@@ -412,6 +412,7 @@ def transcribe_engine(
     """Run one ASR engine and return transcript text plus elapsed seconds."""
     engine_name = _LEGACY_ENGINE_NAMES.get(engine_name, engine_name)
     whisper_language = LANGUAGES.get(language, LANGUAGES["Thai"])
+    os.environ["ASR_ACTIVE_LANGUAGE"] = whisper_language
     started = time.perf_counter()
     logger.info(
         "ASR engine starting: engine=%s language=%s diarization_segments=%d",

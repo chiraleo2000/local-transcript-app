@@ -659,16 +659,42 @@ def _apply_transcript_file(hydrated: dict, path: str) -> dict:
     return hydrated
 
 
+def _results_have_text(results: object) -> bool:
+    if not isinstance(results, dict) or not results:
+        return False
+    for payload in results.values():
+        if isinstance(payload, dict) and str(payload.get("text") or "").strip():
+            return True
+    return False
+
+
 def _hydrate_job_transcript(job: dict) -> dict:
     """Ensure job['results'] has text/download_path (from disk if needed)."""
     from pathlib import Path
 
     hydrated = dict(job)
-    if hydrated.get("results"):
+    if _results_have_text(hydrated.get("results")):
+        return hydrated
+    try:
+        from backend.jobs_db import get_job_row
+
+        row = get_job_row(str(hydrated.get("job_id") or ""))
+    except Exception:  # pylint: disable=broad-exception-caught
+        row = None
+    if row and _results_have_text(row.get("results")):
+        results = row["results"]
+        path = str(row.get("transcript_path") or "")
+        if path:
+            for payload in results.values():
+                if isinstance(payload, dict) and not payload.get("download_path"):
+                    payload["download_path"] = path
+        hydrated["results"] = results
+        if path:
+            hydrated["transcript_path"] = path
         return hydrated
     path = str(hydrated.get("transcript_path") or "")
-    if not path:
-        path = _transcript_path_from_jobs_db(str(hydrated.get("job_id") or ""))
+    if not path and row:
+        path = str(row.get("transcript_path") or "")
         if path:
             hydrated["transcript_path"] = path
     if path and Path(path).is_file():

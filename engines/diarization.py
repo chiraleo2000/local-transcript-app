@@ -1200,6 +1200,39 @@ def _enforce_max_speakers(segments: list[dict], max_speakers: int) -> list[dict]
     return sorted(reassigned, key=lambda s: s["start"])
 
 
+def _coalesce_short_same_speaker(segments: list[dict], min_turn_s: float) -> list[dict]:
+    """Absorb sub-minimum same-speaker fragments instead of dropping them."""
+    if not _env_bool("ASR_MERGE_SHORT_TURNS", True) or min_turn_s <= 0 or len(segments) < 2:
+        return segments
+    out = [dict(seg) for seg in segments]
+    changed = True
+    while changed and len(out) > 1:
+        changed = False
+        nxt: list[dict] = []
+        idx = 0
+        while idx < len(out):
+            seg = out[idx]
+            dur = float(seg["end"]) - float(seg["start"])
+            if dur < min_turn_s and nxt and nxt[-1]["speaker"] == seg["speaker"]:
+                nxt[-1]["end"] = max(nxt[-1]["end"], seg["end"])
+                changed = True
+                idx += 1
+                continue
+            if (
+                dur < min_turn_s
+                and idx + 1 < len(out)
+                and out[idx + 1]["speaker"] == seg["speaker"]
+            ):
+                nxt.append({**seg, "end": max(seg["end"], out[idx + 1]["end"])})
+                changed = True
+                idx += 2
+                continue
+            nxt.append(seg)
+            idx += 1
+        out = nxt
+    return out
+
+
 def _merge_adjacent_same_speaker(
     segments: list[dict], max_gap_s: float = 0.45,
 ) -> list[dict]:
@@ -1283,6 +1316,7 @@ def prepare_asr_turns(
     if max_speakers > 0:
         segments = _enforce_max_speakers(segments, max_speakers)
     merged = _merge_adjacent_same_speaker(segments, max_gap_s=merge_gap)
+    merged = _coalesce_short_same_speaker(merged, min_turn_s)
     turns = _split_turns_for_asr(merged, segments, max_turn_s, min_turn_s)
     logger.info(
         "Prepared %d ASR turn(s) from %d diarization segment(s) "

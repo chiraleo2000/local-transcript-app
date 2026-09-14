@@ -58,7 +58,12 @@ def _connect() -> sqlite3.Connection:
 
 
 def init_jobs_db() -> None:
-    """Create schema and indexes if missing."""
+    """Create schema and indexes if missing, or ping the storage sidecar."""
+    if _storage():
+        from backend.storage_client import schema_version as remote_version
+
+        remote_version()
+        return
     with _DB_LOCK:
         conn = _connect()
         try:
@@ -119,6 +124,10 @@ def init_jobs_db() -> None:
 
 
 def schema_version() -> int:
+    if _storage():
+        from backend.storage_client import schema_version as remote_version
+
+        return remote_version()
     init_jobs_db()
     with _DB_LOCK:
         conn = _connect()
@@ -264,9 +273,20 @@ def _execute_upsert(conn: sqlite3.Connection, row: dict[str, Any]) -> None:
     conn.commit()
 
 
+def _storage():
+    from backend.storage_client import storage_configured
+
+    return storage_configured()
+
+
 def upsert_job(job_id: str, patch: dict[str, Any]) -> None:
     """Insert or merge-update a job row from a manifest-style patch."""
     if not job_id:
+        return
+    if _storage():
+        from backend.storage_client import upsert_job as remote_upsert
+
+        remote_upsert(job_id, patch)
         return
     init_jobs_db()
     with _DB_LOCK:
@@ -282,6 +302,10 @@ def upsert_job(job_id: str, patch: dict[str, Any]) -> None:
 
 
 def get_job_row(job_id: str) -> dict[str, Any] | None:
+    if _storage():
+        from backend.storage_client import get_job
+
+        return get_job(job_id)
     init_jobs_db()
     with _DB_LOCK:
         conn = _connect()
@@ -340,6 +364,16 @@ def list_job_rows(
     status: str | None = None,
 ) -> list[dict[str, Any]]:
     """Return job summary rows sorted by created_at descending."""
+    if _storage():
+        from backend.storage_client import list_jobs as remote_list
+
+        return remote_list(
+            limit,
+            client_ip=client_ip,
+            username=username,
+            user_id=user_id,
+            status=status,
+        )
     init_jobs_db()
     clauses: list[str] = []
     params: list[Any] = []
@@ -372,6 +406,10 @@ def list_job_rows(
 
 def list_resumable_jobs() -> list[dict[str, Any]]:
     """Jobs that were queued/running when the process stopped."""
+    if _storage():
+        from backend.storage_client import list_resumable
+
+        return list_resumable()
     init_jobs_db()
     with _DB_LOCK:
         conn = _connect()
@@ -392,6 +430,34 @@ def import_job_manifest(data: dict[str, Any], *, job_id: str | None = None) -> s
         raise ValueError("job_id required")
     upsert_job(jid, data)
     return jid
+
+
+def save_transcript_result(
+    job_id: str,
+    engine: str,
+    text: str,
+    *,
+    language: str = "",
+    duration_s: float = 0.0,
+    transcript_path: str = "",
+    segments: list[dict[str, Any]] | None = None,
+    error: str = "",
+) -> None:
+    """Persist full transcript text and speaker segments (sidecar when configured)."""
+    if not job_id or not _storage():
+        return
+    from backend.storage_client import save_result
+
+    save_result(
+        job_id=job_id,
+        engine=engine,
+        text=text,
+        language=language,
+        duration_s=duration_s,
+        transcript_path=transcript_path,
+        segments=segments,
+        error=error,
+    )
 
 
 def migrate_json_jobs(job_dir: Path | None = None) -> int:
@@ -430,6 +496,7 @@ __all__ = [
     "list_job_rows",
     "list_resumable_jobs",
     "migrate_json_jobs",
+    "save_transcript_result",
     "schema_version",
     "upsert_job",
 ]

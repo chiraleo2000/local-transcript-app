@@ -3,14 +3,15 @@
 Single source of truth for GPU Docker, validation queue, and high-quality ASR/diar
 defaults. Fixture-specific overlays tune short dialogue vs long meetings.
 
-VRAM fraction ~0.75 (~6 GB on 8 GB cards); companion guards (batch=1, beams≤5, 1 GPU job /
-4 queued) are mandatory. Wall time: <=10 min for audio <20 min; half realtime for longer.
+VRAM fraction ~0.90 (~7.4 GB on RTX 4060 / 8 GB cards); companion guards (batch=1,
+beams 3–5 adaptive, 1 GPU job / 4 queued) are mandatory. Wall time: <=10 min for
+audio <20 min; half realtime for longer.
 """
 
 from __future__ import annotations
 
 # Whisper fallback temperature ladder (shared by base + fixture overlays).
-_ASR_TEMPERATURE_LADDER = "0.0,0.2,0.4,0.6,0.8,1.0"
+_ASR_TEMPERATURE_LADDER = "0.0,0.2,0.4,0.6,0.8"
 
 # Shared accuracy-first GPU profile (8 GB sequential, turn-guided ASR).
 ENTERPRISE_ACCURACY_BASE: dict[str, str] = {
@@ -22,7 +23,7 @@ ENTERPRISE_ACCURACY_BASE: dict[str, str] = {
     "APP_MODEL_ROOT": "./models",
     "ASR_QUALITY_PROFILE": "high",
     "DIARIZATION_ACCURACY_MODE": "true",
-    "ASR_ADAPTIVE_PERFORMANCE": "false",
+    "ASR_ADAPTIVE_PERFORMANCE": "true",
     "ASR_DIAR_WINDOWED_FAST": "false",
     "ASR_HARD_MEMORY_SAFE": "true",
     # --- Wall time: strict half realtime (locked acceptance budget) ---
@@ -30,22 +31,25 @@ ENTERPRISE_ACCURACY_BASE: dict[str, str] = {
     "ASR_TARGET_SHORT_MAX_S": "600",
     "ASR_TARGET_MEDIUM_AUDIO_S": "1200",
     "ASR_TARGET_LONG_MAX_S": "0",
-    "ASR_BUDGET_SEC_PER_TURN": "4.5",
-    # --- 8 GB VRAM lock + companion guards ---
+    "ASR_BUDGET_SEC_PER_TURN": "3.5",
+    # --- RTX 4060 / 8 GB VRAM (~7.4 GB usable) + companion guards ---
     "ASR_CUDA_BATCH_SIZE": "1",
     "ASR_8GB_BATCH_SIZE": "1",
     "ASR_8GB_MAX_BATCH_SIZE": "1",
-    "ASR_CUDA_MEMORY_FRACTION": "0.75",
-    "ASR_CUDA_MEMORY_FRACTION_MAX": "0.90",
+    "ASR_CUDA_MEMORY_FRACTION": "0.90",
+    "ASR_CUDA_MEMORY_FRACTION_MAX": "0.92",
     "ASR_CLEAR_VRAM_AFTER_JOB": "false",
     "ASR_CLEAR_VRAM_BETWEEN_ENGINES": "false",
     "ASR_KEEP_PRELOADED": "true",
     "ASR_PRELOAD_MODE": "eager",
-    "ASR_NUM_BEAMS": "5",
+    "ASR_NUM_BEAMS": "4",
     "ASR_NUM_BEAMS_MAX": "5",
-    "ASR_NUM_BEAMS_MIN": "5",
+    "ASR_NUM_BEAMS_MIN": "3",
     "ASR_FAST_MODE": "true",
     "ASR_CLEAR_VRAM_ON_MEDIA_CHANGE": "false",
+    "ASR_CUDA_DTYPE": "float16",
+    "ASR_ATTENTION_IMPLEMENTATION": "sdpa",
+    "ASR_GPU_PROFILE": "off",
     # --- ASR decode / turn-guided (diar timestamps, not Whisper word TS) ---
     "ASR_WORD_TIMESTAMPS_WITH_DIARIZATION": "false",
     "ASR_TURN_GUIDED": "true",
@@ -109,7 +113,7 @@ ENTERPRISE_ACCURACY_BASE: dict[str, str] = {
     "UI_HISTORY_PER_CLIENT_IP": "true",
     "UI_CANCEL_FREES_GPU_FOR_QUEUE": "true",
     "APP_AUTH_ENABLED": "true",
-    "MIN_NVIDIA_VRAM_MB": "6000",
+    "MIN_NVIDIA_VRAM_MB": "7000",
     "ASR_UNLOAD_ON_CANCEL": "false",
     # --- Audio enhance (CPU; diar on raw, ASR on enhanced when configured) ---
     "AUDIO_ENHANCE_ADAPTIVE": "true",

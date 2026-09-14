@@ -41,6 +41,9 @@ _THAI_ASR_VARIANTS: tuple[tuple[str, str], ...] = (
     (_TWO_BEDROOM, _TWO_BEDROOM),
     ("คอได้ฟิล", "พอได้ฟีล"),
     ("พอได้ฟิล", "พอได้ฟีล"),
+    ("โอเคร", "โอเค"),
+    ("เคค่ะ", "ค่ะ"),
+    ("นะคะนะคะ", "นะคะ"),
 )
 
 # Prefer a single captured prefix run (non-capturing repeats) to avoid backtracking.
@@ -145,6 +148,56 @@ def _env_bool(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _punctuate_thai_question(text: str) -> str:
+    """Mark obvious Thai questions that Whisper left unpunctuated."""
+    stripped = text.rstrip()
+    if not stripped or stripped[-1] in {"?", "？", ".", "!", "…"}:
+        return text
+    if re.search(r"(ไหม|มั้ย|หรือเปล่า|ใช่ไหม|รึเปล่า)\s*$", stripped):
+        return stripped + "?"
+    return text
+
+
+def _join_thai_words(words: list[str]) -> str:
+    parts: list[str] = []
+    buffer = ""
+    for token in words:
+        piece = token.strip()
+        if not piece:
+            continue
+        if _THAI_CHAR_RE.search(piece) and not _LATIN_OR_DIGIT_RE.search(piece):
+            buffer += piece
+            continue
+        if buffer:
+            parts.append(buffer)
+            buffer = ""
+        parts.append(piece)
+    if buffer:
+        parts.append(buffer)
+    return " ".join(parts)
+
+
+def _linguistic_thai_cleanup(text: str) -> str:
+    """Optional pythainlp normalize + word join. No-op if the package is missing."""
+    if not _env_bool("ASR_THAI_LINGUISTIC_CLEANUP", True):
+        return text
+    if not _THAI_CHAR_RE.search(text):
+        return text
+    try:
+        from pythainlp.tokenize import word_tokenize
+        from pythainlp.util import normalize
+    except ImportError:
+        return text
+    try:
+        normalized = normalize(text)
+        words = word_tokenize(normalized, engine="newmm", keep_whitespace=False)
+        if not words:
+            return text
+        return _join_thai_words(words)
+    except (OSError, ValueError, RuntimeError):
+        return text
+
+
 def clean_transcript_text(text: str) -> str:
     """Remove repetition loops and garbled tails from ASR output."""
     if not text or not text.strip():
@@ -158,6 +211,8 @@ def clean_transcript_text(text: str) -> str:
     cleaned = _collapse_spaced_phrase_repeats(cleaned)
     cleaned = _collapse_compact_repeats(cleaned)
     cleaned = fix_common_thai_asr_variants(cleaned)
+    cleaned = _linguistic_thai_cleanup(cleaned)
+    cleaned = _punctuate_thai_question(cleaned)
     return cleaned.strip()
 
 

@@ -9,6 +9,16 @@ import os
 logger = logging.getLogger(__name__)
 
 
+def _thai_beam_lock() -> bool:
+    """Thai accuracy path: do not drop beams under time pressure (unless P4)."""
+    lang = os.getenv("ASR_ACTIVE_LANGUAGE", "").strip().lower()
+    if lang not in {"th", "thai"}:
+        return False
+    if os.getenv("ASR_GPU_PROFILE", "").strip().lower() == "p4":
+        return False
+    return not _env_bool("ASR_THAI_ADAPTIVE_PERFORMANCE", False)
+
+
 def _env_bool(name: str, default: bool) -> bool:
     value = os.getenv(name)
     if value is None:
@@ -300,8 +310,10 @@ def apply_performance_policy(audio_duration_s: float, *, diarization: bool) -> d
     """Apply per-job ASR settings for accuracy within the realtime budget."""
     if not _env_bool("ASR_ADAPTIVE_PERFORMANCE", True):
         return {}
-
-    beams = adaptive_num_beams(audio_duration_s, diarization=diarization)
+    if _thai_beam_lock():
+        beams = max(_env_int("ASR_THAI_NUM_BEAMS", 5), _env_int("ASR_NUM_BEAMS", 5))
+    else:
+        beams = adaptive_num_beams(audio_duration_s, diarization=diarization)
     chunk_s = adaptive_chunk_length_s(audio_duration_s)
     beam_min = max(1, _env_int("ASR_NUM_BEAMS_MIN", 4))
     turn_guided_max_s = _env_float("ASR_TURN_GUIDED_MAX_DURATION_S", 20 * 60)

@@ -2,11 +2,16 @@
 #   docker compose -f deploy/docker/openvino/compose.yml up -d --build
 # UI: http://localhost:7987
 #
-# App code lives in the image. Persistent data is bind-mounted separately.
+# App code lives in the image. History lives in the storage sidecar.
 
 name: local-transcript-app
 
+include:
+  - path: ../compose.storage.yml
+
 services:
+  storage:
+    image: local-transcript-app-openvino
   transcription:
     image: local-transcript-app-openvino
     build:
@@ -16,6 +21,9 @@ services:
         - local-transcript-app-openvino
     container_name: transcription-service-openvino
     restart: unless-stopped
+    depends_on:
+      storage:
+        condition: service_healthy
     shm_size: "2gb"
     ports:
       - "7987:7896"
@@ -32,6 +40,7 @@ services:
       - GRADIO_AUTH_USER=${GRADIO_AUTH_USER:-}
       - GRADIO_AUTH_PASSWORD=${GRADIO_AUTH_PASSWORD:-}
       - APP_PUBLIC_BASE_URL=${APP_PUBLIC_BASE_URL:-}
+      - APP_STORAGE_URL=http://storage:8081
     volumes:
       - ../../../storage:/app/storage
       - ../../../models:/app/models

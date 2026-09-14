@@ -266,8 +266,27 @@ def _success_result(
     text: str,
     elapsed: float,
     output_name: str | None = None,
+    *,
+    language: str = "",
+    segments: list[dict] | None = None,
 ) -> dict:
     transcript_path = save_transcript(job_id, engine, text, output_name=output_name)
+    from backend.jobs_db import save_transcript_result
+    from backend.storage_client import StorageUnavailable
+
+    try:
+        save_transcript_result(
+            job_id,
+            engine,
+            text,
+            language=language,
+            duration_s=elapsed,
+            transcript_path=transcript_path or "",
+            segments=segments,
+        )
+    except StorageUnavailable:
+        logger.error("Job %s transcript not stored (storage sidecar down)", job_id)
+        raise
     logger.info(
         "Job %s ASR success: engine=%s elapsed=%.2fs chars=%d transcript=%s",
         job_id,
@@ -324,7 +343,10 @@ def _run_one_asr_engine(
             window_progress=window_progress,
             max_speakers=max_speakers,
         )
-        return _success_result(job_id, engine, text, elapsed, output_name=output_name)
+        return _success_result(
+            job_id, engine, text, elapsed, output_name=output_name,
+            language=language, segments=diar_segments,
+        )
     except RuntimeError as exc:
         # Re-raise cancellation so run_transcription_job's cleanup handler fires.
         # A broad except further up the call chain must not swallow this.

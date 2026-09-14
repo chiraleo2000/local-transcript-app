@@ -1,0 +1,30 @@
+# Dedicated SQLite sidecar. Included by GPU and OpenVINO stacks.
+# Image is overridden per stack. Data lives on the named volume, not in the app image.
+services:
+  storage:
+    image: ${LTA_IMAGE:-local-transcript-app:latest}
+    container_name: transcript-storage
+    restart: unless-stopped
+    user: "0:0"
+    command: ["python3", "-m", "backend.storage_api"]
+    env_file:
+      - path: ../../.env
+        required: false
+    environment:
+      - APP_STORAGE_DB=/data/app.db
+      - APP_STORAGE_HOST=0.0.0.0
+      - APP_STORAGE_PORT=8081
+      - APP_IMPORT_DIR=/import
+    volumes:
+      - lta-sqlite:/data
+      - ../../storage:/import:ro
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+        "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+volumes:
+  lta-sqlite:
