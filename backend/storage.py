@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import uuid
@@ -25,6 +26,7 @@ MODEL_DIR = resolve_path(os.getenv("APP_MODEL_ROOT", "models"))
 HF_CACHE_DIR = MODEL_DIR / "hf_cache"
 OV_CACHE_DIR = MODEL_DIR / "ov_cache"
 APP_CONFIG_PATH = CONFIG_DIR / "app_config.json"
+logger = logging.getLogger(__name__)
 
 
 def ensure_app_dirs() -> None:
@@ -133,47 +135,75 @@ def write_job_record(job_id: str, patch: dict[str, Any]) -> str:
     )
     try:
         from backend.jobs_db import upsert_job
-        from backend.storage_client import StorageUnavailable
 
         upsert_job(job_id, existing)
-    except StorageUnavailable:
-        raise
     except Exception:  # pylint: disable=broad-exception-caught
-        import logging
-
-        logging.getLogger(__name__).debug(
-            "SQLite job upsert failed for %s (JSON written)", job_id, exc_info=True
+        logger.exception(
+            "Job %s saved locally at %s; storage sync is pending.",
+            job_id,
+            path,
         )
     return str(path)
+
+
+def _read_job_manifest(job_id: str) -> dict[str, Any] | None:
+    path = JOB_DIR / f"{job_id}.json"
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _local_job_is_sufficient(data: dict[str, Any]) -> bool:
+    """In-flight or already complete locally — a sidecar round-trip would only add lag."""
+    from backend.job_status import job_is_in_flight
+
+    if job_is_in_flight(data):
+        return True
+    return bool(data.get("results") and data.get("transcript_path"))
+
+
+def _should_fetch_job_row(data: dict[str, Any] | None) -> bool:
+    if data is None:
+        return True
+    from backend.storage_client import storage_configured
+
+    if not storage_configured():
+        return False
+    return not _local_job_is_sufficient(data)
+
+
+def _fetch_job_row(job_id: str) -> dict[str, Any] | None:
+    try:
+        from backend.jobs_db import get_job_row
+
+        row = get_job_row(job_id)
+    except Exception:  # pylint: disable=broad-exception-caught
+        return None
+    return row if isinstance(row, dict) else None
+
+
+def _merge_job_row(data: dict[str, Any] | None, row: dict[str, Any] | None) -> dict[str, Any] | None:
+    if data is None:
+        return row
+    if not row:
+        return data
+    if not data.get("results") and row.get("results"):
+        data["results"] = row["results"]
+    if not data.get("transcript_path") and row.get("transcript_path"):
+        data["transcript_path"] = row["transcript_path"]
+    return data
 
 
 def load_job(job_id: str) -> dict[str, Any] | None:
     """Load a full job manifest dict, or None if missing/invalid."""
     ensure_app_dirs()
-    path = JOB_DIR / f"{job_id}.json"
-    data: dict[str, Any] | None = None
-    if path.exists():
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            data = None
-    try:
-        from backend.jobs_db import get_job_row
-        from backend.storage_client import StorageUnavailable, storage_configured
-
-        row = get_job_row(job_id) if storage_configured() or data is None else None
-    except StorageUnavailable:
-        raise
-    except Exception:  # pylint: disable=broad-exception-caught
-        row = None
-    if data is None:
-        return row
-    if row:
-        if not data.get("results") and row.get("results"):
-            data["results"] = row["results"]
-        if not data.get("transcript_path") and row.get("transcript_path"):
-            data["transcript_path"] = row["transcript_path"]
-    return data
+    data = _read_job_manifest(job_id)
+    row = _fetch_job_row(job_id) if _should_fetch_job_row(data) else None
+    return _merge_job_row(data, row)
 
 
 def _job_timestamp(value: Any) -> str:
@@ -209,6 +239,101 @@ def _job_row_from_path(path: Path) -> dict[str, Any] | None:
     }
 
 
+def _row_username(row: dict[str, Any]) -> str:
+    return str(row.get("username") or "").strip().lower()
+
+
+def _row_user_id(row: dict[str, Any]) -> int:
+    return int(row.get("user_id") or 0)
+
+
+def _job_row_visible(
+    row: dict[str, Any],
+    *,
+    client_ip: str | None,
+    username: str | None,
+    user_id: int | None,
+) -> bool:
+    if user_id is not None and int(user_id) > 0:
+        return _row_user_id(row) == int(user_id)
+    if username:
+        return _row_username(row) == username.strip().lower()
+    if client_ip:
+        return str(row.get("client_ip") or "") == client_ip
+    return True
+
+
+def _filter_job_rows(
+    rows: list[dict[str, Any]],
+    *,
+    client_ip: str | None,
+    username: str | None,
+    user_id: int | None,
+) -> list[dict[str, Any]]:
+    return [
+        row for row in rows
+        if _job_row_visible(
+            row, client_ip=client_ip, username=username, user_id=user_id,
+        )
+    ]
+
+
+def _rows_from_manifests() -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for path in JOB_DIR.glob("*.json"):
+        row = _job_row_from_path(path)
+        if row is not None:
+            rows.append(row)
+    return rows
+
+
+def _jobs_from_configured_storage(
+    limit: int,
+    *,
+    client_ip: str | None,
+    username: str | None,
+    user_id: int | None,
+) -> list[dict[str, Any]] | None:
+    from backend.jobs_db import list_job_rows
+    from backend.storage_client import storage_configured
+
+    if not storage_configured():
+        return None
+    try:
+        return list_job_rows(
+            limit,
+            client_ip=client_ip,
+            username=username,
+            user_id=user_id,
+        )
+    except Exception:  # pylint: disable=broad-exception-caught
+        logger.exception("Storage sidecar unreachable; listing local job files.")
+        return None
+
+
+def _jobs_from_local_index(
+    limit: int,
+    *,
+    client_ip: str | None,
+    username: str | None,
+    user_id: int | None,
+) -> list[dict[str, Any]] | None:
+    from backend.jobs_db import jobs_db_path, list_job_rows
+
+    if not jobs_db_path().is_file():
+        return None
+    try:
+        indexed = list_job_rows(
+            limit,
+            client_ip=client_ip,
+            username=username,
+            user_id=user_id,
+        )
+    except Exception:  # pylint: disable=broad-exception-caught
+        return None
+    return indexed or None
+
+
 def list_jobs(
     limit: int = 50,
     *,
@@ -224,45 +349,22 @@ def list_jobs(
     is provided.
     """
     ensure_app_dirs()
-    from backend.jobs_db import jobs_db_path, list_job_rows
-    from backend.storage_client import storage_configured
-
-    if storage_configured():
-        return list_job_rows(
-            limit,
-            client_ip=client_ip,
-            username=username,
-            user_id=user_id,
-        )
-    if jobs_db_path().is_file():
-        try:
-            indexed = list_job_rows(
-                limit,
-                client_ip=client_ip,
-                username=username,
-                user_id=user_id,
-            )
-        except Exception:  # pylint: disable=broad-exception-caught
-            indexed = []
-        if indexed:
-            return indexed
-
-    rows: list[dict[str, Any]] = []
-    for path in JOB_DIR.glob("*.json"):
-        row = _job_row_from_path(path)
-        if row is not None:
-            rows.append(row)
-    if user_id is not None and int(user_id) > 0:
-        uid = int(user_id)
-        rows = [row for row in rows if int(row.get("user_id") or 0) == uid]
-    elif username:
-        uname = username.strip().lower()
-        rows = [
-            row for row in rows
-            if (row.get("username") or "").strip().lower() == uname
-        ]
-    elif client_ip:
-        rows = [row for row in rows if (row.get("client_ip") or "") == client_ip]
+    remote = _jobs_from_configured_storage(
+        limit, client_ip=client_ip, username=username, user_id=user_id,
+    )
+    if remote is not None:
+        return remote
+    indexed = _jobs_from_local_index(
+        limit, client_ip=client_ip, username=username, user_id=user_id,
+    )
+    if indexed is not None:
+        return indexed
+    rows = _filter_job_rows(
+        _rows_from_manifests(),
+        client_ip=client_ip,
+        username=username,
+        user_id=user_id,
+    )
     rows.sort(key=lambda row: row["created_at"], reverse=True)
     return rows[: max(1, limit)]
 

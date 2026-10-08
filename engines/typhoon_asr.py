@@ -26,6 +26,12 @@ MODEL_ID = (
 )
 
 _pipeline_cache: list = []
+_loaded_model_id: str | None = None
+
+
+def loaded_model_id() -> str | None:
+    """Checkpoint id currently resident, if any."""
+    return _loaded_model_id
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -202,37 +208,54 @@ def _fmt_ts(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
-def _load_cuda_pipeline_with_retry(hf_token: str | None):
-    """Build CUDA pipeline; recover and retry once on cudaErrorUnknown."""
+def _cuda_dtype_should_fallback(exc: Exception, dtype, torch_mod) -> bool:
+    from engines.whisper_runtime import is_cuda_oom
+
+    return bool(is_cuda_oom(exc) and dtype != torch_mod.float16)
+
+
+def _try_load_cuda_dtype(hf_token: str | None, model_id: str | None, dtype):
+    """Return (pipeline, None), or (None, exc) to try the next dtype."""
     import torch
 
     from backend.vram_state import recover_cuda
-    from engines.whisper_runtime import is_cuda_oom, is_cuda_recoverable
+    from engines.whisper_runtime import is_cuda_recoverable
+
+    for attempt in range(2):
+        try:
+            return _load_cuda_pipeline(hf_token, dtype=dtype, model_id=model_id), None
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            if _cuda_dtype_should_fallback(exc, dtype, torch):
+                logger.warning(
+                    "Typhoon CUDA OOM with %s; falling back to float16.",
+                    dtype,
+                )
+                recover_cuda()
+                return None, exc
+            if attempt == 0 and is_cuda_recoverable(exc):
+                logger.warning(
+                    "Typhoon CUDA load failed (%s); recovering and retrying.",
+                    exc,
+                )
+                recover_cuda()
+            else:
+                raise
+    return None, None
+
+
+def _load_cuda_pipeline_with_retry(hf_token: str | None, model_id: str | None = None):
+    """Build CUDA pipeline; recover and retry once on cudaErrorUnknown."""
+    import torch
+
     from engines.whisper_utils import asr_cuda_dtypes_to_try
 
     last_exc: Exception | None = None
     for dtype in asr_cuda_dtypes_to_try(torch):
-        for attempt in range(2):
-            try:
-                return _load_cuda_pipeline(hf_token, dtype=dtype)
-            except Exception as exc:  # pylint: disable=broad-exception-caught
-                last_exc = exc
-                oom_fallback = is_cuda_oom(exc) and dtype != torch.float16
-                if oom_fallback:
-                    logger.warning(
-                        "Typhoon CUDA OOM with %s; falling back to float16.",
-                        dtype,
-                    )
-                    recover_cuda()
-                    break
-                if attempt == 0 and is_cuda_recoverable(exc):
-                    logger.warning(
-                        "Typhoon CUDA load failed (%s); recovering and retrying.",
-                        exc,
-                    )
-                    recover_cuda()
-                    continue
-                raise
+        pipe, exc = _try_load_cuda_dtype(hf_token, model_id, dtype)
+        if pipe is not None:
+            return pipe
+        if exc is not None:
+            last_exc = exc
     raise last_exc or RuntimeError("Typhoon CUDA load failed after retry")
 
 
@@ -240,17 +263,18 @@ def _reload_cuda_pipeline():
     """Drop cached CUDA pipeline and rebuild after driver/allocator errors."""
     from backend.vram_state import recover_cuda
 
+    checkpoint_id = _loaded_model_id or MODEL_ID
     _pipeline_cache.clear()
     _clear_cuda_cache()
     recover_cuda()
     hf_token = os.getenv("HF_TOKEN")
-    pipe = _load_cuda_pipeline_with_retry(hf_token)
+    pipe = _load_cuda_pipeline_with_retry(hf_token, model_id=checkpoint_id)
     _pipeline_cache.append(pipe)
-    logger.info("Typhoon Whisper CUDA pipeline reloaded.")
+    logger.info("Typhoon Whisper CUDA pipeline reloaded (%s).", checkpoint_id)
     return pipe
 
 
-def _load_cuda_pipeline(hf_token: str | None, dtype=None):
+def _load_cuda_pipeline(hf_token: str | None, dtype=None, model_id: str | None = None):
     """Build Typhoon pipeline on NVIDIA CUDA (FP32 on P4, FP16 on Ampere+)."""
     import torch
     from transformers.models.auto.modeling_auto import AutoModelForSpeechSeq2Seq
@@ -262,8 +286,9 @@ def _load_cuda_pipeline(hf_token: str | None, dtype=None):
     if dtype is None:
         dtype = resolve_asr_cuda_dtype(torch)
     _configure_torch_runtime()
-    logger.info("Using CUDA (%s) backend for Typhoon Whisper.", dtype)
-    checkpoint = resolve_pretrained_checkpoint(MODEL_ID)
+    checkpoint_id = model_id or MODEL_ID
+    logger.info("Using CUDA (%s) backend for Typhoon Whisper (%s).", dtype, checkpoint_id)
+    checkpoint = resolve_pretrained_checkpoint(checkpoint_id)
     model = AutoModelForSpeechSeq2Seq.from_pretrained(
         checkpoint,
         **_model_load_kwargs(hf_token, dtype),
@@ -300,15 +325,16 @@ def _load_cuda_pipeline(hf_token: str | None, dtype=None):
     )
 
 
-def _load_cpu_pipeline(hf_token: str | None):
+def _load_cpu_pipeline(hf_token: str | None, model_id: str | None = None):
     """CPU/float32 fallback when OpenVINO export is unavailable."""
     import torch
     from transformers.models.auto.modeling_auto import AutoModelForSpeechSeq2Seq
     from transformers import pipeline as hf_pipeline
     from transformers.models.whisper.processing_whisper import WhisperProcessor
 
-    logger.info("Using CPU (float32) fallback pipeline for Typhoon Whisper.")
-    checkpoint = resolve_pretrained_checkpoint(MODEL_ID)
+    checkpoint_id = model_id or MODEL_ID
+    logger.info("Using CPU (float32) fallback pipeline for Typhoon Whisper (%s).", checkpoint_id)
+    checkpoint = resolve_pretrained_checkpoint(checkpoint_id)
     model = AutoModelForSpeechSeq2Seq.from_pretrained(
         checkpoint,
         **_model_load_kwargs(hf_token, torch.float32),
@@ -330,7 +356,7 @@ def _load_cpu_pipeline(hf_token: str | None):
     )
 
 
-def _load_ov_pipeline(device: str, hf_token: str | None):
+def _load_ov_pipeline(device: str, hf_token: str | None, model_id: str | None = None):
     """Build Typhoon pipeline via OpenVINO IR; falls back to CPU on export failure."""
     from engines.openvino_compat import apply_openvino_whisper_compat
     from transformers.models.whisper.processing_whisper import WhisperProcessor
@@ -338,8 +364,9 @@ def _load_ov_pipeline(device: str, hf_token: str | None):
 
     apply_openvino_whisper_compat()
 
+    checkpoint_id = model_id or MODEL_ID
     cache_dir = os.getenv("OV_CACHE_DIR", "./ov_cache")
-    safe_model_slug = MODEL_ID.replace("/", "__")
+    safe_model_slug = checkpoint_id.replace("/", "__")
     export_dir = os.path.join(cache_dir, f"typhoon_{safe_model_slug}")
     ir_path = os.path.join(export_dir, "openvino_encoder_model.xml")
 
@@ -356,12 +383,12 @@ def _load_ov_pipeline(device: str, hf_token: str | None):
             )
             processor = WhisperProcessor.from_pretrained(export_dir, local_files_only=True)
         else:
-            if not has_cached_model_file(MODEL_ID):
-                raise RuntimeError(offline_cache_error_message(MODEL_ID))
+            if not has_cached_model_file(checkpoint_id):
+                raise RuntimeError(offline_cache_error_message(checkpoint_id))
             logger.info(
                 "Exporting Typhoon to OpenVINO IR from local cache (first run, may take several minutes)..."
             )
-            checkpoint = resolve_pretrained_checkpoint(MODEL_ID)
+            checkpoint = resolve_pretrained_checkpoint(checkpoint_id)
             model = OVModelForSpeechSeq2Seq.from_pretrained(
                 checkpoint,
                 export=True,
@@ -390,7 +417,7 @@ def _load_ov_pipeline(device: str, hf_token: str | None):
         )
     except Exception as exc:  # pylint: disable=broad-exception-caught
         logger.warning("OpenVINO export/load failed (%s); falling back to CPU pipeline.", exc)
-        return _load_cpu_pipeline(hf_token)
+        return _load_cpu_pipeline(hf_token, model_id=checkpoint_id)
 
 
 def _format_chunks(chunks):
@@ -436,10 +463,22 @@ def _try_ct2_pipeline():
     return pipe
 
 
-def _get_pipeline():
-    """Lazy-load the Typhoon Whisper pipeline (CUDA or OpenVINO)."""
-    if _pipeline_cache:
+def _get_pipeline(
+    model_id: str | None = None,
+    *,
+    label: str = "Typhoon Whisper",
+    allow_ct2: bool = True,
+):
+    """Lazy-load one Whisper checkpoint (CUDA, OpenVINO, or CPU)."""
+    global _loaded_model_id
+    wanted = model_id or MODEL_ID
+    if _pipeline_cache and _loaded_model_id == wanted:
         return _pipeline_cache[0]
+    if _pipeline_cache:
+        logger.info("Releasing resident checkpoint %s before loading %s.", _loaded_model_id, wanted)
+        _pipeline_cache.clear()
+        _loaded_model_id = None
+        _clear_cuda_cache()
 
     from engines.hardware import detect_hardware
     from engines.runtime_backend import uses_openvino_pipeline, uses_pytorch_cuda_pipeline
@@ -449,39 +488,46 @@ def _get_pipeline():
     hf_token = os.getenv("HF_TOKEN")
 
     _sync_hub_constants()
-    require_cached_model(MODEL_ID, logger)
-    ct2_pipe = _try_ct2_pipeline()
+    require_cached_model(wanted, logger)
+    ct2_pipe = _try_ct2_pipeline() if allow_ct2 and wanted == MODEL_ID else None
     if ct2_pipe is not None:
         _pipeline_cache.append(ct2_pipe)
-        logger.info("Typhoon Whisper pipeline ready (CT2).")
+        _loaded_model_id = wanted
+        logger.info("%s pipeline ready (CT2).", label)
         return ct2_pipe
-    logger.info("Loading Typhoon Whisper (%s) on device=%s ...", MODEL_ID, device)
+    logger.info("Loading %s (%s) on device=%s ...", label, wanted, device)
     if uses_pytorch_cuda_pipeline(hw):
-        pipe = _load_cuda_pipeline_with_retry(hf_token)
+        pipe = _load_cuda_pipeline_with_retry(hf_token, model_id=wanted)
     elif uses_openvino_pipeline(hw):
-        pipe = _load_ov_pipeline(device, hf_token)
+        pipe = _load_ov_pipeline(device, hf_token, model_id=wanted)
     else:
-        pipe = _load_cpu_pipeline(hf_token)
+        pipe = _load_cpu_pipeline(hf_token, model_id=wanted)
     _pipeline_cache.append(pipe)
-    logger.info("Typhoon Whisper pipeline ready on %s.", device)
+    _loaded_model_id = wanted
+    logger.info("%s pipeline ready on %s.", label, device)
     return _pipeline_cache[0]
 
 
-def load_model():
-    """Pre-load the Typhoon Whisper model. Safe to call multiple times."""
-    _get_pipeline()
-    logger.info("Typhoon Whisper model pre-loaded.")
+def load_model(model_id: str | None = None, *, label: str = "Typhoon Whisper", allow_ct2: bool = True):
+    """Pre-load a Typhoon Whisper checkpoint. Safe to call multiple times."""
+    _get_pipeline(model_id, label=label, allow_ct2=allow_ct2)
+    logger.info("%s model pre-loaded.", label)
 
 
-def unload_model():
-    """Unload Typhoon Whisper from process memory and clear CUDA cache."""
+def unload_model(model_id: str | None = None):
+    """Unload one resident Whisper checkpoint and clear CUDA cache."""
+    global _loaded_model_id
+    target = model_id or MODEL_ID
+    if _loaded_model_id and _loaded_model_id != target:
+        return
     from engines.faster_whisper_asr import clear_faster_whisper_cache, faster_whisper_enabled
 
     _pipeline_cache.clear()
-    if faster_whisper_enabled():
+    _loaded_model_id = None
+    if faster_whisper_enabled() and target == MODEL_ID:
         clear_faster_whisper_cache()
     _clear_cuda_cache()
-    logger.info("Typhoon Whisper model cache cleared.")
+    logger.info("Whisper model cache cleared (%s).", target)
 
 
 def _load_audio(audio_path: str):
@@ -525,7 +571,7 @@ def _run_pipe(
     return result
 
 
-def _whisper_runtime() -> "WhisperRuntime":
+def _whisper_runtime(engine_name: str = "Typhoon") -> "WhisperRuntime":
     from engines.whisper_runtime import WhisperRuntime
 
     from engines.runtime_backend import uses_pytorch_cuda_pipeline
@@ -533,7 +579,7 @@ def _whisper_runtime() -> "WhisperRuntime":
 
     reload_fn = _reload_cuda_pipeline if uses_pytorch_cuda_pipeline(detect_hardware()) else None
     return WhisperRuntime(
-        engine_name="Typhoon",
+        engine_name=engine_name,
         batch_size=_asr_batch_size,
         chunk_length_s=_chunk_length_s,
         retry_chunk_length_s=_retry_chunk_length_s,
@@ -552,18 +598,22 @@ def transcribe_typhoon(
     cancel_event=None,
     window_progress=None,
     max_speakers: int = 0,
+    model_id: str | None = None,
+    *,
+    label: str = "Typhoon",
+    allow_ct2: bool = True,
 ) -> str:
-    """Transcribe audio using Typhoon Whisper Large v3."""
+    """Transcribe audio using a Typhoon Whisper checkpoint."""
     from engines.whisper_runtime import transcribe_whisper_audio
 
     return transcribe_whisper_audio(
         audio_path,
         language,
         diarization_segments,
-        _get_pipeline(),
+        _get_pipeline(model_id, label=label, allow_ct2=allow_ct2),
         _load_audio,
         _run_pipe,
-        _whisper_runtime(),
+        _whisper_runtime(label),
         _timestamp_mode(diarization_segments),
         _format_chunks,
         cancel_event=cancel_event,

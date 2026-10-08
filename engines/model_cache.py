@@ -24,6 +24,7 @@ DEFAULT_ASR_MODELS = (
     "nectec/Pathumma-whisper-th-large-v3",
     "typhoon-ai/typhoon-whisper-large-v3",
 )
+DEFAULT_TURBO_MODEL = "typhoon-ai/typhoon-whisper-turbo"
 
 DEFAULT_DIARIZATION_MODEL = "pyannote/speaker-diarization-community-1"
 
@@ -322,6 +323,11 @@ def has_cached_pipeline(model_id: str) -> bool:
     if not has_cached_model_file(model_id):
         return False
     return all(has_cached_model_file(dep) for dep in diarization_pipeline_dependencies(model_id))
+
+
+def configured_turbo_model_id() -> str:
+    """Faster Whisper Turbo checkpoint. Optional until its snapshot is cached."""
+    return os.getenv("TYPHOON_TURBO_MODEL_ID", DEFAULT_TURBO_MODEL)
 
 
 def configured_asr_model_ids() -> tuple[str, ...]:

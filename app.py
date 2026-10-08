@@ -190,6 +190,7 @@ LABEL_DOWNLOAD = "3) Download .txt"
 _CANCELLED = "(cancelled)"
 _MSG_CANCELLED = "Cancelled."
 _MSG_JOB_NOT_FOUND = "Job not found."
+_MSG_NO_FILE_SELECTED = "No file selected."
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv", ".wmv", ".m4v", ".ts"}
 
 APP_CSS = """
@@ -668,6 +669,46 @@ def _results_have_text(results: object) -> bool:
     return False
 
 
+def _indexed_job_row(job_id: str) -> dict | None:
+    try:
+        from backend.jobs_db import get_job_row
+
+        row = get_job_row(job_id)
+    except Exception:  # pylint: disable=broad-exception-caught
+        return None
+    return row if isinstance(row, dict) else None
+
+
+def _stamp_download_paths(results: dict, path: str) -> None:
+    if not path:
+        return
+    for payload in results.values():
+        if isinstance(payload, dict) and not payload.get("download_path"):
+            payload["download_path"] = path
+
+
+def _hydrate_from_indexed_results(hydrated: dict, row: dict | None) -> bool:
+    if not row or not _results_have_text(row.get("results")):
+        return False
+    results = row["results"]
+    path = str(row.get("transcript_path") or "")
+    _stamp_download_paths(results, path)
+    hydrated["results"] = results
+    if path:
+        hydrated["transcript_path"] = path
+    return True
+
+
+def _fallback_transcript_path(hydrated: dict, row: dict | None) -> str:
+    path = str(hydrated.get("transcript_path") or "")
+    if path or row is None:
+        return path
+    path = str(row.get("transcript_path") or "")
+    if path:
+        hydrated["transcript_path"] = path
+    return path
+
+
 def _hydrate_job_transcript(job: dict) -> dict:
     """Ensure job['results'] has text/download_path (from disk if needed)."""
     from pathlib import Path
@@ -675,28 +716,10 @@ def _hydrate_job_transcript(job: dict) -> dict:
     hydrated = dict(job)
     if _results_have_text(hydrated.get("results")):
         return hydrated
-    try:
-        from backend.jobs_db import get_job_row
-
-        row = get_job_row(str(hydrated.get("job_id") or ""))
-    except Exception:  # pylint: disable=broad-exception-caught
-        row = None
-    if row and _results_have_text(row.get("results")):
-        results = row["results"]
-        path = str(row.get("transcript_path") or "")
-        if path:
-            for payload in results.values():
-                if isinstance(payload, dict) and not payload.get("download_path"):
-                    payload["download_path"] = path
-        hydrated["results"] = results
-        if path:
-            hydrated["transcript_path"] = path
+    row = _indexed_job_row(str(hydrated.get("job_id") or ""))
+    if _hydrate_from_indexed_results(hydrated, row):
         return hydrated
-    path = str(hydrated.get("transcript_path") or "")
-    if not path and row:
-        path = str(row.get("transcript_path") or "")
-        if path:
-            hydrated["transcript_path"] = path
+    path = _fallback_transcript_path(hydrated, row)
     if path and Path(path).is_file():
         return _apply_transcript_file(hydrated, path)
     return hydrated
@@ -827,9 +850,9 @@ def _poll_job_manifest_live(
             snap = _snap_from_job_manifest(job)
             engines = ", ".join(job.get("selected_engines") or []) or "ASR"
             sig = _transcription_progress_signature(snap)
-            if sig != last_sig or last_sig is None:
+            if sig != last_sig:
                 last_sig = sig
-            yield _running_transcript_outputs(snap, engines, no_dl)
+                yield _running_transcript_outputs(snap, engines, no_dl)
             time.sleep(poll_s)
             continue
         yield _terminal_job_outputs(
@@ -849,7 +872,7 @@ def _default_output_names(media) -> str:
 
 def _format_multi_media_info(paths: list[str]) -> str:
     if not paths:
-        return "No file selected."
+        return _MSG_NO_FILE_SELECTED
     if len(paths) == 1:
         return _format_media_info(paths[0])
     lines = [f"**{len(paths)} files selected** (preview shows the first):", ""]
@@ -994,13 +1017,13 @@ def _build_outputs(
         f"Done. Job ID {job_result.get('job_id', '')} — safe to close this page; "
         "retrieve later under Previous transcripts or GET /api/jobs/{id}."
     )
-    outputs.append(_status_html("done", f"{perf_text} {job_note}"))
-    outputs.append(_job_status_html(tracker.snapshot()))
-    outputs.append(_transcribe_btn_ready())
-    outputs.append(
-        _history_dropdown_update(client_ip, username=username, user_id=user_id)
-    )
-    outputs.append(gr.update(value=None, interactive=False))
+    outputs.extend([
+        _status_html("done", f"{perf_text} {job_note}"),
+        _job_status_html(tracker.snapshot()),
+        _transcribe_btn_ready(),
+        _history_dropdown_update(client_ip, username=username, user_id=user_id),
+        gr.update(value=None, interactive=False),
+    ])
     return tuple(outputs)
 
 
@@ -1112,7 +1135,7 @@ def _parse_transcribe_request(inputs: tuple) -> _TranscribeRequest:
 
 def _progress_poll_interval() -> float:
     try:
-        return max(0.25, float(os.getenv("UI_PROGRESS_POLL_S", "1.0")))
+        return max(0.25, float(os.getenv("UI_PROGRESS_POLL_S", "0.5")))
     except ValueError:
         return 1.0
 
@@ -1160,9 +1183,9 @@ def _poll_transcription_worker(
         if snap.get("job_id") and runtime.get("active_job_id") != snap["job_id"]:
             set_active_job(runtime, snap["job_id"], worker)
         sig = _transcription_progress_signature(snap)
-        if sig != last_sig or last_sig is None:
+        if sig != last_sig:
             last_sig = sig
-        yield _running_transcript_outputs(snap, engines_label, no_dl)
+            yield _running_transcript_outputs(snap, engines_label, no_dl)
         time.sleep(poll_s)
 
 
@@ -1177,9 +1200,13 @@ def _stream_worker_progress(
     username: str | None = None,
     user_id: int | None = None,
 ):
+    last_sig = None
     while worker.is_alive():
         snap = tracker.snapshot()
-        yield _running_transcript_outputs(snap, "ASR", no_dl)
+        sig = _transcription_progress_signature(snap)
+        if sig != last_sig:
+            last_sig = sig
+            yield _running_transcript_outputs(snap, "ASR", no_dl)
         time.sleep(poll_s)
     # Worker finished — load durable results if the job id is known.
     job_id = ""
@@ -1726,7 +1753,7 @@ def _on_media_upload(media, tab_id):
         return (
             gr.update(value=None, visible=False),
             gr.update(value=None, visible=False),
-            "No file selected.",
+            _MSG_NO_FILE_SELECTED,
         )
     path = paths[0]
     info = _format_multi_media_info(paths)
@@ -1846,8 +1873,8 @@ def build_ui() -> gr.Blocks:
                     label="Local ASR Engine",
                     info=(
                         "Auto picks the best engine for the selected language "
-                        "(Typhoon for Thai/English quality; Pathumma for Thai when "
-                        "ASR_AUTO_POLICY=fast)."
+                        "(Typhoon Large-v3 for quality; Typhoon Turbo when "
+                        "ASR_AUTO_POLICY=fast and that model is cached)."
                     ),
                 )
             with gr.Column(scale=1, min_width=180):
@@ -1875,49 +1902,50 @@ def build_ui() -> gr.Blocks:
                 cancel_btn = gr.Button("Cancel & Reset", variant="stop", interactive=True)
 
         # Diarization advanced config — shown when Speaker Diarization is enabled.
-        with gr.Group(visible=False) as diarize_config_group:
-            with gr.Accordion("Advanced Diarization Settings", open=False):
-                gr.Markdown(
-                    "Short clips (&lt; 90 s) with 2–3 speakers use **automatic adaptive tuning** "
-                    "when overrides are off. Enable the preset below only if you still get too "
-                    "few speakers after trying **Audio Enhancement** and raising **Max Speakers**."
+        with gr.Group(visible=False) as diarize_config_group, gr.Accordion(
+            "Advanced Diarization Settings", open=False,
+        ):
+            gr.Markdown(
+                "Short clips (&lt; 90 s) with 2–3 speakers use **automatic adaptive tuning** "
+                "when overrides are off. Enable the preset below only if you still get too "
+                "few speakers after trying **Audio Enhancement** and raising **Max Speakers**."
+            )
+            diar_short_clip_preset = gr.Checkbox(
+                value=False,
+                label="Short clip / multi-speaker preset",
+                info="Fills the sliders below for aggressive multi-speaker detection and enables overrides.",
+            )
+            diar_override_defaults = gr.Checkbox(  # noqa: F841  (wired via inputs= below)
+                value=False,
+                label="Override model-tuned defaults with the sliders below",
+                info="Unchecked (recommended) = adaptive short-clip tuning + community-1 defaults.",
+            )
+            with gr.Row():
+                diar_seg_threshold = gr.Slider(
+                    minimum=0.10, maximum=0.90, step=0.01,
+                    value=float(os.getenv("DIARIZATION_SEGMENTATION_THRESHOLD", "0.42")),
+                    label="Segmentation Threshold",
+                    info="Lower = catches quieter / shorter speaker turns",
                 )
-                diar_short_clip_preset = gr.Checkbox(
-                    value=False,
-                    label="Short clip / multi-speaker preset",
-                    info="Fills the sliders below for aggressive multi-speaker detection and enables overrides.",
+                diar_min_off = gr.Slider(
+                    minimum=0.0, maximum=1.0, step=0.01,
+                    value=float(os.getenv("DIARIZATION_MIN_DURATION_OFF", "0.10")),
+                    label="Min Silence Gap (s)",
+                    info="Min silence before splitting a turn",
                 )
-                diar_override_defaults = gr.Checkbox(  # noqa: F841  (wired via inputs= below)
-                    value=False,
-                    label="Override model-tuned defaults with the sliders below",
-                    info="Unchecked (recommended) = adaptive short-clip tuning + community-1 defaults.",
+            with gr.Row():
+                diar_clust_threshold = gr.Slider(
+                    minimum=0.10, maximum=0.90, step=0.01,
+                    value=float(os.getenv("DIARIZATION_CLUSTERING_THRESHOLD", "0.60")),
+                    label="Clustering Threshold",
+                    info="Lower = more speakers kept separate",
                 )
-                with gr.Row():
-                    diar_seg_threshold = gr.Slider(
-                        minimum=0.10, maximum=0.90, step=0.01,
-                        value=float(os.getenv("DIARIZATION_SEGMENTATION_THRESHOLD", "0.42")),
-                        label="Segmentation Threshold",
-                        info="Lower = catches quieter / shorter speaker turns",
-                    )
-                    diar_min_off = gr.Slider(
-                        minimum=0.0, maximum=1.0, step=0.01,
-                        value=float(os.getenv("DIARIZATION_MIN_DURATION_OFF", "0.10")),
-                        label="Min Silence Gap (s)",
-                        info="Min silence before splitting a turn",
-                    )
-                with gr.Row():
-                    diar_clust_threshold = gr.Slider(
-                        minimum=0.10, maximum=0.90, step=0.01,
-                        value=float(os.getenv("DIARIZATION_CLUSTERING_THRESHOLD", "0.60")),
-                        label="Clustering Threshold",
-                        info="Lower = more speakers kept separate",
-                    )
-                    diar_clust_min_size = gr.Slider(
-                        minimum=1, maximum=30, step=1,
-                        value=int(os.getenv("DIARIZATION_MIN_CLUSTER_SIZE", "6")),
-                        label="Min Cluster Size",
-                        info="Min segments to form a speaker cluster",
-                    )
+                diar_clust_min_size = gr.Slider(
+                    minimum=1, maximum=30, step=1,
+                    value=int(os.getenv("DIARIZATION_MIN_CLUSTER_SIZE", "6")),
+                    label="Min Cluster Size",
+                    info="Min segments to form a speaker cluster",
+                )
 
         diar_short_clip_preset.change(  # pylint: disable=no-member
             fn=_apply_short_clip_preset,
@@ -1944,7 +1972,7 @@ def build_ui() -> gr.Blocks:
         )
 
         with gr.Accordion("Media preview (short files only)", open=False):
-            media_info = gr.Markdown("No file selected.")
+            media_info = gr.Markdown(_MSG_NO_FILE_SELECTED)
             with gr.Row():
                 original_video = gr.Video(
                     label="Video",
@@ -2288,20 +2316,31 @@ def main() -> None:
     from backend.jobs_db import init_jobs_db, migrate_json_jobs
     from backend.queue_policy import apply_queue_policy
 
+    from backend.result_outbox import flush_pending_results
+
     ensure_app_dirs()
     init_user_db()
     init_jobs_db()
+    flush_pending_results()
     apply_cpu_thread_limits()
     apply_quality_profile()
     apply_queue_policy()
     migrate_json_jobs()
-    resume_interrupted_jobs()
+    resumed = resume_interrupted_jobs()
     hardware = detect_hardware()
     logger.info("Selected backend: %s / %s", hardware["backend"], hardware["selected_device"])
     public_base = os.getenv("APP_PUBLIC_BASE_URL", "").strip()
     if public_base:
         logger.info("Public base URL hint: %s", public_base)
-    _preload_models()
+    if int(resumed.get("resumed") or 0) > 0:
+        logger.info(
+            "Skipping model preload; %d resumed job(s) already own the GPU. Opening the UI.",
+            int(resumed["resumed"]),
+        )
+        _mark_engines_available(ALL_ENGINES)
+        _models_ready.set()
+    else:
+        _preload_models()
     _patch_gradio_create_app_for_custom_routes()
     application = build_ui()
     server_name = os.getenv("GRADIO_SERVER_NAME", "127.0.0.1")

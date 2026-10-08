@@ -15,12 +15,13 @@ logger = logging.getLogger(__name__)
 
 
 ENGINE_TYPHOON = "Typhoon Whisper"
+ENGINE_TURBO = "Typhoon Turbo"
 ENGINE_PATHUMMA = "Pathumma Whisper"
 ENGINE_AUTO = "Auto"
 _LEGACY_ENGINE_NAMES: dict[str, str] = {}
-ALL_ENGINES = [ENGINE_PATHUMMA, ENGINE_TYPHOON]
-UI_ENGINE_CHOICES = [ENGINE_AUTO, ENGINE_TYPHOON, ENGINE_PATHUMMA]
-FAST_8GB_ENGINES = [ENGINE_PATHUMMA]
+ALL_ENGINES = [ENGINE_PATHUMMA, ENGINE_TYPHOON, ENGINE_TURBO]
+UI_ENGINE_CHOICES = [ENGINE_AUTO, ENGINE_TYPHOON, ENGINE_TURBO, ENGINE_PATHUMMA]
+FAST_8GB_ENGINES = [ENGINE_TURBO, ENGINE_PATHUMMA]
 _AUTO_ALIASES = frozenset({"auto", ENGINE_AUTO.lower(), "auto (best for language)"})
 
 LANGUAGES = {
@@ -94,16 +95,26 @@ def is_auto_engine(selection: str) -> bool:
     return selection.strip().lower() in _AUTO_ALIASES
 
 
+def turbo_snapshot_cached() -> bool:
+    """True when the faster Typhoon Turbo weights are already on disk."""
+    from engines.model_cache import configured_turbo_model_id, has_cached_model_file
+
+    return has_cached_model_file(configured_turbo_model_id())
+
+
 def best_asr_engine_for_language(language: str) -> str:
-    """Pick the highest-quality local engine for the requested UI language."""
+    """Pick the highest-quality local engine for the requested UI language.
+
+    Quality stays on Typhoon Whisper Large-v3 (still the lowest published CER).
+    Fast Thai prefers Typhoon Turbo when that snapshot is cached; it beats
+    Pathumma on noisy speech and uses the same Whisper decode path.
+    """
     policy = os.getenv("ASR_AUTO_POLICY", "quality").strip().lower()
     lang = (language or "Thai").strip()
     if policy in {"fast", "speed", "balanced"} and lang == "Thai":
+        if turbo_snapshot_cached():
+            return ENGINE_TURBO
         return ENGINE_PATHUMMA
-    if lang == "Thai":
-        return ENGINE_TYPHOON
-    if lang == "English":
-        return ENGINE_TYPHOON
     return ENGINE_TYPHOON
 
 
@@ -360,7 +371,16 @@ def model_is_loaded(engine_name: str) -> bool:
     if engine_name == ENGINE_TYPHOON:
         from engines import typhoon_asr
 
-        return bool(typhoon_asr._pipeline_cache)  # noqa: SLF001
+        return typhoon_asr.loaded_model_id() == typhoon_asr.MODEL_ID and bool(
+            typhoon_asr._pipeline_cache  # noqa: SLF001
+        )
+    if engine_name == ENGINE_TURBO:
+        from engines import typhoon_asr
+        from engines.typhoon_turbo_asr import model_id as turbo_model_id
+
+        return typhoon_asr.loaded_model_id() == turbo_model_id() and bool(
+            typhoon_asr._pipeline_cache  # noqa: SLF001
+        )
     if engine_name == ENGINE_PATHUMMA:
         from engines import pathumma_asr
 
@@ -375,6 +395,11 @@ def load_model(engine_name: str) -> None:
         from engines.typhoon_asr import load_model as load_typhoon
 
         load_typhoon()
+        return
+    if engine_name == ENGINE_TURBO:
+        from engines.typhoon_turbo_asr import load_model as load_turbo
+
+        load_turbo()
         return
     if engine_name == ENGINE_PATHUMMA:
         from engines.pathumma_asr import load_model as load_pathumma
@@ -391,6 +416,10 @@ def unload_model(engine_name: str) -> None:
         from engines.typhoon_asr import unload_model as unload_typhoon
 
         unload_typhoon()
+    elif engine_name == ENGINE_TURBO:
+        from engines.typhoon_turbo_asr import unload_model as unload_turbo
+
+        unload_turbo()
     elif engine_name == ENGINE_PATHUMMA:
         from engines.pathumma_asr import unload_model as unload_pathumma
 
@@ -425,6 +454,14 @@ def transcribe_engine(
             from engines.typhoon_asr import transcribe_typhoon
 
             text = transcribe_typhoon(
+                audio_path, whisper_language, diarization_segments,
+                cancel_event=cancel_event, window_progress=window_progress,
+                max_speakers=max_speakers,
+            )
+        elif engine_name == ENGINE_TURBO:
+            from engines.typhoon_turbo_asr import transcribe_turbo
+
+            text = transcribe_turbo(
                 audio_path, whisper_language, diarization_segments,
                 cancel_event=cancel_event, window_progress=window_progress,
                 max_speakers=max_speakers,

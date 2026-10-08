@@ -66,7 +66,6 @@ VOLUME ["/app/storage", "/app/models", "/app/config"]
 EXPOSE 7896
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=600s --retries=3 \
-    CMD python3 -c "import urllib.request; \
-urllib.request.urlopen('http://localhost:7896/startup-events')" || exit 1
+    CMD python3 -S -c "import urllib.request; urllib.request.urlopen('http://localhost:7896/startup-events', timeout=5)" || exit 1
 
 ENTRYPOINT ["/bin/bash", "scripts/docker_entrypoint.sh"]

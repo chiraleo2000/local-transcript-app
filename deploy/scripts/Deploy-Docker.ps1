@@ -125,13 +125,14 @@ function Ensure-PersistentHostDirs {
 }
 
 function Clear-LocalCaches {
-    Write-Step "Clearing local caches (models/ untouched)"
+    Write-Step "Clearing local caches (model weights untouched)"
     foreach ($d in @(
             (Join-Path $RepoRoot ".cache"),
             (Join-Path $RepoRoot ".pytest_cache"),
             (Join-Path $RepoRoot "htmlcov"),
             (Join-Path $RepoRoot "deploy\nginx\runtime\logs"),
-            (Join-Path $RepoRoot "deploy\nginx\runtime\temp")
+            (Join-Path $RepoRoot "deploy\nginx\runtime\temp"),
+            (Join-Path $RepoRoot "models\ov_cache")
         )) {
         if (Test-Path $d) {
             Get-ChildItem $d -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
@@ -141,6 +142,8 @@ function Clear-LocalCaches {
     Get-ChildItem -Path $RepoRoot -Recurse -Directory -Filter "__pycache__" -ErrorAction SilentlyContinue |
         Where-Object { $_.FullName -notmatch '\\venv\\' } |
         ForEach-Object { Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+    Get-ChildItem -Path (Join-Path $RepoRoot "models") -Recurse -Filter "*.incomplete" -ErrorAction SilentlyContinue |
+        ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }
     if (Test-DockerReady) {
         docker builder prune -f 2>$null | Out-Null
         docker image prune -f 2>$null | Out-Null

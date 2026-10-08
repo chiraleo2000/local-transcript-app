@@ -443,21 +443,47 @@ def save_transcript_result(
     segments: list[dict[str, Any]] | None = None,
     error: str = "",
 ) -> None:
-    """Persist full transcript text and speaker segments (sidecar when configured)."""
-    if not job_id or not _storage():
-        return
-    from backend.storage_client import save_result
+    """Persist full transcript text locally, then to the sidecar when configured.
 
-    save_result(
-        job_id=job_id,
-        engine=engine,
-        text=text,
+    A sidecar blip keeps the local outbox file. Startup flushes it later so a
+    finished transcription is not discarded.
+    """
+    from backend.result_outbox import mark_synced, remember_result
+    from backend.storage_client import StorageUnavailable, save_result
+
+    if not job_id:
+        return
+    path = remember_result(
+        job_id,
+        engine,
+        text,
         language=language,
         duration_s=duration_s,
         transcript_path=transcript_path,
         segments=segments,
         error=error,
+        synced=False,
     )
+    if not _storage():
+        return
+    try:
+        save_result(
+            job_id=job_id,
+            engine=engine,
+            text=text,
+            language=language,
+            duration_s=duration_s,
+            transcript_path=transcript_path,
+            segments=segments,
+            error=error,
+        )
+    except StorageUnavailable:
+        logger.error(
+            "Job %s transcript kept in the local outbox; storage sync is pending.",
+            job_id,
+        )
+        return
+    mark_synced(path)
 
 
 def migrate_json_jobs(job_dir: Path | None = None) -> int:

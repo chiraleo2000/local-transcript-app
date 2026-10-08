@@ -1,6 +1,35 @@
 # Local Transcript App — release notes
 
-**Current version: 2.1.1**
+**Current version: 2.2.0**
+
+---
+
+## v2.2.0
+
+### Summary
+
+Keep Typhoon Whisper Large-v3 as the quality engine, add Typhoon Whisper Turbo for faster online jobs, and store every finished transcript locally before the storage sidecar so a brief outage does not drop the result.
+
+### Models
+
+- Quality Auto stays on `typhoon-ai/typhoon-whisper-large-v3` (GigaSpeech2 CER 4.69, noisy TVSpeech 6.32)
+- New engine **Typhoon Turbo** (`typhoon-ai/typhoon-whisper-turbo`): CER 4.79 / 6.85, four decoder layers, same Whisper path
+- `ASR_AUTO_POLICY=fast` uses Turbo when that snapshot is cached, otherwise Pathumma
+- Container start with `HF_TOKEN` downloads any missing snapshots, then inference stays offline
+
+### Results
+
+- Transcript text is written to `storage/results/` before the sidecar call
+- Sidecar HTTP retries transient network and 5xx errors
+- If the sidecar is down, the job file still completes locally and the next startup syncs the outbox
+- History listing falls back to local job files when the sidecar cannot be reached
+
+### Deploy
+
+- The UI opens even when resumed jobs already own the GPU
+- Container health checks skip the model-stack import so startup is not marked unhealthy
+
+---
 
 See [README.md](README.md) for setup. Docker stacks live under [`deploy/docker/`](deploy/docker/).
 

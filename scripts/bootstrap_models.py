@@ -46,6 +46,7 @@ from backend.services.hardware_policy import detect_hardware  # noqa: E402
 from backend.storage import ensure_app_dirs, update_config  # noqa: E402
 from engines.model_cache import (  # noqa: E402
     configured_asr_model_ids,
+    configured_turbo_model_id,
     consolidate_misplaced_hub_caches,
     has_cached_model_file,
     hub_cache_dir,
@@ -53,6 +54,7 @@ from engines.model_cache import (  # noqa: E402
 
 MAINTAINER_MODELS = (
     *configured_asr_model_ids(),
+    configured_turbo_model_id(),
     "pyannote/speaker-diarization-community-1",
     "pyannote/segmentation-3.0",
     "pyannote/wespeaker-voxceleb-resnet34-LM",
@@ -89,7 +91,7 @@ def _download_missing_models() -> dict[str, str]:
                 failures[model_id] = "download finished but cache is still incomplete"
         except Exception as exc:  # pylint: disable=broad-exception-caught
             failures[model_id] = str(exc)
-            logger.error("Download failed for %s: %s", model_id, exc)
+            logger.exception("Download failed for %s", model_id)
     return failures
 
 
@@ -116,7 +118,7 @@ def main() -> int:
             logger.info("%s ready.", engine)
         except Exception as exc:  # pylint: disable=broad-exception-caught
             failures[engine] = str(exc)
-            logger.error("%s bootstrap failed: %s", engine, exc, exc_info=True)
+            logger.exception("%s bootstrap failed", engine)
         finally:
             try:
                 unload_model(engine)
@@ -134,7 +136,7 @@ def main() -> int:
         unload_diarization_model()
     except Exception as exc:  # pylint: disable=broad-exception-caught
         failures["diarization"] = str(exc)
-        logger.error("Diarization bootstrap failed: %s", exc, exc_info=True)
+        logger.exception("Diarization bootstrap failed")
 
     update_config(model_bootstrap={"ready": not failures, "failures": failures})
     if failures:

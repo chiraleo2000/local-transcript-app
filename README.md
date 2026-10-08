@@ -3,7 +3,7 @@
 GPU-accelerated local audio/video transcription with speaker diarization.  
 No cloud APIs. No telemetry. All processing stays on your machine.
 
-**Version 2.1.1** — see [RELEASE_NOTES.md](RELEASE_NOTES.md)
+**Version 2.2.0** — see [RELEASE_NOTES.md](RELEASE_NOTES.md)
 
 ---
 
@@ -59,8 +59,9 @@ Do this **before** Docker or the installer:
 
 ## Features
 
-- **Typhoon Whisper Large v3** — default ASR engine (Thai-optimised, high accuracy)
-- **Pathumma Whisper Thai Large v3** — fast alternative ASR engine
+- **Typhoon Whisper Large v3** — default ASR engine (still the lowest published Thai CER)
+- **Typhoon Whisper Turbo** — faster Thai engine for online queues (used when `ASR_AUTO_POLICY=fast` and the snapshot is cached)
+- **Pathumma Whisper Thai Large v3** — legacy fast engine if Turbo is not cached
 - **Speaker diarization** — `pyannote/speaker-diarization-community-1` (Sep 2025), fully local
 - **Advanced diarization tuning** — segmentation threshold, clustering threshold, min cluster size, silence gap — adjustable live in the UI
 - **Audio enhancement** — bandpass filter → spectral noise reduction → gate / compress / limiter chain (louder speech, minimal background)

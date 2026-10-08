@@ -155,6 +155,7 @@ def print_versions() -> None:
     print("\n=== Model IDs (from env) ===")
     print(f"  PATHUMMA_MODEL_ID: {os.getenv('PATHUMMA_MODEL_ID', 'nectec/Pathumma-whisper-th-large-v3')}")
     print(f"  TYPHOON_MODEL_ID: {os.getenv('TYPHOON_MODEL_ID', 'typhoon-ai/typhoon-whisper-large-v3')}")
+    print(f"  TYPHOON_TURBO_MODEL_ID: {os.getenv('TYPHOON_TURBO_MODEL_ID', 'typhoon-ai/typhoon-whisper-turbo')}")
     print(f"  DIARIZATION_MODEL_ID: {os.getenv('DIARIZATION_MODEL_ID', 'pyannote/speaker-diarization-community-1')}")
 
 

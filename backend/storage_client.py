@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -12,6 +13,9 @@ from typing import Any
 
 class StorageUnavailable(RuntimeError):
     """Sidecar is configured but the request could not be completed."""
+
+
+_RETRY_STATUS = {408, 425, 429, 500, 502, 503, 504}
 
 
 def storage_url() -> str:
@@ -23,39 +27,88 @@ def storage_configured() -> bool:
 
 
 def _request(method: str, path: str, payload: dict[str, Any] | None = None, query: dict | None = None) -> Any:
+    """Call the sidecar, retrying brief network and 5xx failures."""
+    delay_s = 0.2
+    last: StorageUnavailable | None = None
+    for attempt in range(1, 4):
+        try:
+            return _request_once(method, path, payload, query)
+        except StorageUnavailable as exc:
+            last = exc
+            status = getattr(exc, "status", None)
+            if status not in _RETRY_STATUS and status is not None:
+                raise
+            if attempt == 3:
+                raise
+            time.sleep(delay_s)
+            delay_s *= 2
+    if last is not None:
+        raise last
+    raise StorageUnavailable("storage request failed")
+
+
+def _with_query(url: str, query: dict | None) -> str:
+    if not query:
+        return url
+    filtered = {key: value for key, value in query.items() if value not in (None, "")}
+    return f"{url}?{urllib.parse.urlencode(filtered)}"
+
+
+def _json_body(payload: dict[str, Any] | None) -> bytes | None:
+    if payload is None:
+        return None
+    return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+
+def _request_headers(token: str, *, has_body: bool) -> dict[str, str]:
+    headers = {"Accept": "application/json"}
+    if token:
+        headers["X-Storage-Token"] = token
+    if has_body:
+        headers["Content-Type"] = "application/json"
+    return headers
+
+
+def _parse_storage_error_body(body: str, reason: object) -> Any:
+    try:
+        return json.loads(body) if body else {}
+    except json.JSONDecodeError:
+        return {"error": body or reason}
+
+
+def _error_from_http(exc: urllib.error.HTTPError, method: str, path: str) -> StorageUnavailable:
+    body = exc.read().decode("utf-8", errors="replace")
+    if exc.code in {401, 404, 409}:
+        parsed = _parse_storage_error_body(body, exc.reason)
+        message = parsed.get("error") if isinstance(parsed, dict) else None
+        err = StorageUnavailable(str(message or exc.reason))
+        err.payload = parsed  # type: ignore[attr-defined]
+    else:
+        err = StorageUnavailable(f"storage {method} {path} failed: HTTP {exc.code} {body}")
+    err.status = exc.code  # type: ignore[attr-defined]
+    return err
+
+
+def _request_once(method: str, path: str, payload: dict[str, Any] | None = None, query: dict | None = None) -> Any:
     base = storage_url()
     if not base:
         raise StorageUnavailable("APP_STORAGE_URL is not set")
-    url = f"{base}{path}"
-    if query:
-        url = f"{url}?{urllib.parse.urlencode({k: v for k, v in query.items() if v not in (None, '')})}"
-    data = None
-    headers = {"Accept": "application/json"}
+    data = _json_body(payload)
     token = os.getenv("APP_STORAGE_TOKEN", "").strip()
-    if token:
-        headers["X-Storage-Token"] = token
-    if payload is not None:
-        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    req = urllib.request.Request(
+        _with_query(f"{base}{path}", query),
+        data=data,
+        headers=_request_headers(token, has_body=data is not None),
+        method=method,
+    )
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             raw = resp.read().decode("utf-8")
-            return json.loads(raw) if raw else {}
     except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        if exc.code in {401, 404, 409}:
-            try:
-                parsed = json.loads(body) if body else {}
-            except json.JSONDecodeError:
-                parsed = {"error": body or exc.reason}
-            err = StorageUnavailable(str(parsed.get("error") or exc.reason))
-            err.status = exc.code  # type: ignore[attr-defined]
-            err.payload = parsed  # type: ignore[attr-defined]
-            raise err from exc
-        raise StorageUnavailable(f"storage {method} {path} failed: HTTP {exc.code} {body}") from exc
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise _error_from_http(exc, method, path) from exc
+    except OSError as exc:
         raise StorageUnavailable(f"storage sidecar unreachable at {base}: {exc}") from exc
+    return json.loads(raw) if raw else {}
 
 
 def upsert_job(job_id: str, patch: dict[str, Any]) -> None:
